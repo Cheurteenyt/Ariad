@@ -3,6 +3,7 @@
 import { BaseTool } from './base.js';
 import { ToolDefinition } from './index.js';
 import { MAX_NODES_PER_LABEL } from '../../constants.js';
+import { getGraphStatus, getFreshnessScore, freshnessLabel } from '../../intelligence/graph-status.js';
 
 export class GetProjectOverviewTool extends BaseTool {
   get definition(): ToolDefinition {
@@ -83,6 +84,45 @@ export class GetProjectOverviewTool extends BaseTool {
           coverage_pct: criticalTotal > 0 ? (criticalDocumented / criticalTotal) * 100 : null,
         };
       }
+
+      // Graph freshness status — the agent MUST know if data is stale.
+      if (codeReader) {
+        const graphStatus = getGraphStatus(project, codeReader, process.cwd());
+        const freshnessScore = getFreshnessScore(graphStatus);
+        result['graph_status'] = {
+          available: graphStatus.available,
+          last_indexed: graphStatus.last_indexed,
+          age_seconds: graphStatus.age_seconds,
+          stale: graphStatus.stale,
+          stale_reason: graphStatus.stale_reason,
+          stale_files_count: graphStatus.stale_files_count,
+          stale_files_sample: graphStatus.stale_files_sample,
+          freshness_score: freshnessScore,
+          freshness_label: freshnessLabel(freshnessScore),
+          recommendation: graphStatus.recommendation,
+        };
+      }
+
+      // Smart recommendations — the agent gets actionable next steps.
+      const recommendations: string[] = [];
+      const graphStatus = result['graph_status'] as any;
+      if (graphStatus?.stale) {
+        recommendations.push(`Refresh the code graph: ${graphStatus.stale_reason}. Run "cbm index_repository".`);
+      }
+      if (bugsCount > 0) {
+        recommendations.push(`${bugsCount} open bug(s) — review before making changes. Use prepare_edit_context to see affected files.`);
+      }
+      if (refactorsCount > 0) {
+        recommendations.push(`${refactorsCount} pending refactor plan(s) — check if your work overlaps. Use get_module_context to see details.`);
+      }
+      const docCoverage = result['documentation_coverage'] as any;
+      if (docCoverage && docCoverage.coverage_pct !== null && docCoverage.coverage_pct < 50) {
+        recommendations.push(`Documentation coverage is ${docCoverage.coverage_pct.toFixed(0)}% — ${docCoverage.critical_modules_total - docCoverage.critical_modules_documented} critical module(s) undocumented. Use get_undocumented_hotspots to identify them.`);
+      }
+      if (recommendations.length === 0) {
+        recommendations.push('Project is in good shape. Use prepare_edit_context before modifying any file to get full context.');
+      }
+      result['recommendations'] = recommendations;
 
       return this.json(result);
     } catch (e: any) {

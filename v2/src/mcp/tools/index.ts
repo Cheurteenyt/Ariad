@@ -8,6 +8,7 @@ import { GetUndocumentedHotspotsTool } from './get_undocumented_hotspots.js';
 import { CreateHumanNoteTool } from './create_human_note.js';
 import { LinkNoteToCodeNodeTool } from './link_note_to_code_node.js';
 import { SearchCodeAndMemoryTool } from './search_code_and_memory.js';
+import { PrepareEditContextTool } from './prepare_edit_context.js';
 
 export interface ToolHandler {
   handle(args: Record<string, unknown>): Promise<{
@@ -30,6 +31,7 @@ export const TOOL_CLASSES: Array<new (opts: McpServerOptions) => ToolHandler & {
   CreateHumanNoteTool,
   LinkNoteToCodeNodeTool,
   SearchCodeAndMemoryTool,
+  PrepareEditContextTool,
 ];
 
 export const ALL_TOOLS: ToolDefinition[] = TOOL_CLASSES.map((T) => new T({
