@@ -1,5 +1,9 @@
 # GitLab CI/CD pipeline for Codebase Memory V2
 # Runs typecheck, build, and tests on every push/merge request.
+#
+# Note: We use `npm install` instead of `npm ci` because package-lock.json
+# is gitignored (the project doesn't commit lockfiles). If a lockfile is
+# added in the future, switch back to `npm ci` for reproducible installs.
 
 stages:
   - lint
@@ -9,7 +13,7 @@ stages:
 variables:
   NODE_VERSION: "20"
 
-# Cache npm dependencies between jobs
+# Cache npm dependencies between jobs (and between pipeline runs)
 cache:
   key: ${CI_COMMIT_REF_SLUG}
   paths:
@@ -21,7 +25,7 @@ typecheck:
   image: node:${NODE_VERSION}
   script:
     - cd v2
-    - npm ci
+    - npm install
     - npm run typecheck
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -33,7 +37,7 @@ build:
   image: node:${NODE_VERSION}
   script:
     - cd v2
-    - npm ci
+    - npm install
     - npm run build
   artifacts:
     paths:
@@ -51,7 +55,7 @@ test:
     - build
   script:
     - cd v2
-    - npm ci
+    - npm install
     - npm run build
     - npm test
   rules:
