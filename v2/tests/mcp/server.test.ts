@@ -95,7 +95,8 @@ describe('MCP server protocol compliance', () => {
     expect(toolNames).toContain('create_human_note');
     expect(toolNames).toContain('link_note_to_code_node');
     expect(toolNames).toContain('search_code_and_memory');
-    expect(toolNames.length).toBe(6);
+    expect(toolNames).toContain('prepare_edit_context');
+    expect(toolNames.length).toBe(7);
   });
 
   it('returns -32601 Method not found for unknown method', async () => {
