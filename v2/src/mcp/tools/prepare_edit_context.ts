@@ -111,8 +111,8 @@ export class PrepareEditContextTool extends BaseTool {
 
         // Risk score.
         const props = safeJsonParse(node.properties_json, {} as Record<string, any>);
-        const complexity = props.complexity ?? props.complexity_avg ?? 0;
-        const riskScore = computeRiskScore(inNeighbors.length, complexity, humanNotes.length);
+        const complexity = props.complexity_avg ?? props.complexity ?? 0;
+        const riskScore = computeRiskScore(inNeighbors.length + outNeighbors.length, complexity, humanNotes.length);
         if (riskScore > maxRiskScore) {
           maxRiskScore = riskScore;
           highestRiskNode = node;

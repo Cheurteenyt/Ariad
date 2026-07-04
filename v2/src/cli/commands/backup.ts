@@ -29,7 +29,7 @@ export function registerBackupCommand(program: Command): void {
         }
 
         const backup = {
-          version: '0.3.2',
+          version: '0.4.2',
           exported_at: new Date().toISOString(),
           project,
           notes: notes.map((n) => ({
@@ -147,7 +147,8 @@ export function registerBackupCommand(program: Command): void {
                 author: note.author || undefined,
               });
               importedNotes++;
-            } catch {
+            } catch (e: any) {
+              console.error(`  Warning: skipped note "${note.slug}": ${e.message}`);
               skippedNotes++;
             }
           }
@@ -186,8 +187,8 @@ export function registerBackupCommand(program: Command): void {
                   properties: safeJsonParse(edge.properties_json, {}),
                 });
                 importedEdges++;
-              } catch {
-                // skip
+              } catch (e: any) {
+                console.error(`  Warning: skipped edge: ${e.message}`);
               }
             }
           }
