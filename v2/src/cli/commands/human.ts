@@ -8,6 +8,7 @@ import {
   HUMAN_NODE_LABELS,
   HUMAN_EDGE_TYPES,
   HUMAN_NODE_STATUSES,
+  HumanNodeStatus,
 } from '../../human/schema.js';
 import { deriveProjectName } from '../../config.js';
 
@@ -16,7 +17,7 @@ function deriveProject(opts: any): string {
 }
 
 function parseIntStrict(s: string, flagName: string): number {
-  const n = parseInt(s, 10);
+  const n = Number(s);
   if (!Number.isFinite(n)) {
     throw new Error(`${flagName} must be a number, got "${s}"`);
   }
@@ -34,8 +35,8 @@ export function registerHumanCommand(program: Command): void {
     .option('--title <title>', 'Title (required)')
     .option('--body <text>', 'Markdown body', '')
     .option('--status <status>', `${HUMAN_NODE_STATUSES.join(' | ')}`, 'active')
-    .option('--tag <tag>', 'Tag (can be repeated)')
-    .option('--link-cbm <id>', 'Link to cbm_node_id (can be repeated)')
+    .option('--tag <tag...>', 'Tag (can be repeated)')
+    .option('--link-cbm <id...>', 'Link to cbm_node_id (can be repeated)')
     .option('--link-edge <type>', `Edge type for the link: ${HUMAN_EDGE_TYPES.join(' | ')}`, 'MENTIONS')
     .action((opts) => {
       if (!opts.title || !opts.type) {
@@ -113,12 +114,22 @@ export function registerHumanCommand(program: Command): void {
     .option('--status <status>')
     .option('--limit <n>', '200')
     .action((opts) => {
+      if (opts.type && !HUMAN_NODE_LABELS.includes(opts.type as HumanNodeLabel)) {
+        console.error(`Error: invalid --type "${opts.type}". Valid: ${HUMAN_NODE_LABELS.join(', ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.status && !HUMAN_NODE_STATUSES.includes(opts.status as HumanNodeStatus)) {
+        console.error(`Error: invalid --status "${opts.status}". Valid: ${HUMAN_NODE_STATUSES.join(', ')}`);
+        process.exitCode = 1;
+        return;
+      }
       const project = deriveProject(opts);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       try {
         const nodes = humanStore.listNodes(project, {
           label: opts.type as HumanNodeLabel,
-          status: opts.status as any,
+          status: opts.status as HumanNodeStatus,
           limit: (() => { const n = parseInt(opts.limit, 10); return Number.isFinite(n) ? n : 200; })(),
         });
         if (nodes.length === 0) {

@@ -77,7 +77,7 @@ describe('MCP server protocol compliance', () => {
     expect(pingResp!.result).toEqual({});
   });
 
-  it('lists 6 tools', async () => {
+  it('lists 7 tools', async () => {
     const responses = await runMcpSession(
       [
         JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
