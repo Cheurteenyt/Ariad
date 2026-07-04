@@ -1,0 +1,64 @@
+# GitLab CI/CD pipeline for Codebase Memory V2
+# Runs typecheck, build, and tests on every push/merge request.
+#
+# Note: We use `npm install` instead of `npm ci` because package-lock.json
+# is gitignored (the project doesn't commit lockfiles). If a lockfile is
+# added in the future, switch back to `npm ci` for reproducible installs.
+
+stages:
+  - lint
+  - build
+  - test
+
+variables:
+  NODE_VERSION: "20"
+
+# Cache npm dependencies between jobs (and between pipeline runs)
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - v2/node_modules/
+
+# ── Type-check (fastest gate) ──────────────────────────────────────
+typecheck:
+  stage: lint
+  image: node:${NODE_VERSION}
+  script:
+    - cd v2
+    - npm install
+    - npm run typecheck
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── Build ──────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: node:${NODE_VERSION}
+  script:
+    - cd v2
+    - npm install
+    - npm run build
+  artifacts:
+    paths:
+      - v2/dist/
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── Test (requires build first) ────────────────────────────────────
+test:
+  stage: test
+  image: node:${NODE_VERSION}
+  needs:
+    - build
+  script:
+    - cd v2
+    - npm install
+    - npm run build
+    - npm test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  coverage: '/Tests.*?(\d+).*?passing/'
