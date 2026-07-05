@@ -1,0 +1,261 @@
+// v2/tests/ui/server-r17.test.ts
+// Tests for the R17 new API endpoints.
+// We test the UiServer by starting it on a random port and making HTTP requests.
+
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { UiServer } from '../../src/ui/server.js';
+import { HumanMemoryStore, defaultHumanDbPath } from '../../src/human/store.js';
+import { unlinkSync, existsSync } from 'node:fs';
+
+const TEST_PROJECT = 'r17-test-' + Date.now().toString(36);
+let server: UiServer;
+let port: number;
+let baseUrl: string;
+
+function fetchJson(path: string, options?: { method?: string; body?: unknown }): Promise<{ status: number; body: any }> {
+  return new Promise((resolve, reject) => {
+    const url = `${baseUrl}${path}`;
+    const opts: RequestInit = {
+      method: options?.method ?? 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    };
+    if (options?.body !== undefined) {
+      opts.body = JSON.stringify(options.body);
+    }
+    fetch(url, opts)
+      .then(async (res) => {
+        const body = await res.json().catch(() => ({}));
+        resolve({ status: res.status, body });
+      })
+      .catch(reject);
+  });
+}
+
+describe('R17: UiServer new endpoints', () => {
+  beforeAll(() => {
+    // Find a free port by trying a high random port.
+    port = 9800 + Math.floor(Math.random() * 100);
+    server = new UiServer({ project: TEST_PROJECT, port });
+    server.start();
+    baseUrl = `http://127.0.0.1:${port}`;
+    // Wait a moment for the server to start.
+    return new Promise((r) => setTimeout(r, 300));
+  });
+
+  afterAll(() => {
+    server.stop();
+    // Clean up the test human DB.
+    const dbPath = defaultHumanDbPath(TEST_PROJECT);
+    if (existsSync(dbPath)) {
+      try { unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+    for (const suffix of ['-wal', '-shm']) {
+      if (existsSync(dbPath + suffix)) {
+        try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  describe('GET /api/adr', () => {
+    it('returns has_adr: false when no ADRs exist', async () => {
+      const res = await fetchJson('/api/adr');
+      expect(res.status).toBe(200);
+      expect(res.body.has_adr).toBe(false);
+    });
+  });
+
+  describe('POST /api/adr', () => {
+    it('creates a new ADR note', async () => {
+      const res = await fetchJson('/api/adr', {
+        method: 'POST',
+        body: {
+          project: TEST_PROJECT,
+          title: 'ADR-TEST: Test decision',
+          content: 'We decided to test things.',
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.id).toBeGreaterThan(0);
+      expect(res.body.title).toBe('ADR-TEST: Test decision');
+    });
+
+    it('updates an existing ADR with the same title', async () => {
+      // Create
+      await fetchJson('/api/adr', {
+        method: 'POST',
+        body: {
+          project: TEST_PROJECT,
+          title: 'ADR-UPD: Update test',
+          content: 'Original content',
+        },
+      });
+      // Update
+      const res = await fetchJson('/api/adr', {
+        method: 'POST',
+        body: {
+          project: TEST_PROJECT,
+          title: 'ADR-UPD: Update test',
+          content: 'Updated content',
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('rejects invalid JSON body', async () => {
+      // Send raw invalid JSON
+      const res = await fetch(`${baseUrl}/api/adr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: 'not json',
+      });
+      const body = await res.json().catch(() => ({}));
+      expect(res.status).toBe(400);
+      expect(body.error).toContain('Invalid JSON');
+    });
+  });
+
+  describe('GET /api/adr (after creating)', () => {
+    it('returns has_adr: true with ADR content', async () => {
+      const res = await fetchJson('/api/adr');
+      expect(res.status).toBe(200);
+      expect(res.body.has_adr).toBe(true);
+      expect(typeof res.body.content).toBe('string');
+      expect(res.body.all_adrs).toBeDefined();
+      expect(Array.isArray(res.body.all_adrs)).toBe(true);
+      expect(res.body.all_adrs.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('GET /api/browse', () => {
+    it('lists directories in the home folder by default', async () => {
+      const res = await fetchJson('/api/browse');
+      expect(res.status).toBe(200);
+      expect(res.body.path).toBeDefined();
+      expect(Array.isArray(res.body.dirs)).toBe(true);
+      expect(Array.isArray(res.body.roots)).toBe(true);
+      expect(res.body.roots.length).toBeGreaterThan(0);
+    });
+
+    it('returns 404 for non-existent path', async () => {
+      const res = await fetchJson('/api/browse?path=/nonexistent/path/that/does/not/exist');
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('not found');
+    });
+  });
+
+  describe('GET /api/index-status', () => {
+    it('returns jobs array (empty or with jobs)', async () => {
+      const res = await fetchJson('/api/index-status');
+      expect(res.status).toBe(200);
+      expect(res.body.jobs).toBeDefined();
+      expect(Array.isArray(res.body.jobs)).toBe(true);
+    });
+  });
+
+  describe('POST /api/index', () => {
+    it('rejects missing root_path', async () => {
+      const res = await fetchJson('/api/index', {
+        method: 'POST',
+        body: { project_name: 'test' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('root_path');
+    });
+
+    it('rejects missing project_name', async () => {
+      const res = await fetchJson('/api/index', {
+        method: 'POST',
+        body: { root_path: '/tmp' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('project_name');
+    });
+
+    it('rejects non-existent root_path', async () => {
+      const res = await fetchJson('/api/index', {
+        method: 'POST',
+        body: { root_path: '/nonexistent/path', project_name: 'test' },
+      });
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('GET /api/processes', () => {
+    it('returns processes array', async () => {
+      const res = await fetchJson('/api/processes');
+      expect(res.status).toBe(200);
+      expect(res.body.processes).toBeDefined();
+      expect(Array.isArray(res.body.processes)).toBe(true);
+      // The current UI server should be in the list (on Unix).
+      if (process.platform !== 'win32') {
+        const self = res.body.processes.find((p: any) => p.is_self);
+        expect(self).toBeDefined();
+      }
+    });
+  });
+
+  describe('POST /api/process-kill', () => {
+    it('rejects killing the UI server itself', async () => {
+      const res = await fetchJson('/api/process-kill', {
+        method: 'POST',
+        body: { pid: process.pid },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Cannot kill the UI server');
+    });
+
+    it('rejects invalid pid', async () => {
+      const res = await fetchJson('/api/process-kill', {
+        method: 'POST',
+        body: { pid: -1 },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('positive number');
+    });
+  });
+
+  describe('POST /api/project-delete', () => {
+    it('rejects invalid project name', async () => {
+      const res = await fetchJson('/api/project-delete', {
+        method: 'POST',
+        body: { name: '../etc/passwd' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Invalid project name');
+    });
+
+    it('rejects deleting the active project', async () => {
+      const res = await fetchJson('/api/project-delete', {
+        method: 'POST',
+        body: { name: TEST_PROJECT },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Cannot delete the currently active project');
+    });
+  });
+
+  describe('GET /api/logs', () => {
+    it('returns log lines array', async () => {
+      const res = await fetchJson('/api/logs');
+      expect(res.status).toBe(200);
+      expect(res.body.lines).toBeDefined();
+      expect(Array.isArray(res.body.lines)).toBe(true);
+    });
+
+    it('respects the lines parameter', async () => {
+      const res = await fetchJson('/api/logs?lines=5');
+      expect(res.status).toBe(200);
+      expect(res.body.lines.length).toBeLessThanOrEqual(5);
+    });
+  });
+
+  describe('Unknown endpoint', () => {
+    it('returns 404 for unknown API path', async () => {
+      const res = await fetchJson('/api/nonexistent');
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('Unknown API endpoint');
+    });
+  });
+});

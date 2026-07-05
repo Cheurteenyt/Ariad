@@ -93,7 +93,7 @@ export const api = {
     postJson(`${API_BASE}/api/index`, { root_path: rootPath, project_name: projectName }),
 
   getIndexStatus: () =>
-    fetchJson<{ jobs: Array<{ id: string; status: string; error?: string }> }>(
+    fetchJson<{ jobs: Array<{ id: string; status: string; error?: string; started_at: string; project: string }> }>(
       `${API_BASE}/api/index-status`,
     ),
 

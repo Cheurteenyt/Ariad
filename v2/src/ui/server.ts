@@ -4,8 +4,8 @@
 // Serves static assets + API endpoints that read from the V2 stores.
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, extname, resolve, sep } from "node:path";
+import { existsSync, readFileSync, statSync, readdirSync } from "node:fs";
+import { join, extname, resolve, sep, dirname } from "node:path";
 import { homedir } from 'node:os';
 import { HumanMemoryStore, defaultHumanDbPath } from '../human/store.js';
 import { CodeGraphReader, defaultCodeDbPath } from '../bridge/sqlite-ro.js';
@@ -43,6 +43,12 @@ export class UiServer {
   private graphUiPath: string;
   private humanStore: HumanMemoryStore;
   private codeReader: CodeGraphReader | undefined;
+  // R17: in-memory index job tracking. Keyed by job ID (string).
+  // Jobs are created by POST /api/index and polled via GET /api/index-status.
+  private indexJobs: Map<string, { id: string; status: string; error?: string; started_at: string; project: string }> = new Map();
+  // R17: in-memory log buffer (ring buffer, max 500 lines).
+  private logBuffer: string[] = [];
+  private static readonly LOG_BUFFER_MAX = 500;
 
   constructor(opts: UiServerOptions) {
     this.port = opts.port ?? DEFAULT_PORT;
@@ -57,6 +63,56 @@ export class UiServer {
     }
 
     this.server = createServer((req, res) => this.handleRequest(req, res));
+  }
+
+  /**
+   * Append a line to the in-memory log buffer. Used by /api/logs.
+   * The buffer is a ring buffer — oldest lines are dropped when full.
+   */
+  private log(line: string): void {
+    this.logBuffer.push(`[${new Date().toISOString()}] ${line}`);
+    if (this.logBuffer.length > UiServer.LOG_BUFFER_MAX) {
+      this.logBuffer.shift();
+    }
+  }
+
+  /**
+   * Parse a JSON body from an IncomingMessage. Returns null on parse error
+   * or missing body. Caps at 1MB to prevent abuse.
+   */
+  private async parseJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      let totalSize = 0;
+      const MAX_BODY = 1024 * 1024; // 1MB
+      req.on('data', (chunk: Buffer) => {
+        totalSize += chunk.length;
+        if (totalSize > MAX_BODY) {
+          // Too large — destroy the stream and resolve null.
+          req.destroy();
+          resolve(null);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => {
+        if (chunks.length === 0) {
+          resolve(null);
+          return;
+        }
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            resolve(null);
+            return;
+          }
+          resolve(body as Record<string, unknown>);
+        } catch {
+          resolve(null);
+        }
+      });
+      req.on('error', () => resolve(null));
+    });
   }
 
   start(): void {
@@ -379,6 +435,322 @@ export class UiServer {
         freshness_score: score,
         freshness_label: freshnessLabel(score),
       });
+      return;
+    }
+
+    // ── R17: 7 new endpoints ──────────────────────────────────────────
+
+    // GET /api/adr — list all ADR notes for the project
+    if (path === '/api/adr' && req.method === 'GET') {
+      const adrs = this.humanStore.listNodes(project, { label: 'ADR', limit: 500 });
+      if (adrs.length === 0) {
+        this.sendJson(res, 200, { has_adr: false });
+        return;
+      }
+      // Return the most recent ADR's content + a list of all ADRs.
+      const latest = adrs[0];
+      this.sendJson(res, 200, {
+        has_adr: true,
+        content: latest.body_markdown,
+        updated_at: latest.updated_at,
+        title: latest.title,
+        slug: latest.slug,
+        obsidian_path: latest.obsidian_path,
+        all_adrs: adrs.map((a) => ({
+          id: a.id,
+          title: a.title,
+          slug: a.slug,
+          status: a.status,
+          updated_at: a.updated_at,
+          obsidian_path: a.obsidian_path,
+        })),
+      });
+      return;
+    }
+
+    // POST /api/adr — create or update an ADR note
+    if (path === '/api/adr' && req.method === 'POST') {
+      const body = await this.parseJsonBody(req);
+      if (!body) {
+        this.sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+      const content = typeof body.content === 'string' ? body.content : '';
+      const title = typeof body.title === 'string' ? body.title : `ADR-${Date.now().toString(36)}`;
+      const adrProject = typeof body.project === 'string' ? body.project : project;
+      try {
+        // Check if an ADR with this title already exists; if so, update it.
+        const existing = this.humanStore.listNodes(adrProject, { label: 'ADR', limit: 500 })
+          .find((a) => a.title === title);
+        let node;
+        if (existing) {
+          node = this.humanStore.updateNode(existing.id, { body_markdown: content });
+        } else {
+          node = this.humanStore.createNode({
+            project: adrProject,
+            label: 'ADR',
+            title,
+            body_markdown: content,
+            source: 'human',
+            status: 'active',
+            tags: ['adr'],
+          });
+        }
+        this.log(`ADR saved: id=${node!.id} title="${title}"`);
+        this.sendJson(res, 200, {
+          success: true,
+          id: node!.id,
+          title: node!.title,
+          slug: node!.slug,
+          obsidian_path: node!.obsidian_path,
+          updated_at: node!.updated_at,
+        });
+      } catch (e: any) {
+        this.sendJson(res, 500, { error: e.message });
+      }
+      return;
+    }
+
+    // GET /api/browse — file picker (list directories)
+    if (path === '/api/browse' && req.method === 'GET') {
+      const queryPath = url.searchParams.get('path');
+      let targetPath: string;
+      if (queryPath) {
+        targetPath = resolve(queryPath);
+      } else {
+        // Default: home directory
+        targetPath = homedir();
+      }
+      try {
+        if (!existsSync(targetPath)) {
+          this.sendJson(res, 404, { error: `Path not found: ${targetPath}` });
+          return;
+        }
+        const stat = statSync(targetPath);
+        if (!stat.isDirectory()) {
+          this.sendJson(res, 400, { error: 'Path is not a directory' });
+          return;
+        }
+        const entries = readdirSync(targetPath, { withFileTypes: true });
+        const dirs = entries
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+          .map((e) => e.name)
+          .sort();
+        const parent = dirname(targetPath) === targetPath ? '' : dirname(targetPath);
+        // Detect filesystem roots (Unix: /, Windows: C:\, D:\, etc.)
+        const roots: string[] = [];
+        if (process.platform === 'win32') {
+          // Windows: list drive letters
+          for (let i = 65; i <= 90; i++) {
+            const drive = String.fromCharCode(i) + ':\\';
+            if (existsSync(drive)) roots.push(drive);
+          }
+        } else {
+          roots.push('/');
+        }
+        this.sendJson(res, 200, {
+          path: targetPath,
+          dirs,
+          roots,
+          parent,
+        });
+      } catch (e: any) {
+        this.sendJson(res, 500, { error: e.message });
+      }
+      return;
+    }
+
+    // POST /api/index — trigger a V1 index job (async, returns job ID)
+    if (path === '/api/index' && req.method === 'POST') {
+      const body = await this.parseJsonBody(req);
+      if (!body) {
+        this.sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+      const rootPath = typeof body.root_path === 'string' ? body.root_path : '';
+      const projectName = typeof body.project_name === 'string' ? body.project_name : '';
+      if (!rootPath || !projectName) {
+        this.sendJson(res, 400, { error: 'root_path and project_name are required' });
+        return;
+      }
+      if (!existsSync(rootPath)) {
+        this.sendJson(res, 404, { error: `root_path not found: ${rootPath}` });
+        return;
+      }
+      // Generate a job ID and track it. The actual indexing is done by V1's
+      // `cbm index_repository` command — we spawn it as a subprocess.
+      const jobId = `idx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const job: { id: string; status: string; error?: string; started_at: string; project: string } = { id: jobId, status: 'pending', started_at: new Date().toISOString(), project: projectName };
+      this.indexJobs.set(jobId, job);
+      this.log(`Index job started: id=${jobId} project="${projectName}" root="${rootPath}"`);
+
+      // Spawn the V1 indexer. We use `cbm` if available, otherwise `npx cbm`.
+      // The job status is updated in-memory when the process exits.
+      const { spawn } = await import('node:child_process');
+      try {
+        const child = spawn('cbm', ['index_repository', '--project', projectName, rootPath], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: false,
+        });
+        job.status = 'running';
+        let stderr = '';
+        child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+        child.on('error', (err) => {
+          job.status = 'failed';
+          job.error = `spawn error: ${err.message}`;
+          this.log(`Index job ${jobId} failed: ${err.message}`);
+        });
+        child.on('exit', (code) => {
+          if (code === 0) {
+            job.status = 'completed';
+            this.log(`Index job ${jobId} completed`);
+          } else {
+            job.status = 'failed';
+            job.error = `exit code ${code}: ${stderr.slice(0, 500)}`;
+            this.log(`Index job ${jobId} failed (exit ${code})`);
+          }
+        });
+      } catch (e: any) {
+        job.status = 'failed';
+        job.error = e.message;
+        this.log(`Index job ${jobId} failed to start: ${e.message}`);
+      }
+
+      this.sendJson(res, 202, { job_id: jobId, status: job.status });
+      return;
+    }
+
+    // GET /api/index-status — list all index jobs
+    if (path === '/api/index-status' && req.method === 'GET') {
+      const jobs = [...this.indexJobs.values()].sort((a, b) => b.started_at.localeCompare(a.started_at));
+      // Clean up old completed/failed jobs (keep last 50)
+      if (this.indexJobs.size > 50) {
+        const toKeep = new Set(jobs.slice(0, 50).map((j) => j.id));
+        for (const id of this.indexJobs.keys()) {
+          if (!toKeep.has(id)) this.indexJobs.delete(id);
+        }
+      }
+      this.sendJson(res, 200, { jobs });
+      return;
+    }
+
+    // GET /api/processes — list running cbm/cbm-v2 processes
+    if (path === '/api/processes' && req.method === 'GET') {
+      const currentPid = process.pid;
+      const processes: Array<{ pid: number; cpu: number; rss_mb: number; elapsed: string; command: string; is_self: boolean }> = [];
+      try {
+        // Use `ps` to list processes (Unix only). On Windows, return empty.
+        if (process.platform !== 'win32') {
+          const { execSync } = await import('node:child_process');
+          // ps aux — filter for cbm/cbm-v2/node processes
+          const output = execSync('ps aux 2>/dev/null | grep -E "cbm|node" | grep -v grep', {
+            encoding: 'utf-8',
+            timeout: 5000,
+          });
+          const lines = output.split('\n').filter((l) => l.trim().length > 0);
+          for (const line of lines.slice(0, 50)) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length < 11) continue;
+            const pid = parseInt(parts[1], 10);
+            if (!Number.isFinite(pid)) continue;
+            const cpu = parseFloat(parts[2]) || 0;
+            const rssKb = parseFloat(parts[5]) || 0;
+            const command = parts.slice(10).join(' ').slice(0, 200);
+            // Skip the grep process itself and the current ps command
+            if (command.includes('grep ')) continue;
+            processes.push({
+              pid,
+              cpu,
+              rss_mb: Math.round(rssKb / 1024),
+              elapsed: parts[9] || 'unknown',
+              command,
+              is_self: pid === currentPid,
+            });
+          }
+        }
+      } catch {
+        // ps not available or failed — return empty list
+      }
+      this.sendJson(res, 200, { processes });
+      return;
+    }
+
+    // POST /api/process-kill — kill a process by PID
+    if (path === '/api/process-kill' && req.method === 'POST') {
+      const body = await this.parseJsonBody(req);
+      if (!body) {
+        this.sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+      const pid = typeof body.pid === 'number' ? body.pid : parseInt(String(body.pid), 10);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        this.sendJson(res, 400, { error: 'pid must be a positive number' });
+        return;
+      }
+      // Defense: refuse to kill ourselves
+      if (pid === process.pid) {
+        this.sendJson(res, 400, { error: 'Cannot kill the UI server itself' });
+        return;
+      }
+      try {
+        process.kill(pid, 'SIGTERM');
+        this.log(`Process killed: pid=${pid}`);
+        this.sendJson(res, 200, { success: true, pid, signal: 'SIGTERM' });
+      } catch (e: any) {
+        this.sendJson(res, 500, { error: `Failed to kill pid ${pid}: ${e.message}` });
+      }
+      return;
+    }
+
+    // POST /api/project-delete — delete a project's code graph DB
+    if (path === '/api/project-delete' && req.method === 'POST') {
+      const body = await this.parseJsonBody(req);
+      if (!body) {
+        this.sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+      const name = typeof body.name === 'string' ? body.name : '';
+      if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+        this.sendJson(res, 400, { error: 'Invalid project name (alphanumeric, dash, underscore only)' });
+        return;
+      }
+      // Defense: refuse to delete the currently active project
+      if (name === this.project) {
+        this.sendJson(res, 400, { error: 'Cannot delete the currently active project. Stop the UI server first.' });
+        return;
+      }
+      const dbPath = defaultCodeDbPath(name);
+      const humanDbPath = defaultHumanDbPath(name);
+      try {
+        const { unlinkSync } = await import('node:fs');
+        let deleted = false;
+        if (existsSync(dbPath)) {
+          unlinkSync(dbPath);
+          deleted = true;
+        }
+        if (existsSync(humanDbPath)) {
+          unlinkSync(humanDbPath);
+          deleted = true;
+        }
+        // Also clean up WAL/SHM files
+        for (const suffix of ['-wal', '-shm']) {
+          if (existsSync(dbPath + suffix)) unlinkSync(dbPath + suffix);
+          if (existsSync(humanDbPath + suffix)) unlinkSync(humanDbPath + suffix);
+        }
+        this.log(`Project deleted: name="${name}" db=${dbPath}`);
+        this.sendJson(res, 200, { success: true, name, deleted, db_path: dbPath });
+      } catch (e: any) {
+        this.sendJson(res, 500, { error: `Failed to delete project: ${e.message}` });
+      }
+      return;
+    }
+
+    // GET /api/logs — return recent log lines
+    if (path === '/api/logs' && req.method === 'GET') {
+      const linesParam = url.searchParams.get('lines');
+      const lines = linesParam ? Math.min(Math.max(parseInt(linesParam, 10) || 100, 1), 500) : 100;
+      const recent = this.logBuffer.slice(-lines);
+      this.sendJson(res, 200, { lines: recent });
       return;
     }
 
