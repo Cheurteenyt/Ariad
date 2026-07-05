@@ -1,8 +1,8 @@
 # V2 Roadmap — Codebase Memory V2
 
-> Updated 2026-07-05 for version 0.5.5.
+> Updated 2026-07-05 for version 0.6.0.
 
-## Current State (0.5.5)
+## Current State (0.6.0)
 
 ### ✅ Completed
 
@@ -23,27 +23,33 @@
 | N+1 query elimination | 0.5.3 | getBulkNotesByCbmNodeIds, getBulkNodeDegrees — /api/layout 2000→4 queries |
 | Round 14 deep audit | 0.5.4 | 18 bugs (5 CRITICAL sync/data, 7 HIGH, 4 MEDIUM, 2 LOW). markSynced hash consistency, safeJsonParse array validation, UI server double-response crash |
 | Round 15 N+1 + UX | 0.5.5 | 16 bugs (3 CRITICAL, 6 HIGH, 5 MEDIUM, 2 LOW). getBulkNotesByCbmNodeIds SQL-level ROW_NUMBER(), getBulkEdges(), backup N+1 fix, ProjectCard redesign |
+| Full docs audit | 0.5.5 | 6 docs updated (README, ROADMAP, MCP_TOOLS, CLI_REF, TOKEN_ECONOMY, ARCHITECTURE) |
+| 7 new API endpoints | 0.6.0 | /api/adr (GET+POST), /api/browse, /api/index, /api/index-status, /api/processes, /api/process-kill, /api/project-delete, /api/logs |
+| ControlTab full implementation | 0.6.0 | Processes list, logs viewer, index jobs, kill process |
 
 ### 📊 Metrics
 
 | Metric | Value |
 |---|---|
-| Source files (v2) | 32 |
-| Test files | 16 |
-| Tests | 175 (all passing) |
-| Bugs fixed (15 rounds) | 403+ |
+| Source files (v2) | 33 |
+| Test files | 17 |
+| Tests | 194 (all passing) |
+| Bugs fixed (16 rounds) | 403+ |
 | MCP tools | 7 |
 | CLI commands | 15+ |
-| Graph UI components | 12 |
+| API endpoints | 13 (6 existing + 7 new) |
+| Graph UI components | 13 |
 | CI pipeline stages | 3 (typecheck → build → test) |
 | Production dependencies | 3 |
 
 ## Roadmap
 
-### Phase 1: Stability & Developer Experience (0.6.0)
+### Phase 1: Stability & Developer Experience (0.6.x)
 
 | Feature | Priority | Complexity | Status |
 |---|---|---|---|
+| ✅ 7 missing API endpoints | Done | Medium | Completed in 0.6.0 |
+| ✅ ControlTab full implementation | Done | Medium | Completed in 0.6.0 |
 | `cbm-v2 watch` daemon | High | Medium | Planned |
 | Refactor `generateVault` (230 LOC → sub-functions) | High | Medium | Planned |
 | Refactor `importVault` (188 LOC → sub-functions) | High | Medium | Planned |
@@ -51,7 +57,6 @@
 | ESLint + Prettier configuration | Medium | Low | Planned |
 | `noUncheckedIndexedAccess` in tsconfig | Medium | Low | Planned |
 | Compact MCP responses (shorter excerpts) | Medium | Low | Planned |
-| 7 missing API endpoints (ADR, browse, index, processes, logs) | Medium | Medium | Planned |
 | UI tests (vitest + testing-library) | Medium | Medium | Planned |
 
 ### Phase 2: Proactive Intelligence (0.7.0)
@@ -107,7 +112,9 @@
 | R13 (N+1 elimination) | 0.5.3 | 15 | 15 | 156 |
 | R14 (deep audit) | 0.5.4 | 18 | 18 | 170 |
 | R15 (N+1 + UX) | 0.5.5 | 16 | 16 | 175 |
-| **Total** | | **403+** | **403+** | **175** |
+| R16 (docs audit) | 0.5.5 | — (docs) | — | 175 |
+| R17 (7 API endpoints) | 0.6.0 | — (features) | — | 194 |
+| **Total** | | **403+** | **403+** | **194** |
 
 ## Performance Milestones
 
@@ -123,3 +130,24 @@
 | R15 | `get_project_overview` | ~5000 queries | ~4 queries | -99.9% |
 | R15 | `backup export` edges | ~1000 queries | 1 query | -99.9% |
 | R15 | `getBulkNotesByCbmNodeIds` (limit=1, 10000 notes) | 10000 rows | 1 row | -99.99% |
+
+## API Endpoints (0.6.0)
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/layout` | GET | Graph layout data (nodes + edges, bulk-fetched) |
+| `/api/projects` | GET | List indexed projects with node/edge counts + health |
+| `/api/project-health` | GET | Check DB integrity for a specific project |
+| `/api/project-delete` | POST | Delete a project's code graph + human DB (R17) |
+| `/api/dashboard` | GET | Dashboard data (KPIs, freshness, recommendations) |
+| `/api/human-notes` | GET | Human notes for a code node |
+| `/api/graph-status` | GET | Graph freshness status |
+| `/api/adr` | GET | List all ADR notes (R17) |
+| `/api/adr` | POST | Create or update an ADR note (R17) |
+| `/api/browse` | GET | File picker — list directories (R17) |
+| `/api/index` | POST | Trigger a V1 index job (async) (R17) |
+| `/api/index-status` | GET | List index jobs (R17) |
+| `/api/processes` | GET | List running cbm/node processes (R17) |
+| `/api/process-kill` | POST | Kill a process by PID (R17) |
+| `/api/logs` | GET | Recent log lines (R17) |
+
