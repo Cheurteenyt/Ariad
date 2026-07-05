@@ -89,30 +89,38 @@ export class CreateHumanNoteTool extends BaseTool {
         validatedLinks.push({ cbm_node_id: cbmId, edge_type: link.edge_type, exists });
       }
 
-      const node = this.humanStore.createNode({
-        project,
-        label,
-        title,
-        body_markdown: bodyMarkdown,
-        status,
-        source: 'human',
-        cbm_node_ids: cbmNodeIds,
-        tags,
-        author,
-      });
-
-      // Create edges.
+      // R26 (Bug #4 fix): wrap createNode + createEdge in a single transaction
+      // so either everything commits or nothing does. Previously, if createEdge
+      // threw after createNode succeeded, the node (and any earlier edges)
+      // remained committed — leaving an orphan that a retry would duplicate.
+      let node: any;
       const createdEdges: Array<{ id: number; type: string; cbm_node_id: number }> = [];
-      for (const link of validatedLinks) {
-        const edge = this.humanStore.createEdge({
+      const db = this.humanStore.getRawDb();
+      const tx = db.transaction(() => {
+        node = this.humanStore.createNode({
           project,
-          source_human_node_id: node.id,
-          target_kind: 'code',
-          target_cbm_node_id: link.cbm_node_id,
-          type: link.edge_type,
+          label,
+          title,
+          body_markdown: bodyMarkdown,
+          status,
+          source: 'human',
+          cbm_node_ids: cbmNodeIds,
+          tags,
+          author,
         });
-        createdEdges.push({ id: edge.id, type: link.edge_type, cbm_node_id: link.cbm_node_id });
-      }
+
+        for (const link of validatedLinks) {
+          const edge = this.humanStore.createEdge({
+            project,
+            source_human_node_id: node.id,
+            target_kind: 'code',
+            target_cbm_node_id: link.cbm_node_id,
+            type: link.edge_type,
+          });
+          createdEdges.push({ id: edge.id, type: link.edge_type, cbm_node_id: link.cbm_node_id });
+        }
+      });
+      tx();
 
       return this.json({
         success: true,

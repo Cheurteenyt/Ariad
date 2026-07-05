@@ -94,33 +94,10 @@ export function registerObsidianCommand(program: Command): void {
           console.warn('    Sync will work in human-only mode (no auto module/route notes).');
         }
 
-        if (direction === 'export' || direction === 'both') {
-          console.log('');
-          console.log('→ Export (DB → vault):');
-          const result = generateVault({
-            project,
-            vaultPath,
-            humanStore,
-            codeReader,
-            backupBeforeWrite: backup,
-            dryRun,
-            autoGenerateModuleNotes: autoModules,
-            autoGenerateRouteNotes: autoRoutes,
-            minDegreeForModuleNote: minDegree,
-          });
-          console.log(`  Created: ${result.created.length}`);
-          console.log(`  Updated: ${result.updated.length}`);
-          console.log(`  Unchanged: ${result.unchanged.length}`);
-          if (result.backups.length > 0) console.log(`  Backups: ${result.backups.length}`);
-          if (result.errors.length > 0) {
-            console.log(`  Errors: ${result.errors.length}`);
-            for (const e of result.errors.slice(0, 5)) {
-              console.log(`    - ${e.path}: ${e.error}`);
-            }
-            if (result.errors.length > 5) console.log(`    ... and ${result.errors.length - 5} more`);
-          }
-        }
-
+        // R26 (Bug #1 fix): when direction is 'both', import runs BEFORE export.
+        // This ensures user edits to frontmatter (status, tags, type) are pulled
+        // into the DB first, so the subsequent export regenerates the vault from
+        // the updated DB rather than overwriting the user's edits with stale data.
         if (direction === 'import' || direction === 'both') {
           console.log('');
           console.log('← Import (vault → DB):');
@@ -139,6 +116,33 @@ export function registerObsidianCommand(program: Command): void {
           if (result.orphanNotes.length > 0) {
             console.log(`  Orphan notes (no cbm_node_id): ${result.orphanNotes.length}`);
           }
+          if (result.errors.length > 0) {
+            console.log(`  Errors: ${result.errors.length}`);
+            for (const e of result.errors.slice(0, 5)) {
+              console.log(`    - ${e.path}: ${e.error}`);
+            }
+            if (result.errors.length > 5) console.log(`    ... and ${result.errors.length - 5} more`);
+          }
+        }
+
+        if (direction === 'export' || direction === 'both') {
+          console.log('');
+          console.log('→ Export (DB → vault):');
+          const result = generateVault({
+            project,
+            vaultPath,
+            humanStore,
+            codeReader,
+            backupBeforeWrite: backup,
+            dryRun,
+            autoGenerateModuleNotes: autoModules,
+            autoGenerateRouteNotes: autoRoutes,
+            minDegreeForModuleNote: minDegree,
+          });
+          console.log(`  Created: ${result.created.length}`);
+          console.log(`  Updated: ${result.updated.length}`);
+          console.log(`  Unchanged: ${result.unchanged.length}`);
+          if (result.backups.length > 0) console.log(`  Backups: ${result.backups.length}`);
           if (result.errors.length > 0) {
             console.log(`  Errors: ${result.errors.length}`);
             for (const e of result.errors.slice(0, 5)) {

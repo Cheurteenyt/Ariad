@@ -13,6 +13,7 @@
 
 import { HumanMemoryStore } from '../human/store.js';
 import { CodeGraphReader } from '../bridge/sqlite-ro.js';
+import { safeJsonParse } from '../constants.js';
 import { parseNote, parseCbmNodeIds, parseTags, splitSections } from './frontmatter.js';
 import {
   parseWikilinks,
@@ -21,7 +22,7 @@ import {
   inferEdgeTypeFromContext,
   Wikilink,
 } from './wikilinks.js';
-import { walkVault, readNote, hashContent } from './vault.js';
+import { walkVault, readNote } from './vault.js';
 import {
   slugify,
   HumanNodeLabel,
@@ -124,11 +125,10 @@ function importSingleFile(relPath: string, opts: ImportOptions, result: ImportRe
   const existing = resolveExistingNode(opts, relPath, slug, result);
   if (existing === 'CONFLICT') return; // error already pushed
 
-  const vaultHash = hashContent(content);
-
-  // Upsert the node (create or update, with no-op detection).
+  // R26 (Bug #5 fix): removed vestigial vaultHash computation — markSynced()
+  // ignores the parameter (prefixed _vaultContentHash). Was wasted SHA-256 on every file.
   const sourceNodeId = upsertNode(existing, opts, result, {
-    relPath, label, title, humanBody, fm, status, source, cbmNodeIds, tags, vaultHash,
+    relPath, label, title, humanBody, fm, status, source, cbmNodeIds, tags,
   });
 
   if (cbmNodeIds.length === 0) {
@@ -211,7 +211,6 @@ interface UpsertSpec {
   source: HumanNodeSource;
   cbmNodeIds: number[];
   tags: string[];
-  vaultHash: string;
 }
 
 /**
@@ -231,7 +230,12 @@ function upsertNode(
     const sameCbmIds = JSON.stringify(existing.cbm_node_ids.slice().sort()) === JSON.stringify(spec.cbmNodeIds.slice().sort());
     const sameTags = JSON.stringify(existing.tags.slice().sort()) === JSON.stringify(spec.tags.slice().sort());
     const sameStatus = existing.status === spec.status;
-    if (sameContent && sameTitle && sameCbmIds && sameTags && sameStatus) {
+    // R26 (Bug #3 fix): compare frontmatter too. Previously, if a user edited
+    // only a custom frontmatter key (not title/body/tags/status/cbm_ids), the
+    // no-op check would short-circuit and the edit would never reach the DB.
+    const existingFm = safeJsonParse(existing.frontmatter_json, {} as Record<string, unknown>);
+    const sameFrontmatter = JSON.stringify(sortKeys(existingFm)) === JSON.stringify(sortKeys(spec.fm));
+    if (sameContent && sameTitle && sameCbmIds && sameTags && sameStatus && sameFrontmatter) {
       result.unchanged.push(spec.relPath);
       return existing.id;
     }
@@ -246,7 +250,7 @@ function upsertNode(
         tags: spec.tags,
         obsidian_path: spec.relPath,
       });
-      opts.humanStore.markSynced(existing.id, 'import', spec.vaultHash);
+      opts.humanStore.markSynced(existing.id, 'import');
     }
     result.updated.push(spec.relPath);
     return existing.id;
@@ -267,7 +271,7 @@ function upsertNode(
       obsidian_path: spec.relPath,
       source_file: spec.relPath,
     });
-    opts.humanStore.markSynced(node.id, 'import', spec.vaultHash);
+    opts.humanStore.markSynced(node.id, 'import');
     result.created.push(spec.relPath);
     return node.id;
   }
@@ -421,3 +425,19 @@ function extractTitle(body: string, relPath?: string): string | null {
 
 // Import HumanNode type for resolveExistingNode return type.
 import type { HumanNode } from '../human/schema.js';
+
+/**
+ * R26: Recursively sort object keys for stable JSON comparison.
+ * Used by upsertNode's no-op detection to compare frontmatter objects
+ * regardless of key order.
+ */
+function sortKeys(obj: Record<string, unknown>): Record<string, unknown> {
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) {
+    const val = obj[key];
+    sorted[key] = (val !== null && typeof val === 'object' && !Array.isArray(val))
+      ? sortKeys(val as Record<string, unknown>)
+      : val;
+  }
+  return sorted;
+}

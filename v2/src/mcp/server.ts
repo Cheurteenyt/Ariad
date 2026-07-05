@@ -64,9 +64,19 @@ export class McpServer {
     }
 
     // Graceful shutdown on signals.
+    // R26 (Bug #6 fix): close DB handles before process.exit to ensure
+    // WAL checkpoints are flushed cleanly.
     const shutdown = (signal: string) => {
       process.stderr.write(`[cbm-v2 mcp] received ${signal}, shutting down...\n`);
-      Promise.allSettled([...this.pending]).finally(() => process.exit(0));
+      Promise.allSettled([...this.pending]).finally(() => {
+        try {
+          this.opts.humanStore.close();
+          this.opts.codeReader?.close();
+        } catch {
+          // ignore close errors during shutdown
+        }
+        process.exit(0);
+      });
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));

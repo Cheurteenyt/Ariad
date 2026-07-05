@@ -135,7 +135,19 @@ describe('Sync conflict scenarios', () => {
       autoGenerateRouteNotes: false,
     });
 
-    // Import without modifying the vault — should be unchanged.
+    // First import — the frontmatter was enriched by buildFrontmatter during
+    // export (type, source, status, cbm_node_ids, tags), so the DB's
+    // frontmatter_json ('{}') differs from the vault's. This import should
+    // detect the change and update the DB.
+    const firstResult = importVault({
+      project: 'test',
+      vaultPath,
+      humanStore,
+    });
+    expect(firstResult.updated).toContain(node.obsidian_path);
+
+    // Second import — now the DB frontmatter matches the vault, so it should
+    // be unchanged. This is the real no-op test.
     const result = importVault({
       project: 'test',
       vaultPath,
