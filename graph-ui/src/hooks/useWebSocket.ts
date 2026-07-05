@@ -59,9 +59,10 @@ export function useWebSocket(
     if (!project || !mountedRef.current) return;
 
     // Build WebSocket URL from the current page URL.
+    // R26: use /ws path so Vite dev server can proxy it separately from HMR.
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}`;
+    const wsUrl = `${protocol}//${host}/ws`;
 
     let ws: WebSocket;
     try {
