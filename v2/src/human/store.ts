@@ -462,12 +462,18 @@ export class HumanMemoryStore {
     params.push(new Date().toISOString());
     params.push(id);
 
-    this.db.prepare(`UPDATE human_nodes SET ${sets.join(', ')} WHERE id = ?`).run(...params);
-
-    // R21: if cbm_node_ids changed, sync the junction table.
-    if (input.cbm_node_ids !== undefined) {
-      this.syncCbmLinks(id, input.cbm_node_ids);
-    }
+    // R46 (F7): wrap the UPDATE + junction-table sync in a transaction so a
+    // crash between them can't leave the JSON cbm_node_ids cache and the
+    // human_node_cbm_links junction table out of sync. Matches the markSynced
+    // idiom (line 500). emitNotification stays outside the transaction so a
+    // notification callback can't roll back the write.
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`UPDATE human_nodes SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+      if (input.cbm_node_ids !== undefined) {
+        this.syncCbmLinks(id, input.cbm_node_ids);
+      }
+    });
+    tx();
 
     // R25: notify WebSocket clients that human_nodes changed.
     this.emitNotification('human_nodes_changed', { node_id: id, action: 'update' });
@@ -478,11 +484,19 @@ export class HumanMemoryStore {
   deleteNode(id: number): boolean {
     // Fetch the node first to clean up sync_state (keyed by project + obsidian_path, not by id).
     const node = this.getNodeById(id);
-    const result = this.db.prepare('DELETE FROM human_nodes WHERE id = ?').run(id);
-    if (result.changes > 0 && node && node.obsidian_path) {
-      this.db.prepare('DELETE FROM sync_state WHERE project = ? AND obsidian_path = ?')
-        .run(node.project, node.obsidian_path);
-    }
+    // R46 (F7): wrap both DELETEs in a transaction so a crash between them
+    // can't leave sync_state pointing at a non-existent node.
+    let result: { changes: number };
+    const tx = this.db.transaction(() => {
+      result = this.db.prepare('DELETE FROM human_nodes WHERE id = ?').run(id);
+      if (result.changes > 0 && node && node.obsidian_path) {
+        this.db.prepare('DELETE FROM sync_state WHERE project = ? AND obsidian_path = ?')
+          .run(node.project, node.obsidian_path);
+      }
+    });
+    tx();
+    // result is assigned inside the transaction (synchronous in better-sqlite3).
+    if (!result!) return false;
     // R25: notify WebSocket clients that human_nodes changed (only if something was deleted).
     if (result.changes > 0) {
       this.emitNotification('human_nodes_changed', { node_id: id, action: 'delete' });
@@ -610,54 +624,60 @@ export class HumanMemoryStore {
     }
 
     const now = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `INSERT INTO human_edges (
-          project, source_human_node_id, target_kind,
-          target_cbm_node_id, target_human_node_id,
-          type, properties_json, provenance, confidence, source_file, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        input.project,
-        input.source_human_node_id,
-        input.target_kind,
-        input.target_kind === 'code' ? input.target_cbm_node_id! : null,
-        input.target_kind === 'human' ? input.target_human_node_id! : null,
-        input.type,
-        JSON.stringify(input.properties ?? {}),
-        'human',
-        input.confidence ?? 1.0,
-        input.source_file ?? null,
-        now
-      );
 
-    // R19+R21: keep the denormalized cbm_node_ids JSON cache AND the junction
-    // table in sync. When a code-target edge is created, the source node's
-    // cbm_node_ids must include the target_cbm_node_id — otherwise queries
-    // won't find this note.
-    if (input.target_kind === 'code' && input.target_cbm_node_id != null) {
-      const sourceNode = this.getNodeById(input.source_human_node_id);
-      if (sourceNode) {
-        const cbmId = input.target_cbm_node_id;
-        // R21: write to junction table (idempotent via INSERT OR IGNORE).
-        this.db
-          .prepare('INSERT OR IGNORE INTO human_node_cbm_links (human_node_id, cbm_node_id) VALUES (?, ?)')
-          .run(sourceNode.id, cbmId);
-        // R19: update the JSON cache (only if not already present).
-        if (!sourceNode.cbm_node_ids.includes(cbmId)) {
-          const updatedIds = [...sourceNode.cbm_node_ids, cbmId];
+    // R46 (F7): wrap the INSERT + junction-table sync + JSON cache update in
+    // a transaction so a crash between them can't leave the junction table
+    // and the JSON cache out of sync. emitNotification stays outside.
+    let newEdgeId!: number;
+    const tx = this.db.transaction(() => {
+      const insertResult = this.db
+        .prepare(
+          `INSERT INTO human_edges (
+            project, source_human_node_id, target_kind,
+            target_cbm_node_id, target_human_node_id,
+            type, properties_json, provenance, confidence, source_file, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          input.project,
+          input.source_human_node_id,
+          input.target_kind,
+          input.target_kind === 'code' ? input.target_cbm_node_id! : null,
+          input.target_kind === 'human' ? input.target_human_node_id! : null,
+          input.type,
+          JSON.stringify(input.properties ?? {}),
+          'human',
+          input.confidence ?? 1.0,
+          input.source_file ?? null,
+          now
+        );
+      newEdgeId = Number(insertResult.lastInsertRowid);
+
+      // R19+R21: keep the denormalized cbm_node_ids JSON cache AND the junction
+      // table in sync. When a code-target edge is created, the source node's
+      // cbm_node_ids must include the target_cbm_node_id.
+      if (input.target_kind === 'code' && input.target_cbm_node_id != null) {
+        const sourceNode = this.getNodeById(input.source_human_node_id);
+        if (sourceNode) {
+          const cbmId = input.target_cbm_node_id;
           this.db
-            .prepare('UPDATE human_nodes SET cbm_node_ids = ? WHERE id = ?')
-            .run(JSON.stringify(updatedIds), sourceNode.id);
+            .prepare('INSERT OR IGNORE INTO human_node_cbm_links (human_node_id, cbm_node_id) VALUES (?, ?)')
+            .run(sourceNode.id, cbmId);
+          if (!sourceNode.cbm_node_ids.includes(cbmId)) {
+            const updatedIds = [...sourceNode.cbm_node_ids, cbmId];
+            this.db
+              .prepare('UPDATE human_nodes SET cbm_node_ids = ? WHERE id = ?')
+              .run(JSON.stringify(updatedIds), sourceNode.id);
+          }
         }
       }
-    }
+    });
+    tx();
 
     // R25: notify WebSocket clients that human_edges changed.
-    this.emitNotification('human_edges_changed', { edge_id: Number(result.lastInsertRowid), action: 'create' });
+    this.emitNotification('human_edges_changed', { edge_id: newEdgeId!, action: 'create' });
 
-    return this.getEdgeById(Number(result.lastInsertRowid))!;
+    return this.getEdgeById(newEdgeId!)!;
   }
 
   getEdgeById(id: number): HumanEdge | null {

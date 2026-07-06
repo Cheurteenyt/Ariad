@@ -1,5 +1,32 @@
 # Changelog — Codebase Memory V2
 
+## 0.11.0 — Round 46 (2026-07-06)
+
+8 issues fixed across V2 + Graph UI (2 MEDIUM bugs, 6 MEDIUM test-coverage). 11 new tests (368 total: 347 backend + 21 frontend).
+
+### Bug fixes (atomicity + validation)
+
+- **`human/store.ts` F7 (MEDIUM)**: `updateNode`, `deleteNode`, and `createEdge` lacked transaction wrapping — a crash between their multiple SQL statements could leave the JSON `cbm_node_ids` cache and the `human_node_cbm_links` junction table out of sync, or `sync_state` pointing at a deleted node. All three now wrap their multi-statement writes in `db.transaction()`, matching the existing `markSynced` idiom. `emitNotification` stays outside the transaction so a notification callback can't roll back the write.
+
+- **`get_undocumented_hotspots` F8 (MEDIUM)**: the `label` parameter was read with `optionalString` instead of `requireEnum` — invalid values like `"Bogus"` silently returned an empty array with 200 OK, misleading the caller. The JSON Schema already declared the enum; now the handler enforces it. Invalid labels get a clear error.
+
+### Test coverage expansion (6 new test files, 11 tests)
+
+- **`NodeTooltip.test.tsx` F1** (3 tests): regression test for the R40 viewport-flip fix (UI-12). Asserts the tooltip flips X/Y when near the right/bottom viewport edge and doesn't flip when there's room.
+- **`ResizeHandle.test.tsx` F2** (1 test): regression test for the R40 onPointerCancel fix (UI-11). Asserts that after `pointerCancel`, subsequent `pointerMove` events do NOT fire `onResize` (drag is released).
+- **`Sidebar.test.tsx` F3** (2 tests): regression test for the R41 flattenSingleChild fix (UI-7). Asserts the component renders without exploding on a 20-deep single-child chain and completes in <2s (pre-R41 was O(n²)).
+- **`ControlTab.test.tsx` F4** (2 tests): regression test for the R43 kill-confirmation gate (M3). Asserts `killProcess` is NOT called when `window.confirm` is dismissed, and IS called when accepted.
+- **`StatsTab.test.tsx` F5** (1 test): regression test for the R43 retry-in-error-branch fix (M5). Asserts the Retry button renders in the error branch and calls `refresh` on click.
+- **`ProjectCard.test.tsx` F6** (2 tests): regression test for the corrupt-state disable gate. Asserts the View Graph button is disabled and `onSelect` is NOT called when `status === "corrupt"`.
+
+### Test infrastructure
+- `vite.config.ts`: added `include: ["src/**/*.{test,spec}.{ts,tsx}"]` to restrict test discovery to the graph-ui project (was picking up backend tests from sibling work directories).
+
+### Test coverage
+- 11 new frontend tests across 6 new test files.
+- Frontend test count: 10 → 21.
+- Backend test count unchanged (347) — F7 and F8 are mechanical fixes covered by existing store/MCP tests.
+
 ## 0.10.9 — Round 45 (2026-07-06)
 
 8 issues fixed across V2 + Graph UI (1 HIGH bug, 1 MEDIUM security, 4 MEDIUM test-coverage, 2 LOW cleanup). 9 new tests (357 total: 347 backend + 10 frontend).

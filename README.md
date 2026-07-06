@@ -21,18 +21,19 @@ Codebase Memory V2 adds the **human context**:
 
 It syncs everything to an **Obsidian-compatible Markdown vault** so you can read and edit notes in your favorite editor, with backlinks and tags.
 
-## Current version: 0.10.9
+## Current version: 0.11.0
 
-- **357 tests** (347 backend + 10 frontend, all passing)
+- **368 tests** (347 backend + 21 frontend, all passing)
 - **7 MCP tools** (including the flagship `prepare_edit_context`)
 - **16+ CLI commands** across 7 command groups (including `watch` daemon)
 - **15 API endpoints** (6 original + 9 R17)
-- **485+ bugs fixed** across 45 audit rounds
+- **493+ bugs fixed** across 46 audit rounds
 - **Graph UI** with 2D d3-force canvas, dashboard, filters, **real-time WebSocket**, ARIA tablist, stale-while-revalidate refetch, AbortController timeouts
 - **Watch daemon** — auto-sync when vault files change (fs.watch recursive)
 - **FTS5 full-text search** on human notes (BM25 ranking, AND-of-terms, migration V4)
 - **Hardened API** — project_name validation + `--` separator, process-kill allowlist (cbm/cbm-v2 only), browse restricted to home (realpath-resolved), project-health path-traversal guard
-- **Frontend test infrastructure** — Vitest + @testing-library/react + jsdom (10 tests covering C1 regression, WS zombie race, sim reuse)
+- **Transactional writes** — updateNode/deleteNode/createEdge wrapped in transactions (atomicity guarantee)
+- **Frontend test infrastructure** — Vitest + @testing-library/react + jsdom (21 tests covering C1 regression, WS zombie race, sim reuse, viewport flip, pointer cancel, kill confirmation, corrupt-state gate)
 - **Optimized SQLite storage** (junction table, composite indexes, FTS5, PRAGMAs)
 
 ## Quick start
@@ -41,7 +42,7 @@ It syncs everything to an **Obsidian-compatible Markdown vault** so you can read
 cd v2
 npm install
 npm run build
-npm test                    # 357 tests
+npm test                    # 368 tests
 
 # Try the demo (no V1 needed)
 node dist/cli/index.js demo
