@@ -28,4 +28,15 @@ export default defineConfig({
     outDir: "dist",
     sourcemap: true,
   },
+  // R44 (Part C): Vitest configuration. The dependencies (@testing-library/react,
+  // @testing-library/jest-dom, jsdom, vitest) were already installed in package.json
+  // but the test block was missing — so `npm test` found no tests and the C1
+  // regression (useGraphData unmounting GraphCanvas on every WS refetch) hid
+  // for 3 rounds with no way to catch it.
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test-setup.ts"],
+    css: false, // don't process Tailwind CSS in tests (speeds up suite)
+  },
 });

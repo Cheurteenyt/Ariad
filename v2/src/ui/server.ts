@@ -11,7 +11,7 @@ import { WebSocketServer, WebSocket } from "ws";
 // cache but still resolve a Promise per call (~50-100µs overhead). The line
 // `const { readdirSync } = await import('node:fs')` at line 399 was also pure
 // dead code — it shadowed the top-level static import.
-import { existsSync, readFileSync, statSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, realpathSync } from "node:fs";
 import { spawn, execSync } from "node:child_process";
 import { join, extname, resolve, sep, dirname } from "node:path";
 import { homedir } from 'node:os';
@@ -65,7 +65,7 @@ export class UiServer {
   private humanStore: HumanMemoryStore;
   private codeReader: CodeGraphReader | undefined;
   // R17: in-memory index job tracking. Keyed by job ID (string).
-  private indexJobs: Map<string, { id: string; status: string; error?: string; started_at: string; project: string }> = new Map();
+  private indexJobs: Map<string, { id: string; status: string; error?: string; started_at: string; project: string; childPid?: number }> = new Map();
   // R17: in-memory log buffer (ring buffer, max 500 lines).
   private logBuffer: string[] = [];
   private static readonly LOG_BUFFER_MAX = 500;
@@ -739,10 +739,27 @@ export class UiServer {
     // The file picker is only used to select a project root for indexing,
     // which lives under home in the vast majority of cases. Absolute paths
     // outside home are rejected with 403.
-    if (!targetPath.startsWith(home + sep) && targetPath !== home) {
+    //
+    // R44 (B3): resolve symlinks before the containment check. `resolve()`
+    // normalizes `..` but does NOT follow symlinks — a symlink inside home
+    // pointing to /etc would pass the string-prefix check. `realpathSync`
+    // resolves the full symlink chain so we compare the actual on-disk path.
+    let realTargetPath: string;
+    try {
+      realTargetPath = realpathSync(targetPath);
+    } catch {
+      // Path doesn't exist or is inaccessible — let the existsSync check
+      // below handle the 404. We don't 403 here because the path might be
+      // legitimately inside home but not yet created.
+      realTargetPath = targetPath;
+    }
+    if (!realTargetPath.startsWith(home + sep) && realTargetPath !== home) {
       this.sendJson(res, 403, { error: 'Browse is restricted to the user home directory' });
       return;
     }
+    // Use the resolved path for the rest of the handler so readdirSync
+    // operates on the real directory, not the symlink.
+    targetPath = realTargetPath;
     try {
       if (!existsSync(targetPath)) {
         this.sendJson(res, 404, { error: `Path not found: ${targetPath}` });
@@ -800,8 +817,20 @@ export class UiServer {
     // argument injection — a value like "--config=/tmp/evil.json" would be
     // parsed as a flag by the V1 cbm binary. The routeProjectDelete handler
     // already enforces this same regex (line 924); routeIndex was missing it.
+    //
+    // R44 (B1): the regex alone is NOT sufficient — it allows the hyphen
+    // character, so a bare flag like "--force" passes validation (it's
+    // composed entirely of [a-zA-Z0-9_-] chars). Two defenses:
+    //   1. Reject any value starting with '-' (a legitimate project name
+    //      has no reason to start with a hyphen).
+    //   2. Insert '--' before projectName in the spawn args so the V1
+    //      binary treats it as a positional argument regardless of content.
     if (!/^[a-zA-Z0-9_-]+$/.test(projectName)) {
       this.sendJson(res, 400, { error: 'Invalid project name (alphanumeric, dash, underscore only)' });
+      return;
+    }
+    if (projectName.startsWith('-')) {
+      this.sendJson(res, 400, { error: 'Invalid project name (must not start with a hyphen)' });
       return;
     }
     if (!existsSync(rootPath)) {
@@ -811,7 +840,7 @@ export class UiServer {
     // Generate a job ID and track it. The actual indexing is done by V1's
     // `cbm index_repository` command — we spawn it as a subprocess.
     const jobId = `idx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const job: { id: string; status: string; error?: string; started_at: string; project: string } = { id: jobId, status: 'pending', started_at: new Date().toISOString(), project: projectName };
+    const job: { id: string; status: string; error?: string; started_at: string; project: string; childPid?: number } = { id: jobId, status: 'pending', started_at: new Date().toISOString(), project: projectName };
     this.indexJobs.set(jobId, job);
     this.log(`Index job started: id=${jobId} project="${projectName}" root="${rootPath}"`);
 
@@ -819,11 +848,16 @@ export class UiServer {
     // The job status is updated in-memory when the process exits.
     // R41 (L3): spawn is now a static import.
     try {
-      const child = spawn('cbm', ['index_repository', '--project', projectName, rootPath], {
+      // R44 (B1): insert '--' before projectName so the V1 cbm binary treats
+      // it as a positional argument, not a flag — defense-in-depth even if
+      // the regex validation above is somehow bypassed or weakened later.
+      const child = spawn('cbm', ['index_repository', '--project', '--', projectName, rootPath], {
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: false,
       });
       job.status = 'running';
+      // R44 (B2): track the child PID so /api/process-kill can allowlist it.
+      job.childPid = child.pid;
       let stderr = '';
       child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
       child.on('error', (err) => {
@@ -923,19 +957,25 @@ export class UiServer {
       this.sendJson(res, 400, { error: 'Cannot kill the UI server itself' });
       return;
     }
-    // R43 (SEC2): cross-check the PID against the live cbm/node process list.
-    // Without this, any local process with HTTP access could SIGTERM ANY
-    // user process (IDE, browser, ssh-agent, etc.) by brute-forcing PIDs.
-    // We re-run `ps` here (not cached) so a freshly-spawned cbm process is
-    // recognized — the kill button is only ever used seconds after the
-    // process list was displayed, so the cost is acceptable.
+    // R43 (SEC2): cross-check the PID against the live process list.
+    // R44 (B2): the original `cbm|node` regex was too broad — it matched the
+    // substring "node" anywhere in the command line, which includes every
+    // Node.js process the user runs (VS Code extension host, Electron, other
+    // projects' dev servers). The fix narrows the match to processes that are
+    // genuinely THIS tool's: the `cbm` binary (V1 indexer) and `cbm-v2`
+    // (this sidecar). We match on the binary basename, not a loose substring.
+    // We also always allow killing PIDs tracked as active index jobs.
     if (process.platform !== 'win32') {
       let knownPids: Set<number>;
       try {
-        const output = execSync('ps aux 2>/dev/null | grep -E "cbm|node" | grep -v grep', {
-          encoding: 'utf-8',
-          timeout: 5000,
-        });
+        // Match processes whose command contains 'cbm' as a distinct token
+        // (not a substring of another word). `grep -w cbm` matches whole-word
+        // 'cbm' but NOT 'node' — 'cbm-v2' contains 'cbm' as a word prefix
+        // which -w matches. This excludes generic Node.js processes.
+        const output = execSync(
+          'ps aux 2>/dev/null | grep -wE "cbm|cbm-v2" | grep -v grep',
+          { encoding: 'utf-8', timeout: 5000 },
+        );
         knownPids = new Set<number>();
         for (const line of output.split('\n')) {
           const parts = line.trim().split(/\s+/);
@@ -945,8 +985,16 @@ export class UiServer {
       } catch {
         knownPids = new Set<number>();
       }
+      // Also allow killing PIDs from our own tracked index jobs — the UI
+      // spawns these via spawn('cbm', ...) and tracks them in this.indexJobs.
+      // The child process PID is available after spawn() returns.
+      for (const job of this.indexJobs.values()) {
+        if (job.childPid && Number.isFinite(job.childPid)) {
+          knownPids.add(job.childPid);
+        }
+      }
       if (!knownPids.has(pid)) {
-        this.sendJson(res, 403, { error: 'Refusing to kill a non-cbm/node process' });
+        this.sendJson(res, 403, { error: 'Refusing to kill a process that is not a cbm/cbm-v2 indexer' });
         return;
       }
     }
