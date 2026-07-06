@@ -221,6 +221,26 @@ describe('R17: UiServer new endpoints', () => {
       // in test env). The key assertion: NOT 400 (invalid project name).
       expect(res.status).not.toBe(400);
     });
+
+    // R44 (B1): bare-flag argument-injection. The R43 regex allows hyphens,
+    // so "--force" (all chars in [a-zA-Z0-9_-]) passed validation. The R44
+    // fix rejects any value starting with '-'.
+    it('rejects project_name that is a bare flag (starts with hyphen)', async () => {
+      const res = await fetchJson('/api/index', {
+        method: 'POST',
+        body: { root_path: '/tmp', project_name: '--force' },
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('hyphen');
+    });
+
+    it('rejects project_name that is a single hyphen', async () => {
+      const res = await fetchJson('/api/index', {
+        method: 'POST',
+        body: { root_path: '/tmp', project_name: '-' },
+      });
+      expect(res.status).toBe(400);
+    });
   });
 
   describe('GET /api/processes', () => {

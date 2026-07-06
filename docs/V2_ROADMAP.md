@@ -1,8 +1,8 @@
 # V2 Roadmap — Codebase Memory V2
 
-> Updated 2026-07-06 for version 0.10.7.
+> Updated 2026-07-06 for version 0.10.8.
 
-## Current State (0.10.7)
+## Current State (0.10.8)
 
 ### ✅ Completed
 
@@ -52,15 +52,16 @@
 | Round 41 FTS5 + route table | 0.10.5 | 13 fixes: M5 FTS5 search (migration V4, searchHumanNodes, BM25 ranking), L1 handleApi route-table refactor (588->22 lines), N1 report.ts resource leak (withProjectStores helper), L2+N2 countAll single-query + finally close, UI-9 pan bounds + reset view (forwardRef), L4 slug prepare hoist, L3 dead dynamic imports, N3 dead outer catch, UI-7 sidebar O(n²) fix, UI-8 dead showLabels toggle, L6 SlugConflictError class, UI-10 ARIA tablist + canvas role. 23 new tests (329 total) |
 | Round 42 Claude Sonnet R5 audit | 0.10.6 | 4 fixes from external audit: D1 tab button id (aria-labelledby contract), D2 changelog arithmetic correction, D3 watch docs (source-tag guard mechanism), E1 FTS5 AND-of-terms search (phrase-only → multi-term AND, matches scattered/reordered words). 10 new tests (339 total) |
 | Round 43 proactive audit (security + C1 regression) | 0.10.7 | 14 fixes: C1 CRITICAL useGraphData loading gate unmounted GraphCanvas on WS refetch (defeated R40 sim reuse — now project-aware stale-while-revalidate), SEC1 /api/index project_name argument-injection validation, SEC2 /api/process-kill allowlist cbm/node PIDs, SEC3 /api/browse restricted to home dir, H1 DashboardTab same loading gate fix, M1 NodeDetailPanel risk-score display, M2 ErrorBoundary key={project}, M3 ControlTab kill confirmation, M5 StatsTab error retry button, L1 NodeDetailPanel ~80 lines dead code removed (Show code + GitHub link + rpc.ts deleted), L2 groupByType O(n²)→O(n) + memoized, a11y close buttons aria-label. 4 new tests (343 total) |
+| Round 44 Claude Sonnet R7 audit (security gaps + frontend tests) | 0.10.8 | 5 fixes: B1 /api/index leading-hyphen rejection + `--` separator (closes bare-flag argument injection that passed R43's regex), B2 /api/process-kill narrowed allowlist from `cbm|node` substring to `cbm|cbm-v2` whole-word + tracked job PIDs (was matching every Node.js process), B3 /api/browse realpathSync before containment check (closes symlink bypass), Part C frontend test infrastructure (vitest config + setup + first 3 tests), C1 regression test (useGraphData same-project refetch preserves data). 5 new tests (348 total: 345 backend + 3 frontend) |
 
 ### 📊 Metrics
 
 | Metric | Value |
 |---|---|
 | Source files (v2) | 38 |
-| Test files | 31 |
-| Tests | 343 (all passing) |
-| Bugs fixed (43 rounds) | 471+ |
+| Test files | 32 (31 backend + 1 frontend) |
+| Tests | 348 (345 backend + 3 frontend, all passing) |
+| Bugs fixed (44 rounds) | 476+ |
 | MCP tools | 7 |
 | CLI commands | 16+ (including `watch` daemon) |
 | API endpoints | 15 (6 existing + 9 new) |
@@ -100,7 +101,7 @@
 | Human memory overlay on graph | Medium | High | Planned |
 | `cbm-v2 watch` daemon (auto-sync) | Medium | Medium | Planned |
 
-### Phase 3: V1 Complete (0.10.7)
+### Phase 3: V1 Complete (0.10.8)
 
 | Feature | Priority | Complexity | Status |
 |---|---|---|---|
@@ -169,7 +170,8 @@
 | R41 (FTS5 + route table + leaks + a11y) | 0.10.5 | 13 | 23 | 329 |
 | R42 (Claude Sonnet R5 audit) | 0.10.6 | 4 | 10 | 339 |
 | R43 (proactive: C1 regression + 3 security + 10 UX/cleanup) | 0.10.7 | 14 | 4 | 343 |
-| **Total** | | **471+** | **471+** | **343** |
+| R44 (Claude Sonnet R7: security gaps + frontend tests) | 0.10.8 | 5 | 5 | 348 |
+| **Total** | | **476+** | **476+** | **348** |
 
 ## Performance Milestones
 
@@ -205,7 +207,7 @@
 | R41 | `Sidebar flattenSingleChild` | O(n²) on deep single-child chains | O(n) (use already-flattened sc.children) | -~n× on deep chains |
 | R42 | `searchHumanNodes` FTS5 query | Phrase-only (entire query in one pair of quotes — required exact adjacent phrase) | AND-of-terms (each term individually quoted, implicit AND) | Matches scattered/reordered words, not just adjacent phrases |
 
-## API Endpoints (0.10.7)
+## API Endpoints (0.10.8)
 
 | Endpoint | Method | Description |
 |---|---|---|

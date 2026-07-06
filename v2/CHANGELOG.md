@@ -1,5 +1,30 @@
 # Changelog — Codebase Memory V2
 
+## 0.10.8 — Round 44 (2026-07-06)
+
+5 issues fixed based on Claude Sonnet round 7 audit (2 security gaps in R43 fixes, 1 security edge case, 1 structural test gap, 1 regression test). 5 new tests (348 total: 345 backend + 3 frontend).
+
+### Security fixes (closing gaps in R43's own fixes)
+
+- **`/api/index` B1 (MEDIUM security)**: R43's `^[a-zA-Z0-9_-]+$` regex allowed the hyphen character, so a bare flag like `--force` (composed entirely of allowed chars) passed validation untouched — the fix's own stated threat model (CLI argument injection) was only partially closed. Fixed with two defenses: (1) reject any `project_name` starting with `-` (a legitimate project name has no reason to start with a hyphen), (2) insert a literal `--` separator before `projectName` in the `spawn()` args so the V1 binary treats it as a positional argument regardless of content — defense-in-depth that closes the class of bug, not just one shape of it.
+
+- **`/api/process-kill` B2 (HIGH security)**: R43's `grep -E "cbm|node"` allowlist was far broader than its stated goal — it matched the substring "node" anywhere in the command line, which includes every Node.js process the user runs (VS Code extension host, Electron, other projects' dev servers). The practical result was "kill any Node.js process this user owns" instead of "kill this tool's processes". Fixed: narrowed to `grep -wE "cbm|cbm-v2"` (whole-word match on the binary name, not the loose "node" substring) + allowlist PIDs tracked as active index jobs via the new `childPid` field on the job object. Non-cbm/cbm-v2 PIDs get 403.
+
+- **`/api/browse` B3 (LOW security)**: R43's `startsWith(home + sep)` containment check was a string-prefix check, not a canonical-path check. `resolve()` normalizes `..` but does NOT follow symlinks — a symlink inside home pointing to `/etc` would pass the check while the real on-disk target is outside home. Fixed: `realpathSync(targetPath)` before the containment check, so we compare the actual on-disk path after resolving the full symlink chain.
+
+### Structural fix (Part C — frontend test infrastructure)
+
+- **Vitest + @testing-library/react config**: the graph-ui `package.json` already had `vitest`, `@testing-library/react`, `@testing-library/jest-dom`, and `jsdom` as devDependencies, and a `"test": "vitest run"` script — but `vite.config.ts` had no `test:` block, no setup file existed, and there were zero test files. This is exactly why the C1 regression (R43's CRITICAL: `useGraphData` unmounting `GraphCanvas` on every WS refetch) hid for 3 rounds — the infrastructure to catch it didn't exist. Fixed: added `test:` block to `vite.config.ts` (jsdom environment, globals, setup file), created `src/test-setup.ts` (imports jest-dom matchers, mocks `matchMedia`/`ResizeObserver`/`requestAnimationFrame` for jsdom), excluded test files from the production `tsconfig.json` build.
+
+### Regression test (the test that would have caught C1)
+
+- **`useGraphData.test.ts`**: 3 tests covering the C1 invariant — (1) refetching the SAME project does NOT set `loading=true` or clear `data` (the exact behavior that was broken), (2) switching to a DIFFERENT project DOES set `loading=true` and clear stale data, (3) error state clears on successful refetch. This is the test Claude round 7 specifically recommended: "mount `GraphTab` with a stale project's data, fire a mock WebSocket notification, and assert the canvas is never unmounted."
+
+### Test coverage
+- 2 new backend tests in `tests/ui/server-r17.test.ts`: B1 bare-flag rejection (`--force`, single `-`).
+- 3 new frontend tests in `graph-ui/src/hooks/useGraphData.test.ts`: C1 regression (same-project refetch preserves data, project switch clears data, error clears on refetch).
+- Frontend test count: 0 → 3 (first frontend tests in the project's history).
+
 ## 0.10.7 — Round 43 (2026-07-06)
 
 14 issues fixed across V2 + Graph UI (1 CRITICAL regression, 3 SECURITY, 1 HIGH UX, 5 MEDIUM, 4 LOW). 4 new tests (343 total).
