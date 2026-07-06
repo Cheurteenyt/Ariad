@@ -211,6 +211,6 @@ A failed pipeline blocks merge.
 
 ## Questions?
 
-- Open an issue on GitLab: https://github.com/Cheurteenyt/codebase-mirror/issues
+- Open an issue on GitHub: https://github.com/Cheurteenyt/codebase-mirror/issues
 - Read the docs: `docs/` directory
 - Check the CHANGELOG: `v2/CHANGELOG.md`
