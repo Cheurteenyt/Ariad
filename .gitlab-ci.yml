@@ -15,7 +15,12 @@ mirror-to-github:
     - apk add --no-cache git
   script:
     - echo "Mirroring to GitHub to trigger Actions CI..."
-    - git push "https://Cheurteenyt:${GITHUB_MIRROR_TOKEN}@github.com/Cheurteenyt/codebase-mirror.git" HEAD:main --force
+    # R53 (D1): use --force-with-lease instead of --force. If GitHub's main
+    # has moved (e.g. a PR was merged directly on GitHub), the push FAILS
+    # loudly instead of silently discarding the GitHub-only commits.
+    # R53 (D2): use http.extraHeader for auth instead of embedding the token
+    # in the URL — prevents token leakage in git error output.
+    - git -c http.extraHeader="Authorization: basic $(printf '%s' "Cheurteenyt:${GITHUB_MIRROR_TOKEN}" | base64 -w0)" push "https://github.com/Cheurteenyt/codebase-mirror.git" HEAD:main --force-with-lease
     - echo "Mirror complete. CI runs at https://github.com/Cheurteenyt/codebase-mirror/actions"
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
