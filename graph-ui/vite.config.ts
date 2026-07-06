@@ -38,5 +38,8 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test-setup.ts"],
     css: false, // don't process Tailwind CSS in tests (speeds up suite)
+    // R46: restrict test discovery to this project's src/ so vitest doesn't
+    // pick up backend tests from sibling work directories.
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
 });

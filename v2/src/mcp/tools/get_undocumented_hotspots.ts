@@ -25,7 +25,15 @@ export class GetUndocumentedHotspotsTool extends BaseTool {
   async handle(args: Record<string, unknown>) {
     try {
       const project = this.optionalString(args, 'project') ?? this.project;
-      const labelFilter = this.optionalString(args, 'label');
+      // R46 (F8): validate label against the enum declared in the JSON Schema.
+      // The old code used optionalString, which silently accepted invalid
+      // values like "Bogus" — none of the if branches below matched, so the
+      // tool returned an empty array with 200 OK, misleading the caller.
+      // Now invalid labels get a clear error.
+      const VALID_LABELS = ['Module', 'Route', 'Function', 'Class', 'Interface'] as const;
+      const labelFilter = args.label == null
+        ? undefined
+        : this.requireEnum(args, 'label', VALID_LABELS);
       const limit = this.optionalNumber(args, 'limit') ?? 50;
 
       if (!this.codeReader) {
