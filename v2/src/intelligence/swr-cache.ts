@@ -230,38 +230,46 @@ export class SwrCache<K, V> {
   }
 
   /**
+   * Evict the single oldest entry (LRU). Returns true if an entry was evicted,
+   * false if the cache is empty or has only 1 entry (never evict the last one).
+   *
+   * R60: extracted from evictToFit() to eliminate the duplicated pattern
+   * (get oldestKey → delete entry → subtract bytes → delete handlers → bump stats).
+   */
+  private evictOne(): boolean {
+    const oldestKey = this.entries.keys().next().value;
+    if (oldestKey === undefined) return false;
+    const entry = this.entries.get(oldestKey);
+    if (entry) this.totalBytes -= entry.size;
+    this.entries.delete(oldestKey);
+    // R50 (#8): also clear refresh handler to prevent orphaned handler
+    // being used by stale-hit scheduling after eviction.
+    this.refreshHandlers.delete(oldestKey);
+    this.refreshTimers.delete(oldestKey);
+    if (this.trackStats) this.stats.evictions++;
+    return true;
+  }
+
+  /**
    * Evict entries until the cache is within its memory/entry budget.
    * Uses LRU order (Map insertion order = access order in JS).
    */
   private evictToFit(): void {
     // Check memory budget.
     while (this.totalBytes > this.maxBytes && this.entries.size > 1) {
-      const oldestKey = this.entries.keys().next().value;
-      if (oldestKey === undefined) break;
-      const entry = this.entries.get(oldestKey);
-      if (entry) this.totalBytes -= entry.size;
-      this.entries.delete(oldestKey);
-      // R50 (#8): also clear refresh handler to prevent orphaned handler
-      // being used by stale-hit scheduling after eviction.
-      this.refreshHandlers.delete(oldestKey);
-      this.refreshTimers.delete(oldestKey);
-      if (this.trackStats) this.stats.evictions++;
+      if (!this.evictOne()) break;
     }
 
-    // Check entry count budget (fallback when maxBytes is 0 or sizeFn not provided).
-    const effectiveMaxEntries = this.maxBytes > 0 ? this.maxEntries : this.maxEntries;
+    // Check entry count budget.
+    // R60: removed the dead `effectiveMaxEntries` ternary — both branches were
+    // identical (`this.maxEntries : this.maxEntries`), so it was a no-op that
+    // looked like it did something. The entry-count limit always applies
+    // regardless of whether maxBytes is set, which is the correct behavior
+    // (maxBytes is the primary budget, maxEntries is a hard cap to prevent
+    // unbounded entry count when sizeFn returns tiny values).
     // R37 fix: use > instead of >= to allow exactly maxEntries entries.
-    // With >=, setting the Nth entry would evict the (N-1)th, leaving only N-1 entries.
-    while (this.entries.size > effectiveMaxEntries && this.entries.size > 1) {
-      const oldestKey = this.entries.keys().next().value;
-      if (oldestKey === undefined) break;
-      const entry = this.entries.get(oldestKey);
-      if (entry) this.totalBytes -= entry.size;
-      this.entries.delete(oldestKey);
-      // R50 (#8): also clear refresh handler + timer.
-      this.refreshHandlers.delete(oldestKey);
-      this.refreshTimers.delete(oldestKey);
-      if (this.trackStats) this.stats.evictions++;
+    while (this.entries.size > this.maxEntries && this.entries.size > 1) {
+      if (!this.evictOne()) break;
     }
   }
 
@@ -377,10 +385,11 @@ export class SwrCache<K, V> {
           entry.refreshing = false;
           if (this.trackStats) this.stats.backgroundRefreshes++;
           this.events.emit('refresh', { key, phase: 'success' });
-        } catch (e: any) {
+        } catch (e: unknown) {
           // Refresh failed — keep the stale value, mark as not refreshing.
           entry.refreshing = false;
-          this.events.emit('refresh', { key, phase: 'error', error: e.message });
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          this.events.emit('refresh', { key, phase: 'error', error: errorMsg });
         }
       } else {
         // No handler — mark as not refreshing so the next stale hit can retry.
@@ -506,12 +515,22 @@ export class SwrCache<K, V> {
   /**
    * Invalidate all cache entries whose key matches a prefix.
    * Useful for invalidating all entries for a specific project.
+   *
+   * R60: collect matching keys first, then invalidate. The previous code
+   * modified `this.entries` while iterating over `this.entries.keys()`,
+   * which is technically safe in JS (Map iterators tolerate concurrent
+   * deletion) but fragile and surprising — it's the kind of thing that
+   * breaks silently if someone later changes the iteration method.
    */
   invalidatePrefix(prefix: string): void {
+    const keysToInvalidate: K[] = [];
     for (const key of this.entries.keys()) {
       if (typeof key === 'string' && key.startsWith(prefix)) {
-        this.invalidate(key);
+        keysToInvalidate.push(key);
       }
+    }
+    for (const key of keysToInvalidate) {
+      this.invalidate(key);
     }
   }
 
@@ -581,9 +600,23 @@ export class SwrCache<K, V> {
    *   cache.on('refresh', ({ key, phase, error }) => {
    *     console.log(`Cache refresh ${phase} for key: ${key}`);
    *   });
+   *
+   * R60: the listener is now typed as `(event: SwrCacheRefreshEvent<K>) => void`
+   * instead of `(...args: any[]) => void`. Callers get autocomplete on the
+   * event payload and the compiler catches typos in field names.
    */
-  on(event: string, listener: (...args: any[]) => void): () => void {
-    this.events.on(event, listener);
-    return () => this.events.off(event, listener);
+  on(event: 'refresh', listener: (event: SwrCacheRefreshEvent<K>) => void): () => void {
+    this.events.on(event, listener as (...args: unknown[]) => void);
+    return () => this.events.off(event, listener as (...args: unknown[]) => void);
   }
+}
+
+/**
+ * Cache event payload for the 'refresh' event. R60: typed to replace the
+ * previous `(...args: any[]) => void` listener signature.
+ */
+export interface SwrCacheRefreshEvent<K = unknown> {
+  key: K;
+  phase: 'success' | 'error';
+  error?: string;
 }

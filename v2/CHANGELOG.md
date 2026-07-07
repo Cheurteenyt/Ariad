@@ -1,5 +1,40 @@
 # Changelog — Codebase Memory V2
 
+## 0.12.7 — Round 60 (2026-07-07) code quality in swr-cache.ts
+
+No bugs fixed — code quality, deduplication, and type safety in the SWR cache
+(`v2/src/intelligence/swr-cache.ts`). Zero functional changes, zero test regressions.
+
+### Code quality (MEDIUM) — dead code + duplication + fragility
+
+- **Dead code removed**: `effectiveMaxEntries` ternary in `evictToFit()` had both
+  branches identical (`this.maxEntries : this.maxEntries`). It looked like it
+  did something but was a no-op. Removed; the entry-count limit now always
+  applies regardless of maxBytes (which is the correct behavior — maxBytes is
+  the primary budget, maxEntries is a hard cap).
+- **Duplication eliminated**: extracted `evictOne()` private method from
+  `evictToFit()`. The pattern "get oldestKey → delete entry → subtract bytes →
+  delete refresh handlers → delete refresh timers → bump eviction stats" was
+  duplicated 2× (once for the memory budget loop, once for the entry-count
+  budget loop). Now both loops call `evictOne()`.
+- **Defensive iteration**: `invalidatePrefix()` previously modified
+  `this.entries` while iterating over `this.entries.keys()`. JS Map iterators
+  tolerate concurrent deletion, but this is fragile — it would break silently
+  if someone later changed the iteration method (e.g. to `for...of` with
+  destructuring). Now collects matching keys into an array first, then
+  invalidates them in a separate loop.
+
+### Type safety (LOW) — `any` removed from event API
+
+- **`catch (e: any)` → `catch (e: unknown)`** in the background refresh error
+  handler. Now uses `e instanceof Error ? e.message : String(e)` instead of
+  accessing `.message` on an `any`-typed value (which would throw if `e` was
+  not an Error object — e.g. `throw "string"` or `throw { code: 42 }`).
+- **`on()` method typed**: previously `on(event: string, listener: (...args: any[]) => void)`.
+  Now `on(event: 'refresh', listener: (event: SwrCacheRefreshEvent<K>) => void)`.
+  Added `SwrCacheRefreshEvent<K>` exported interface with `key`, `phase`, `error?`
+  fields. Callers now get autocomplete and the compiler catches field-name typos.
+
 ## 0.12.6 — Round 59 (2026-07-07) code quality + type safety in sqlite-ro.ts
 
 No bugs fixed — same pattern as R58 but applied to the code graph reader
