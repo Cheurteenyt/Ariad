@@ -1,5 +1,54 @@
 # Changelog — Codebase Memory V2
 
+## 0.15.9 — Round 77 (2026-07-07) honest benchmark reassessment + rigorous test
+
+**Corrects a measurement error in R72-R76.** Previous benchmarks compared
+V2's internal extraction timer (267ms) against V1's wall time (305ms from R67).
+This was misleading — V2's wall time includes Node.js startup + WASM init
+(~110ms) that V1 doesn't have.
+
+### Rigorous benchmark (5 iterations, alternating, wall-clock)
+
+| Engine | min | median | max | nodes | edges |
+|---|---|---|---|---|---|
+| V1 (C) | 357ms | **361ms** | 362ms | 537 | 1681 |
+| V2 (WASM) | 397ms | **401ms** | 416ms | 819 | 768 |
+
+**V2 is 11% SLOWER than V1 in wall time (40ms).**
+
+### Where V2 IS faster
+
+**Extraction phase only** (excluding startup):
+- V2 extraction: 267ms (20% faster than V1's 335ms pipeline)
+- V1 pipeline: 335ms
+
+On a persistent process (MCP server, UI server), V2's startup is amortized.
+In that scenario, V2 is 20% faster.
+
+### Why V1 extracts more edges (1681 vs 768)
+
+V1 does LSP-based call resolution (1085 resolved calls), cross-file imports
+(222), usage tracking (253), and semantic analysis. V2 only does static
+AST analysis — no LSP, no cross-file resolution.
+
+### What was wrong with previous benchmarks
+
+V2's CLI reports "Duration: 267ms" but this is only the extraction phase.
+The full wall time is ~401ms (Node startup ~30ms + WASM init ~50ms + grammar
+load ~20ms + CLI overhead ~10ms + extraction ~267ms + SQLite ~24ms).
+
+### Files
+
+- New: `docs/RIGOROUS_BENCHMARK_R77.md` (full report with fairness notes)
+- New: `v2/scripts/rigorous-benchmark.ts` (reproducible benchmark script)
+- Corrected all previous "V2 is X% faster than V1" claims in docs
+
+### Next steps
+
+1. Reduce WASM init time (defer Parser.init)
+2. Add cross-file CALLS resolution (V2 misses ~900 edges V1 finds)
+3. Use V2 as persistent process (amortize startup)
+
 ## 0.15.8 — Round 76 (2026-07-07) single-pass complexity + skip anonymous
 
 2 optimizations to the fast-walker extraction.
