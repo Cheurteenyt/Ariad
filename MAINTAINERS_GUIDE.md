@@ -182,7 +182,7 @@ When receiving an audit report from another AI (Claude Sonnet 5, etc.):
 
 - **Package version** (`v2/package.json`): semver, bumped per round.
   - 0.x.y for pre-1.0. Each round = one minor or patch bump.
-  - Currently 0.15.0 (R69).
+  - Currently 0.15.1 (R69).
 - **Backup format version** (`backup.ts`): independent schema version,
   bumped only when the JSON shape changes. Currently `0.10.3` (frozen
   since R36 — the schema hasn't changed).
