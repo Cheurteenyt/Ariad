@@ -1,5 +1,19 @@
 # Changelog — Codebase Memory V2
 
+## 0.15.1 — Round 69b (2026-07-07) fix: package.json dependencies restored
+
+Fix: the R69 commit accidentally lost the original `package.json` dependencies
+(`better-sqlite3`, `commander`, `ws`, `yaml`, `ts-morph`, `typescript`,
+`vitest`, `@types/*`). The CI failed because `npm install` only installed
+3 packages instead of the full set.
+
+**Root cause**: during R68-R69, `npm install <pkg>` overwrote `package.json`
+instead of merging. The file was left with only the newly-installed packages.
+
+**Fix**: restored all original dependencies + added the new R68-R69 dependencies
+(`ts-morph`, `web-tree-sitter`, `tree-sitter-wasm`, `tsx`). Version bumped
+to 0.15.1. All 378 tests pass.
+
 ## 0.15.0 — Round 69 (2026-07-07) web-tree-sitter WASM — 112 languages
 
 **Minor version bump** — V2 indexer upgraded from ts-morph (1 language, 1833ms)

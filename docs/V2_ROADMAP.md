@@ -1,8 +1,8 @@
 # V2 Roadmap — Codebase Memory V2
 
-> Updated 2026-07-07 for version 0.15.0.
+> Updated 2026-07-07 for version 0.15.1.
 
-## Current State (0.15.0)
+## Current State (0.15.1)
 
 ### ✅ Completed
 
@@ -126,7 +126,7 @@
 | Human memory overlay on graph | Medium | High | Planned |
 | `cbm-v2 watch` daemon (auto-sync) | Medium | Medium | Planned |
 
-### Phase 3: V1 Complete (0.15.0)
+### Phase 3: V1 Complete (0.15.1)
 
 | Feature | Priority | Complexity | Status |
 |---|---|---|---|
@@ -257,7 +257,7 @@
 | R41 | `Sidebar flattenSingleChild` | O(n²) on deep single-child chains | O(n) (use already-flattened sc.children) | -~n× on deep chains |
 | R42 | `searchHumanNodes` FTS5 query | Phrase-only (entire query in one pair of quotes — required exact adjacent phrase) | AND-of-terms (each term individually quoted, implicit AND) | Matches scattered/reordered words, not just adjacent phrases |
 
-## API Endpoints (0.15.0)
+## API Endpoints (0.15.1)
 
 | Endpoint | Method | Description |
 |---|---|---|
