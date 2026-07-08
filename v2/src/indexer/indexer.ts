@@ -113,14 +113,16 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   let estimatedFilesToIndex = files.length;
   if (opts.incremental) {
     estimatedFilesToIndex = 0;
+    // R90: prepare statement once outside the loop (was re-preparing per file)
+    const getHashMeta = db.prepare(
+      'SELECT mtime_ns, mtime, size FROM file_hashes WHERE project = ? AND file_path = ?'
+    );
     for (const f of files) {
       const relPath = nodeRelative(opts.rootPath, f);
       const stat = statSync(f, { bigint: true });
       const fileMtimeNs = stat.mtimeNs.toString();
       const fileSize = Number(stat.size);
-      const existing = db.prepare(
-        'SELECT mtime_ns, mtime, size FROM file_hashes WHERE project = ? AND file_path = ?'
-      ).get(opts.project, relPath) as { mtime_ns: string | null; mtime: number; size: number } | undefined;
+      const existing = getHashMeta.get(opts.project, relPath) as { mtime_ns: string | null; mtime: number; size: number } | undefined;
       if (!existing) {
         estimatedFilesToIndex++;
       } else {
@@ -237,6 +239,11 @@ async function indexParallel(
     languages.add(lang);
     const filesToIndex: string[] = [];
 
+    // R90: prepare statement once outside the per-file loop
+    const getHashMetaParallel = db.prepare(
+      'SELECT content_hash, mtime, mtime_ns, size FROM file_hashes WHERE project = ? AND file_path = ?'
+    );
+
     for (const f of langFiles) {
       if (incremental) {
         const relPath = nodeRelative(rootPath, f);
@@ -247,9 +254,8 @@ async function indexParallel(
         const fileSize = Number(stat.size);
 
         // R85: mtimeNs+size fast skip — nanosecond precision
-        const existing = db.prepare(
-          'SELECT content_hash, mtime, mtime_ns, size FROM file_hashes WHERE project = ? AND file_path = ?'
-        ).get(project, relPath) as { content_hash: string; mtime: number; mtime_ns: string | null; size: number } | undefined;
+        // R90: prepare statement once outside the loop
+        const existing = getHashMetaParallel.get(project, relPath) as { content_hash: string; mtime: number; mtime_ns: string | null; size: number } | undefined;
 
         if (existing) {
           // R85: use mtime_ns if available, fall back to mtime for pre-R85 DBs
