@@ -1,5 +1,70 @@
 # Changelog — Codebase Memory V2
 
+## 0.28.0 — Round 90 (2026-07-08) CI Benchmark Lock + Smoke Mode + Prepared Statements
+
+**16th round (GPT 5.5 external audit R90).** 0 new bugs — this round hardens
+the benchmark CI integration, implements the missing smoke mode, adds a
+blocking parallel path assertion, and optimizes prepared statements in O(N)
+loops. All items from the GPT 5.5 R90 audit are addressed.
+
+### Improvements (4, from GPT 5.5 R90 audit)
+
+1. **CBM_BENCH_SMOKE implemented** (`incremental-benchmark-r87.ts`) — The `bench:incremental:smoke` script was defined in package.json but the env var was never read. Now `CBM_BENCH_SMOKE=1` reduces file counts (8 single-thread, 24 parallel) for fast CI runs. Smoke mode still exercises the parallel path (>20 files).
+
+2. **Parallel path assertion is now blocking** (`incremental-benchmark-r87.ts`) — Previously `isParallel6` was computed and displayed but not used as an invariant. Now if the parallel-full-cold scenario doesn't use the parallel path, `allOk = false` and the benchmark fails.
+
+3. **Prepared statements moved outside O(N) loops** (`indexer.ts`) — Both the estimation pass and the parallel incremental scan were calling `db.prepare()` inside per-file loops. On 50k files this is measurable overhead. Now prepared once before the loop and reused.
+
+4. **Benchmark wired to GitHub Actions CI** (`.github/workflows/ci.yml`) — Added `npm run bench:incremental:smoke` step after `Test` in the backend job. CI will now fail if any benchmark invariant breaks.
+
+### Smoke benchmark results (all pass)
+
+```
+full-cold                        279ms     8     0     24     16     0      0     8    true
+incremental-noop                 196ms     0     8     24     16     0      0     8    true
+incremental-metadata-only        234ms     0     8     24     16     0      0     8    true
+incremental-1-file               247ms     1     7     24     16     0      0     8    true
+incremental-10pct                234ms     1     7     24     16     0      0     8    true
+parallel-full-cold               445ms    24     0     72     48     0      0    24    true
+parallel-incremental-noop        196ms     0    24     72     48     0      0    24    true
+parallel-metadata-only           198ms     0    24     72     48     0      0    24    true
+parallel-noop-after-meta         198ms     0    24     72     48     0      0    24    true
+
+✓ All invariants pass
+BENCHMARK PASSED — all invariants met
+```
+
+### Verification
+
+```
+Test Files  35 passed (35)
+     Tests  374 passed (374)
+```
+
+### Files
+
+- Modified: `v2/scripts/incremental-benchmark-r87.ts` (smoke mode + parallel assertion)
+- Modified: `v2/src/indexer/indexer.ts` (prepared statements outside loops)
+- Modified: `.github/workflows/ci.yml` (benchmark step in CI)
+- Modified: `v2/package.json` (version 0.28.0)
+
+### Total: 31 bugs + 8 optimizations across 16 rounds
+
+| Round | Type | Count |
+|---|---|---|
+| R78-R82 (1-4) | bugs | 23 |
+| R83-R84 (9-10) | optimizations + bugs | 3 opt + 2 bugs + portability |
+| R85-R86 (11-12) | bugs | 4 + 6 tests |
+| R87 (13) | tests + benchmark | 7 failure tests + incremental benchmark |
+| R88-R89 (14-15) | bugs + benchmark | 2 bugs + CI lock |
+| R90 (16) | optimizations | smoke mode + parallel assertion + prepared statements + CI wiring |
+
+### Next steps
+
+1. **Cross-file CALLS resolution** — V2 still misses 900+ edges V1 finds
+2. **Worker pool persistant** — for MCP/UI/watch daemon mode
+3. **Real failure injection tests** — inject extractFast/worker failure at runtime
+
 ## 0.27.0 — Round 89 (2026-07-08) Benchmark CI Lock + No-Op Early Return
 
 **15th round (GPT 5.5 external audit R90).** 1 bug fixed + benchmark hardening.

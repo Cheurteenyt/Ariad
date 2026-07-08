@@ -114,19 +114,23 @@ console.log('  R87 Incremental Benchmark — with correctness invariants');
 console.log('='.repeat(80));
 console.log();
 
-const tmpDir = mkdtempSync(join(tmpdir(), 'r88-bench-'));
+const tmpDir = mkdtempSync(join(tmpdir(), 'r90-bench-'));
 const projectDir = join(tmpDir, 'project');
 const parallelDir = join(tmpDir, 'parallel-project');
 const cacheDir = join(tmpDir, 'cache');
 mkdirSync(join(cacheDir, 'codebase-memory-mcp'), { recursive: true });
-const FILE_COUNT = 20; // small enough for single-thread
-const PARALLEL_FILE_COUNT = 64; // R88: >20 to force parallel path
-const projectName = 'r88bench';
-const parallelProjectName = 'r88parallel';
+// R90: support CBM_BENCH_SMOKE=1 for fast CI runs
+const SMOKE = process.env.CBM_BENCH_SMOKE === '1';
+const FILE_COUNT = SMOKE ? 8 : 20; // small enough for single-thread
+const PARALLEL_FILE_COUNT = SMOKE ? 24 : 64; // >20 to force parallel path
+const projectName = 'r90bench';
+const parallelProjectName = 'r90parallel';
 const dbPath = join(cacheDir, 'codebase-memory-mcp', `${projectName}.db`);
 const parallelDbPath = join(cacheDir, 'codebase-memory-mcp', `${parallelProjectName}.db`);
 
 const results: BenchResult[] = [];
+// R90: declare allOk early so parallel assertion can use it
+let allOk = true;
 
 try {
   // Create test project
@@ -240,6 +244,11 @@ try {
     statsMatch: s6.statsMatch, errors: p6.errors,
   });
   console.log(`  ${t6Wall}ms | indexed=${p6.filesIndexed} parallel=${isParallel6} nodes=${s6.nodes} hashes=${s6.hashCount}`);
+  // R90: assert parallel path was actually used
+  if (!isParallel6) {
+    console.log(`  ✗ parallel-full-cold did not use parallel path (output missing 'Parallel')`);
+    allOk = false;
+  }
 
   // Scenario 7: Parallel incremental no-op
   console.log('Scenario 7: Parallel incremental no-op');
@@ -305,7 +314,7 @@ try {
   // Invariant checks
   console.log();
   console.log('  Invariant checks:');
-  let allOk = true;
+  // allOk already declared at top (R90)
   for (const r of results) {
     if (r.orphanEdges > 0) {
       console.log(`  ✗ ${r.scenario}: orphan_edges=${r.orphanEdges} (must be 0)`);

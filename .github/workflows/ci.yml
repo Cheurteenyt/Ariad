@@ -71,6 +71,10 @@ jobs:
       - name: Test
         run: npx vitest run
 
+      # R90: Incremental benchmark with correctness invariants
+      - name: Incremental benchmark invariants
+        run: npm run bench:incremental:smoke
+
   # ── Frontend (graph-ui): typecheck + build + test ──────────────
   frontend:
     name: Frontend (graph-ui)
