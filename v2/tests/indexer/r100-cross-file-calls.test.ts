@@ -156,11 +156,11 @@ describe('R100: Cross-file CALLS Precision + Correctness', () => {
     db.close();
   });
 
-  it('incremental: crossFileCallsStale flag is set when files change', async () => {
+  it('incremental: crossFileCallsStale is false when call_sites is populated (R106)', async () => {
     writeFileSync(join(projectDir, 'b.ts'), 'export function foo() { return 42; }\n');
     writeFileSync(join(projectDir, 'a.ts'), 'export function caller() { return foo(); }\n');
 
-    // Full index
+    // Full index — populates call_sites
     await indexProjectWasm({
       project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0,
     });
@@ -173,7 +173,15 @@ describe('R100: Cross-file CALLS Precision + Correctness', () => {
     });
 
     expect(result2.errors.length).toBe(0);
-    // R100: crossFileCallsStale should be true when incremental modifies files
-    expect((result2 as any).crossFileCallsStale).toBe(true);
+    // R106: with persistent call_sites, incremental mode can now rebuild
+    // cross-file CALLS. So crossFileCallsStale should be FALSE (not true).
+    // Before R106, this was true because incremental couldn't resolve cross-file.
+    expect((result2 as any).crossFileCallsStale).toBe(false);
+
+    // Verify cross-file CALLS edge still exists after incremental
+    const db = getDb();
+    const crossFile = countCrossFileEdges(db);
+    expect(crossFile).toBeGreaterThan(0);
+    db.close();
   });
 });

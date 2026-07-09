@@ -29,6 +29,7 @@ import { readFileSync, statSync, readdirSync } from 'node:fs';
 import { relative, extname, basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { extractFast, type UnresolvedCallSite } from './fast-walker.js';
+import { replaceCallSitesForFiles, rebuildCrossFileCallsEdges, hasCallSites } from './cross-file-resolver.js';
 const require2 = createRequire(import.meta.url);
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -40,6 +41,9 @@ export interface WasmExtractionResult {
   skipped: number;
   errors: Array<{ file: string; error: string }>;
   languages: Set<string>;
+  // R106: true if cross-file CALLS edges were rebuilt from persistent call_sites.
+  // false if call_sites was empty (legacy DB) and the graph is stale.
+  crossFileCallsResolved: boolean;
 }
 
 // ── Language detection ─────────────────────────────────────────────────
@@ -214,9 +218,20 @@ export async function extractFromFilesWasm(
 ): Promise<WasmExtractionResult> {
   const result: WasmExtractionResult = {
     nodes: 0, edges: 0, files: 0, skipped: 0, errors: [], languages: new Set(),
+    crossFileCallsResolved: false,
   };
 
-  if (files.length === 0) return result;
+  if (files.length === 0) {
+    // R106: even with 0 files to index, in incremental mode we may still need
+    // to rebuild cross-file CALLS (e.g., deletion-only fast path skips here).
+    // But that path is handled at the indexer.ts level (it doesn't call
+    // extractFromFilesWasm at all). If we reach here with 0 files in full mode,
+    // there's nothing to do. If we reach here in incremental mode with 0 files
+    // to extract but call_sites already populated, we still want to rebuild
+    // cross-file CALLS — but that's also handled at the indexer.ts level.
+    // So here we just return.
+    return result;
+  }
 
   // R79: Parser.init() is now deferred to preloadGrammars() (called by
   // indexer.ts before this function). The lazy ensureParserInitialized()
@@ -500,89 +515,80 @@ export async function extractFromFilesWasm(
       stmt.run(...params);
     }
 
-    // R98/R99: Cross-file CALLS resolution — Phase 3
-    // R99: Only run cross-file resolution in FULL mode. In incremental mode,
-    // the globalSymbolIndex would only contain changed files, missing unchanged
-    // files' symbols. This would drop cross-file edges to/from unchanged files.
-    // Instead, incremental mode keeps existing cross-file edges in DB and only
-    // deletes cross-file edges for changed files (done above in the changedRelPaths
-    // delete phase). A full reindex is needed to rebuild cross-file edges.
-    if (!incremental) {
-    const globalSymbolIndex = new Map<string, string[]>();
+    // R106: Cross-file CALLS resolution via persistent call_sites table.
+    //
+    // Full mode:
+    //   1. call_sites for the project were cleared by clearProjectData() before
+    //      extraction. Now we insert all new call_sites from allExtracts.
+    //   2. Then rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges
+    //      from the persistent table + all current nodes.
+    //
+    // Incremental mode:
+    //   1. Delete call_sites for changed files (changedRelPaths).
+    //   2. Insert new call_sites from allExtracts (which contains only changed
+    //      files' results — unchanged files are skipped in Phase 1).
+    //   3. rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges from
+    //      the persistent table (which has call_sites for both changed and
+    //      unchanged files) + all current nodes (which has nodes for both
+    //      changed and unchanged files).
+    //   4. crossFileCallsStale = false (no longer stale!).
+    //
+    // Edge case: if call_sites was empty BEFORE this transaction (legacy DB
+    // without call_sites, e.g., pre-R106 DB doing its first incremental), we
+    // can't rebuild a complete graph — unchanged files' call_sites are missing.
+    // In that case, skip resolution and let the caller mark stale=true.
+    // This forces a full reindex which will populate call_sites for all files.
+
+    // R106: capture legacy DB flag BEFORE inserting new call_sites.
+    // After insertion, hasCallSites would return true even for legacy DBs
+    // (because changed files' call_sites were just inserted).
+    const callSitesExistedBefore = hasCallSites(db, project);
+
+    // Step 1: persist call_sites.
+    // - Full mode: insert all call_sites from allExtracts (table was cleared).
+    // - Incremental mode: delete call_sites for changed files, then insert new.
+    const newCallSites: UnresolvedCallSite[] = [];
     for (const ext of allExtracts) {
-      for (const node of ext.nodes) {
-        // Index by simple name (not qualified name)
-        addToGlobalIndex(globalSymbolIndex, node.name, node.qualifiedName);
-      }
+      newCallSites.push(...ext.unresolvedCalls);
+    }
+    if (incremental) {
+      // Delete + re-insert call_sites for changed files only.
+      // call_sites for unchanged files remain in the table.
+      replaceCallSitesForFiles(db, project, changedRelPaths, newCallSites);
+    } else {
+      // Full mode: table was cleared by clearProjectData. Just insert.
+      // Use the helper with an empty delete list.
+      replaceCallSitesForFiles(db, project, [], newCallSites);
     }
 
-    // Collect cross-file CALLS edges
-    const crossFileEdges: Array<{ sourceQn: string; targetQn: string; type: string; properties: string }> = [];
-    for (const ext of allExtracts) {
-      for (const call of ext.unresolvedCalls) {
-        // Try exact callee name first, then last segment (e.g. for obj.method)
-        const candidates = globalSymbolIndex.get(call.calleeName) || globalSymbolIndex.get(call.lastSegment);
-        if (!candidates || candidates.length === 0) continue;
-        // R98: cap at 5 candidates to avoid edge explosion
-        const capped = candidates.slice(0, 5);
-        const confidence = capped.length === 1 ? 1.0 : (1.0 / capped.length);
-        // R99: member calls get lower confidence — name match is less reliable
-        const adjustedConfidence = call.callKind === 'member_call' ? Math.min(confidence, 0.3) : confidence;
-        for (let ci = 0; ci < capped.length; ci++) {
-          if (capped[ci] === call.sourceQn) continue; // skip self-calls
-          // R99: rename cross_file_exact to cross_file_name_exact (not import-aware)
-          const resolution = capped.length === 1 ? 'cross_file_name_exact' : 'cross_file_ambiguous';
-          // R99: use JSON.stringify instead of string concatenation for safety
-          crossFileEdges.push({
-            sourceQn: call.sourceQn,
-            targetQn: capped[ci],
-            type: 'CALLS',
-            properties: JSON.stringify({
-              callee: call.calleeName,
-              inferred: true,
-              resolution,
-              confidence: parseFloat(adjustedConfidence.toFixed(2)),
-              candidate_count: capped.length,
-              candidate_index: ci,
-              call_kind: call.callKind,
-            }),
-          });
-        }
+    // Step 2: rebuild cross-file CALLS edges from persistent call_sites.
+    if (incremental) {
+      const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(project) as { c: number }).c;
+      if (nodesCount > 0 && !callSitesExistedBefore) {
+        // Legacy DB: call_sites was empty before this transaction. Unchanged
+        // files' call_sites are missing. Skip resolution to avoid creating an
+        // incomplete graph. Caller will mark stale=true to force full reindex.
+      } else if (nodesCount > 0 && hasCallSites(db, project)) {
+        const added = rebuildCrossFileCallsEdges(db, project);
+        result.edges += added;
+        result.crossFileCallsResolved = true;
       }
+      // else: no nodes or no call_sites — nothing to resolve.
+    } else {
+      // Full mode: always rebuild (table was cleared, all call_sites are new).
+      const added = rebuildCrossFileCallsEdges(db, project);
+      result.edges += added;
+      result.crossFileCallsResolved = true;
     }
-
-    // Insert cross-file CALLS edges
-    for (let i = 0; i < crossFileEdges.length; i += BATCH_SIZE) {
-      const batch = crossFileEdges.slice(i, i + BATCH_SIZE);
-      const placeholders = batch.map(() => '(?, ?, ?, ?, ?)').join(', ');
-      const stmt = db.prepare(`INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`);
-      const params: unknown[] = [];
-      for (const edge of batch) {
-        const sourceId = qnToId.get(edge.sourceQn);
-        const targetId = qnToId.get(edge.targetQn);
-        if (sourceId && targetId) {
-          params.push(project, sourceId, targetId, edge.type, edge.properties);
-          nextEdgeId++;
-          result.edges++;
-        }
-      }
-      if (params.length > 0) stmt.run(...params);
-    }
-    } // end if (!incremental) — R99: cross-file only in full mode
   });
   tx();
 
   return result;
 }
 
-// R98: helper for building global symbol index
-function addToGlobalIndex(map: Map<string, string[]>, name: string, qn: string): void {
-  // Skip anonymous functions — they can't be called by name cross-file
-  if (name.startsWith('anonymous#')) return;
-  const existing = map.get(name);
-  if (existing) existing.push(qn);
-  else map.set(name, [qn]);
-}
+// R106: addToGlobalIndex() was removed. Cross-file CALLS resolution now lives
+// in cross-file-resolver.ts (rebuildCrossFileCallsEdges), which builds its own
+// global symbol index from the persistent nodes table.
 
 // ── Synchronous language loading (pre-load all needed grammars) ────────
 

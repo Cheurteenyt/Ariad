@@ -1,5 +1,96 @@
 # Changelog — Codebase Memory V2
 
+## 0.41.0 — Round 106 (2026-07-09) Call-sites Persistent Table + Deletion-only Fast Path
+
+**31st round (GPT 5.5 external audit R106).** Major feature: persistent
+`call_sites` table that enables cross-file CALLS resolution in incremental
+mode. Before R106, incremental mode couldn't resolve cross-file CALLS (the
+global symbol index only had changed files' symbols), so the graph was marked
+stale until a full reindex. R106 eliminates this limitation.
+
+### Feature: Call-sites Persistent Table (R106 Phase 1)
+
+New `call_sites` table stores unresolved call-sites from every file. In
+incremental mode, only call_sites for changed/deleted files are removed;
+call_sites for unchanged files remain. Cross-file CALLS edges are rebuilt from
+the full call_sites table + all current nodes.
+
+**Schema:**
+```sql
+CREATE TABLE call_sites (
+  id INTEGER PRIMARY KEY,
+  project TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  source_qn TEXT NOT NULL,
+  callee TEXT NOT NULL,
+  last_segment TEXT NOT NULL,
+  call_kind TEXT NOT NULL,
+  line INTEGER NOT NULL
+);
+CREATE INDEX idx_call_sites_project_file ON call_sites(project, file_path);
+```
+
+**Behavior:**
+- **Full mode**: clear call_sites → extract all files → insert call_sites → rebuild cross-file CALLS → stale=false
+- **Incremental mode**: delete call_sites for changed files → insert new call_sites → rebuild cross-file CALLS from full table → stale=false
+- **Deletion-only fast path**: skip extraction entirely → cleanup deleted files → rebuild cross-file CALLS → stale=false
+- **Legacy DB (pre-R106)**: call_sites empty → skip resolution → stale=true (forces full reindex to populate call_sites)
+
+### Performance improvement (1)
+
+- **Deletion-only incremental fast path** (`indexer.ts`) — Before R106, deleting a single file in incremental mode would fall through to `extractFromFilesWasm()` which stats+skips every unchanged file (wasteful). R106 adds a dedicated fast path: if `estimatedFilesToIndex === 0 && deletedRelPaths.length > 0`, skip extraction entirely, just run the cleanup transaction + rebuild cross-file CALLS. On a large project, this turns a multi-second stat pass into a sub-100ms cleanup.
+
+### Files
+
+- New: `v2/src/indexer/cross-file-resolver.ts` — shared helper for call_sites persistence + cross-file CALLS resolution
+- Modified: `v2/src/indexer/schema.ts` — call_sites table + index + clearProjectData
+- Modified: `v2/src/indexer/wasm-extractor.ts` — single-thread path uses persistent call_sites + shared resolver
+- Modified: `v2/src/indexer/indexer.ts` — parallel path uses persistent call_sites + shared resolver + deletion-only fast path
+- New: `v2/tests/indexer/r106-call-sites-persistent.test.ts` (12 tests)
+- Updated: `v2/tests/indexer/r100-cross-file-calls.test.ts` (stale=false after incremental)
+- Updated: `v2/tests/indexer/r102-stale-monotonicity.test.ts` (stale=false after incremental)
+- Updated: `v2/tests/indexer/r103-stale-precision.test.ts` (stale=false after content change)
+- Modified: `v2/package.json` (version 0.41.0)
+
+### Tests added (12)
+
+New file: `v2/tests/indexer/r106-call-sites-persistent.test.ts`
+
+1. **full index: a.ts calls b.ts → cross-file CALLS edge created + call_sites populated**
+2. **incremental: modify caller a.ts → cross-file CALLS updated, stale=false**
+3. **incremental: modify target b.ts → cross-file CALLS still resolved, stale=false**
+4. **incremental: delete target b.ts → call_sites/edges for b.ts cleaned up**
+5. **metadata-only: no files re-indexed, call_sites unchanged, stale preserved**
+6. **no-op incremental: nothing changes, call_sites/edges preserved**
+7. **incremental: ambiguity cap 5 preserved with persistent call_sites**
+8. **incremental: builtins filter preserved (console.log, arr.map not matched)**
+9. **incremental with call_sites: orphan edges = 0, stats match**
+10. **deletion-only fast path: skips extraction, rebuilds cross-file CALLS, stale=false**
+11. **legacy DB without call_sites: incremental marks stale=true (forces full reindex)**
+12. **call_sites table: schema + index idx_call_sites_project_file exists**
+
+### Tests updated (3)
+
+- `r100-cross-file-calls.test.ts` test 6: "incremental: crossFileCallsStale is false when call_sites is populated (R106)" — was "stale=true when files change"
+- `r102-stale-monotonicity.test.ts`: "full → incremental changed (resolves) → no-op preserves → full resets" — stale is now false after incremental (resolver runs)
+- `r103-stale-precision.test.ts` test 2: "real content change resolves cross-file (R106), then metadata-only preserves" — stale is now false after content change
+
+### Verification
+
+```
+Test Files  11 passed (11)     [indexer tests only]
+     Tests  53 passed (53)     [41 existing + 12 new R106]
+```
+
+### Total: 37 bugs + 11 optimizations + 53 indexer tests across 31 rounds
+
+### Next steps
+
+1. **Import-aware resolution** — parse import statements to prefer imported symbols
+2. **Precision benchmark** — manually verify 20-50 cross-file CALLS edges
+3. **Worker pool persistant** — for MCP/UI/watch daemon mode
+4. **Incremental cross-file CALLS optimization** — only re-resolve call_sites from changed files (instead of rebuilding all)
+
 ## 0.40.0 — Round 105 (2026-07-09) Legacy Deletion Detection + Parallel Proof
 
 **30th round (GPT 5.5 external audit R105).** 0 new bugs — hardens R104's
