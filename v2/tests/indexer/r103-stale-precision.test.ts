@@ -66,7 +66,7 @@ describe('R103: Stale Flag Precision — metadata-only does not set stale', () =
     expect(getStaleFromDB()).toBe(false);
   });
 
-  it('real content change sets stale, then metadata-only preserves stale', async () => {
+  it('real content change resolves cross-file (R106), then metadata-only preserves', async () => {
     writeFileSync(join(projectDir, 'a.ts'), 'export function caller() { return foo(); }\n');
     writeFileSync(join(projectDir, 'b.ts'), 'export function foo() { return 42; }\n');
 
@@ -76,27 +76,28 @@ describe('R103: Stale Flag Precision — metadata-only does not set stale', () =
     });
     expect(getStaleFromDB()).toBe(false);
 
-    // Real content change → stale = true
+    // Real content change → R106: resolver runs (call_sites populated), stale=false.
+    // (Before R106, this was true because incremental couldn't resolve cross-file.)
     writeFileSync(join(projectDir, 'a.ts'), 'export function caller() { return foo() + 1; }\n');
     const result2 = await indexProjectWasm({
       project: projectName, rootPath: projectDir, incremental: true, useWasm: true, workers: 0,
     });
     expect(result2.files).toBeGreaterThan(0); // file was re-indexed
-    expect(result2.crossFileCallsStale).toBe(true);
-    expect(getStaleFromDB()).toBe(true);
+    expect(result2.crossFileCallsStale).toBe(false); // R106: resolved, not stale
+    expect(getStaleFromDB()).toBe(false);
 
-    // Now touch b.ts (metadata-only) — stale should STILL be true (preserved)
+    // Now touch b.ts (metadata-only) — stale should STILL be false (preserved)
     const now = new Date();
     utimesSync(join(projectDir, 'b.ts'), now, now);
     const result3 = await indexProjectWasm({
       project: projectName, rootPath: projectDir, incremental: true, useWasm: true, workers: 0,
     });
     expect(result3.files).toBe(0); // metadata-only
-    // R103: stale preserved from previous run (monotonic)
-    expect(result3.crossFileCallsStale).toBe(true);
-    expect(getStaleFromDB()).toBe(true);
+    // R103/R106: stale preserved from previous run (was false, stays false)
+    expect(result3.crossFileCallsStale).toBe(false);
+    expect(getStaleFromDB()).toBe(false);
 
-    // Full reindex resets
+    // Full reindex resets (already false, stays false)
     const result4 = await indexProjectWasm({
       project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0,
     });

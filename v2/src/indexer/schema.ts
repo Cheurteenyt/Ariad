@@ -56,6 +56,29 @@ const SCHEMA_SQL = `
     cross_file_calls_stale INTEGER DEFAULT 0
   );
 
+  -- R106: Call-sites persistent table.
+  -- Stores unresolved call-sites from every file so that cross-file CALLS
+  -- edges can be rebuilt in incremental mode (without re-parsing unchanged files).
+  -- Schema:
+  --   - project + file_path: which file the call-site lives in
+  --   - source_qn: qualified name of the enclosing function/method (CALLS source)
+  --   - callee: raw callee expression text (e.g. obj.method or foo)
+  --   - last_segment: last segment of callee (e.g. method) - used for symbol lookup
+  --   - call_kind: identifier_call | member_call | computed_call
+  --   - line: 1-indexed source line (for diagnostics)
+  -- In incremental mode, only call_sites for changed/deleted files are removed;
+  -- call_sites for unchanged files remain and participate in resolution.
+  CREATE TABLE IF NOT EXISTS call_sites (
+    id INTEGER PRIMARY KEY,
+    project TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    source_qn TEXT NOT NULL,
+    callee TEXT NOT NULL,
+    last_segment TEXT NOT NULL,
+    call_kind TEXT NOT NULL,
+    line INTEGER NOT NULL
+  );
+
   -- Indexes matching V1's layout for query compatibility.
   CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project);
   CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name);
@@ -65,6 +88,11 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
   CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project);
   CREATE INDEX IF NOT EXISTS idx_file_hashes_path ON file_hashes(project, file_path);
+  -- R106: indexes for call_sites — (project, file_path) for per-file delete/replace,
+  -- (project, last_segment) is intentionally NOT created because resolution loads
+  -- all call_sites for a project at once and uses an in-memory Map (faster than
+  -- per-row index lookup for the typical 1k-100k call-site range).
+  CREATE INDEX IF NOT EXISTS idx_call_sites_project_file ON call_sites(project, file_path);
 `;
 
 /**
@@ -88,6 +116,10 @@ export function initIndexerSchema(db: Database.Database): void {
   migrateFileHashesMtimeNsColumn(db);
   // R101: add cross_file_calls_stale column to projects if missing
   migrateProjectsCrossFileStale(db);
+  // R106: call_sites table is created by SCHEMA_SQL (CREATE IF NOT EXISTS),
+  // but the index idx_call_sites_project_file must exist for legacy DBs that
+  // already had the table created without it. CREATE INDEX IF NOT EXISTS in
+  // SCHEMA_SQL handles this idempotently.
 }
 
 /**
@@ -206,14 +238,16 @@ function migrateProjectsCrossFileStale(db: Database.Database): void {
 }
 
 /**
- * Clear all data for a project (nodes, edges, file_hashes) before re-indexing.
+ * Clear all data for a project (nodes, edges, file_hashes, call_sites) before re-indexing.
  * Does NOT clear the projects table — that's updated separately.
+ * R106: also clears call_sites (persistent cross-file resolution table).
  */
 export function clearProjectData(db: Database.Database, project: string): void {
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
     db.prepare('DELETE FROM edges WHERE project = ?').run(project);
     db.prepare('DELETE FROM file_hashes WHERE project = ?').run(project);
+    db.prepare('DELETE FROM call_sites WHERE project = ?').run(project);
   });
   tx();
 }

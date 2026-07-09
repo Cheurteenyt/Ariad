@@ -11,12 +11,14 @@ import Database from 'better-sqlite3';
 import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { initIndexerSchema, clearProjectData, updateProjectStats } from './schema.js';
 import { discoverSourceFilesWasm, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
+import { replaceCallSitesForFiles, rebuildCrossFileCallsEdges, hasCallSites } from './cross-file-resolver.js';
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 import { join, relative as nodeRelative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import type { WorkerBatch, WorkerBatchResult } from './worker.js';
+import type { UnresolvedCallSite } from './fast-walker.js';
 
 export interface IndexOptions {
   project: string;
@@ -170,6 +172,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // R89: Bug 31 fix — early return for no-op incremental. If estimatedFilesToIndex
   // is 0 AND no deleted files, skip the entire extraction phase.
   // R104: don't early-return if there are deleted files to clean up.
+  // R106: deletion-only has its OWN fast path (see next block) that also
+  // rebuilds cross-file CALLS from the persistent call_sites table.
   if (opts.incremental && estimatedFilesToIndex === 0 && deletedRelPaths.length === 0) {
     const totals = db.prepare(`
       SELECT
@@ -201,6 +205,77 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     };
   }
 
+  // R106: P2 perf fix — deletion-only fast path.
+  // If incremental mode has 0 files to extract BUT has deleted files to clean
+  // up, skip the extraction phase entirely. Just do the cleanup + rebuild
+  // cross-file CALLS from the persistent call_sites table.
+  // Before R106, this case fell through to extractFromFilesWasm() which would
+  // stat+skip every file (wasteful) before the cleanup transaction ran.
+  if (opts.incremental && estimatedFilesToIndex === 0 && deletedRelPaths.length > 0) {
+    const cleanupTx = db.transaction(() => {
+      // 1. Delete nodes/edges/file_hashes/call_sites for deleted files.
+      const ph = deletedRelPaths.map(() => '?').join(',');
+      const oldNodeIds = db.prepare(
+        `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
+      ).all(opts.project, ...deletedRelPaths) as Array<{ id: number }>;
+      if (oldNodeIds.length > 0) {
+        const idPh = oldNodeIds.map(() => '?').join(',');
+        const idParams = oldNodeIds.map(r => r.id);
+        db.prepare(
+          `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
+        ).run(opts.project, ...idParams, ...idParams);
+      }
+      db.prepare(`DELETE FROM nodes WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+      db.prepare(`DELETE FROM file_hashes WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+      // R106: also clean up call_sites for deleted files.
+      db.prepare(`DELETE FROM call_sites WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+
+      // 2. Rebuild cross-file CALLS from the post-cleanup state.
+      //    This removes edges that pointed to deleted nodes and re-resolves
+      //    call_sites that may now match different candidates.
+      //    If call_sites is empty (legacy DB), skip — caller will mark stale.
+      const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(opts.project) as { c: number }).c;
+      if (nodesCount > 0 && hasCallSites(db, opts.project)) {
+        rebuildCrossFileCallsEdges(db, opts.project);
+      }
+    });
+    cleanupTx();
+
+    // Compute totals + stale.
+    const totals = db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM nodes WHERE project = ?) AS nodes,
+        (SELECT COUNT(*) FROM edges WHERE project = ?) AS edges
+    `).get(opts.project, opts.project) as { nodes: number; edges: number };
+    const existingStaleRow = db.prepare(
+      'SELECT cross_file_calls_stale FROM projects WHERE name = ?'
+    ).get(opts.project) as { cross_file_calls_stale?: number } | undefined;
+    const existingStale = existingStaleRow?.cross_file_calls_stale === 1;
+    // R106: if call_sites was populated, we rebuilt cross-file CALLS → stale=false.
+    // If call_sites was empty (legacy DB), stale=true to force full reindex.
+    const nodesCountForStale = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(opts.project) as { c: number }).c;
+    const resolved = nodesCountForStale > 0 && hasCallSites(db, opts.project);
+    const crossFileStale = resolved ? false : (existingStale || true);
+    updateProjectStats(db, opts.project, opts.rootPath, totals.nodes, totals.edges, crossFileStale);
+    db.close();
+    return {
+      dbPath,
+      durationMs: Date.now() - start,
+      nodes: 0,
+      edges: 0,
+      files: 0,
+      skipped: files.length,
+      errors: [],
+      languages: allLangs,
+      parallel: false,
+      workerCount: 0,
+      crossFileCallsStale: crossFileStale,
+    };
+  }
+
   if (!useParallel) {
     // Single-thread: main thread needs the grammars
     await preloadGrammars(allLangs);
@@ -218,6 +293,10 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
 
   // R104: Bug 37 fix — clean up deleted files in incremental mode.
   // Delete nodes, edges, and file_hashes for files that no longer exist on disk.
+  // R106: also delete call_sites for deleted files, and rebuild cross-file CALLS
+  // to remove edges that pointed to deleted nodes.
+  // Note: this block only runs when there were BOTH changed files to extract
+  // AND deleted files to clean up. Deletion-only is handled by the fast path above.
   if (opts.incremental && deletedRelPaths.length > 0) {
     const deleteTx = db.transaction(() => {
       const ph = deletedRelPaths.map(() => '?').join(',');
@@ -236,6 +315,18 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         .run(opts.project, ...deletedRelPaths);
       db.prepare(`DELETE FROM file_hashes WHERE project = ? AND file_path IN (${ph})`)
         .run(opts.project, ...deletedRelPaths);
+      // R106: clean up call_sites for deleted files.
+      db.prepare(`DELETE FROM call_sites WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+
+      // R106: rebuild cross-file CALLS to remove edges that pointed to deleted
+      // nodes and re-resolve call_sites that may now match different candidates.
+      // The extraction transaction already rebuilt cross-file CALLS, but that
+      // used the pre-cleanup state (deleted files' nodes were still present).
+      // This second rebuild uses the post-cleanup state.
+      if (hasCallSites(db, opts.project)) {
+        rebuildCrossFileCallsEdges(db, opts.project);
+      }
     });
     deleteTx();
   }
@@ -248,14 +339,21 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       (SELECT COUNT(*) FROM edges WHERE project = ?) AS edges
   `).get(opts.project, opts.project) as { nodes: number; edges: number };
   // R101/R102/R103/R104: persist crossFileCallsStale in DB + return in IndexResult
-  // R104: deleted files also make cross-file CALLS stale
+  // R106: with persistent call_sites, incremental mode can now rebuild cross-file
+  // CALLS. If result.crossFileCallsResolved is true, stale=false. If false
+  // (legacy DB without call_sites), preserve existing stale or set to true.
   const existingStaleRow = opts.incremental
     ? db.prepare('SELECT cross_file_calls_stale FROM projects WHERE name = ?').get(opts.project) as { cross_file_calls_stale?: number } | undefined
     : undefined;
   const existingStale = existingStaleRow?.cross_file_calls_stale === 1;
   const crossFileStale = opts.incremental
-    ? existingStale || result.files > 0 || deletedRelPaths.length > 0
-    : false; // full reindex resets stale
+    ? // R106: if resolver ran successfully, not stale. Otherwise, preserve
+      // existing stale (could be true from a previous run) or set true if
+      // files changed but resolver couldn't run (legacy DB case).
+      (result.crossFileCallsResolved ?? false)
+        ? false
+        : (existingStale || result.files > 0 || deletedRelPaths.length > 0)
+    : false; // full reindex always resets stale (resolver always runs in full mode)
   updateProjectStats(db, opts.project, opts.rootPath, totals.nodes, totals.edges, crossFileStale);
   db.close();
 
@@ -282,6 +380,9 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
  * after all nodes are inserted. In incremental mode they are intentionally
  * marked stale (crossFileCallsStale=true) until a full reindex or a persistent
  * call_sites table is implemented.
+ * R106: persistent call_sites table is now implemented. Cross-file CALLS are
+ * resolved in BOTH full and incremental modes using the shared
+ * rebuildCrossFileCallsEdges() helper from cross-file-resolver.ts.
  */
 async function indexParallel(
   db: Database.Database,
@@ -290,7 +391,7 @@ async function indexParallel(
   langGroups: Map<string, string[]>,
   numWorkers: number,
   incremental: boolean,
-): Promise<{ nodes: number; edges: number; files: number; skipped: number; errors: Array<{ file: string; error: string }>; languages: Set<string> }> {
+): Promise<{ nodes: number; edges: number; files: number; skipped: number; errors: Array<{ file: string; error: string }>; languages: Set<string>; crossFileCallsResolved: boolean }> {
   // Build batches: group files by language, then split into worker-sized chunks
   const batches: WorkerBatch[] = [];
   const languages = new Set<string>();
@@ -387,7 +488,7 @@ async function indexParallel(
       });
       metaTx();
     }
-    return { nodes: 0, edges: 0, files: 0, skipped: totalSkipped, errors: [], languages };
+    return { nodes: 0, edges: 0, files: 0, skipped: totalSkipped, errors: [], languages, crossFileCallsResolved: false };
   }
 
   // Dispatch batches to workers
@@ -439,6 +540,8 @@ async function indexParallel(
   let nodeCount = 0;
   let edgeCount = 0;
   let fileCount = 0;
+  // R106: tracks whether cross-file CALLS resolution ran successfully.
+  let crossFileResolved = false;
 
   // Build a global QN→ID map for edge resolution
   const qnToId = new Map<string, number>();
@@ -566,70 +669,68 @@ async function indexParallel(
       upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
     }
 
-    // R98/R99: Cross-file CALLS resolution — Phase 3 (parallel path)
-    // R99: Only in full mode. See wasm-extractor.ts for explanation.
-    if (!incremental) {
-    // Build global symbol index from all successfully inserted nodes
-    const globalSymbolIndex = new Map<string, string[]>();
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
-        if (fileResult.error) continue;
-        for (const node of fileResult.nodes) {
-          if (node.name.startsWith('anonymous#')) continue;
-          const existing = globalSymbolIndex.get(node.name);
-          if (existing) existing.push(node.qualifiedName);
-          else globalSymbolIndex.set(node.name, [node.qualifiedName]);
-        }
-      }
-    }
+    // R106: Cross-file CALLS resolution via persistent call_sites table.
+    //
+    // Full mode:
+    //   1. call_sites for the project were cleared by clearProjectData() before
+    //      extraction. Now we insert all new call_sites from worker results.
+    //   2. Then rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges
+    //      from the persistent table + all current nodes.
+    //
+    // Incremental mode:
+    //   1. Delete call_sites for changed files (changedToApply).
+    //   2. Insert new call_sites from worker results (only changed files).
+    //   3. rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges from
+    //      the persistent table (has call_sites for both changed and unchanged
+    //      files) + all current nodes (has nodes for both changed and unchanged).
+    //   4. crossFileCallsStale = false (no longer stale!).
+    //
+    // Edge case: if call_sites was empty BEFORE this transaction (legacy DB
+    // without call_sites), skip resolution to avoid an incomplete graph.
 
-    // Resolve unresolved call-sites from workers
-    const crossFileEdges: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
+    // R106: capture legacy DB flag BEFORE inserting new call_sites.
+    const callSitesExistedBefore = hasCallSites(db, project);
+
+    // Step 1: collect new call_sites from worker results.
+    const newCallSites: UnresolvedCallSite[] = [];
     for (const batchResult of results) {
       for (const fileResult of batchResult.results) {
         if (fileResult.error || !fileResult.unresolvedCalls) continue;
-        for (const call of fileResult.unresolvedCalls) {
-          const candidates = globalSymbolIndex.get(call.calleeName) || globalSymbolIndex.get(call.lastSegment);
-          if (!candidates || candidates.length === 0) continue;
-          const capped = candidates.slice(0, 5);
-          const confidence = capped.length === 1 ? 1.0 : (1.0 / capped.length);
-          // R99: member calls get lower confidence
-          const adjustedConfidence = call.callKind === 'member_call' ? Math.min(confidence, 0.3) : confidence;
-          for (let ci = 0; ci < capped.length; ci++) {
-            if (capped[ci] === call.sourceQn) continue;
-            const sourceId = qnToId.get(call.sourceQn);
-            const targetId = qnToId.get(capped[ci]);
-            if (sourceId && targetId) {
-              const resolution = capped.length === 1 ? 'cross_file_name_exact' : 'cross_file_ambiguous';
-              // R99: use JSON.stringify
-              crossFileEdges.push({
-                sourceId, targetId, type: 'CALLS',
-                properties: JSON.stringify({
-                  callee: call.calleeName,
-                  inferred: true,
-                  resolution,
-                  confidence: parseFloat(adjustedConfidence.toFixed(2)),
-                  candidate_count: capped.length,
-                  candidate_index: ci,
-                  call_kind: call.callKind,
-                }),
-              });
-            }
-          }
-        }
+        newCallSites.push(...fileResult.unresolvedCalls);
       }
     }
 
-    // Insert cross-file CALLS edges
-    for (const edge of crossFileEdges) {
-      insertEdge.run(project, edge.sourceId, edge.targetId, edge.type, edge.properties);
-      edgeCount++;
+    // Step 2: persist call_sites.
+    if (incremental) {
+      // Delete + re-insert call_sites for changed files only.
+      // call_sites for unchanged files remain in the table.
+      replaceCallSitesForFiles(db, project, changedToApply, newCallSites);
+    } else {
+      // Full mode: table was cleared by clearProjectData. Just insert.
+      replaceCallSitesForFiles(db, project, [], newCallSites);
     }
-    } // end if (!incremental) — R99: cross-file only in full mode
+
+    // Step 3: rebuild cross-file CALLS edges.
+    if (incremental) {
+      const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(project) as { c: number }).c;
+      if (nodesCount > 0 && !callSitesExistedBefore) {
+        // Legacy DB: call_sites was empty before. Skip resolution.
+        // Caller marks stale=true to force full reindex.
+      } else if (nodesCount > 0 && hasCallSites(db, project)) {
+        const added = rebuildCrossFileCallsEdges(db, project);
+        edgeCount += added;
+        crossFileResolved = true;
+      }
+    } else {
+      // Full mode: always rebuild.
+      const added = rebuildCrossFileCallsEdges(db, project);
+      edgeCount += added;
+      crossFileResolved = true;
+    }
   });
   tx();
 
-  return { nodes: nodeCount, edges: edgeCount, files: fileCount, skipped: totalSkipped, errors, languages };
+  return { nodes: nodeCount, edges: edgeCount, files: fileCount, skipped: totalSkipped, errors, languages, crossFileCallsResolved: crossFileResolved };
 }
 
 /**
