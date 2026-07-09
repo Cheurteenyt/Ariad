@@ -619,6 +619,19 @@ export function rebuildCrossFileCallsEdges(
 }
 
 /**
+ * R120: Check whether the exports table is populated for a project.
+ * Used to detect legacy DBs (pre-R119) that have call_sites_initialized=1
+ * but no exports. In that case, the resolver can't resolve export aliases
+ * or re-exports for unchanged files, so the caller should mark stale=true.
+ */
+export function hasExports(db: Database.Database, project: string): boolean {
+  const row = db.prepare(
+    'SELECT COUNT(*) AS c FROM exports WHERE project = ?'
+  ).get(project) as { c: number };
+  return row.c > 0;
+}
+
+/**
  * R106: Check whether the persistent call_sites table is populated for a project.
  *
  * Used by the incremental path to decide whether cross-file CALLS can be
