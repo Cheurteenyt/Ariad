@@ -1,5 +1,54 @@
 # Changelog — Codebase Memory V2
 
+## 0.39.0 — Round 104 (2026-07-09) Incremental Deleted Files Cleanup
+
+**29th round (GPT 5.5 external audit R104).** 1 bug fixed. GPT 5.5 found that
+deleted files were never cleaned up in incremental mode — nodes, edges, and
+file_hashes for deleted files remained in the DB as "ghost graph".
+
+### Bug fixed (1)
+
+37. **Deleted files not cleaned up in incremental mode** (`indexer.ts`) — In incremental mode, the indexer only processes files currently on disk. Files that were deleted since the last index remained in `nodes`, `edges`, and `file_hashes` indefinitely. MCP/UI would show symbols for files that no longer exist. Fixed: after extraction, detect deleted files by comparing `file_hashes.file_path` against current discovery. Delete their nodes, edges (orphaned), and file_hashes in a transaction. Also sets `crossFileCallsStale=true` since the graph changed.
+
+### Implementation
+
+1. After `discoverSourceFilesWasm()`, build `currentRelPaths` set
+2. Query `SELECT file_path FROM file_hashes WHERE project = ?`
+3. `deletedRelPaths = indexedPaths.filter(p => !currentRelPaths.has(p))`
+4. Don't early-return no-op if `deletedRelPaths.length > 0`
+5. After extraction phase, delete nodes/edges/file_hashes for deleted files in a transaction
+6. `crossFileStale = existingStale || result.files > 0 || deletedRelPaths.length > 0`
+
+### Tests added (3)
+
+New file: `v2/tests/indexer/r104-deleted-files.test.ts`
+
+1. **`deleted file is cleaned up from nodes, edges, and file_hashes`** — Delete b.ts, incremental, verify b.ts nodes=0, hashes=0, a.ts preserved, orphan_edges=0, stale=true.
+2. **`deleted file + modified file: both handled correctly`** — Delete b.ts + modify a.ts, incremental, verify b.ts cleaned, a.ts re-indexed, c.ts preserved, orphan_edges=0.
+3. **`no-op after deletion cleanup: deleted file stays gone`** — After deletion cleanup, second no-op incremental doesn't re-create b.ts.
+
+### Verification
+
+```
+Test Files  41 passed (41)
+     Tests  394 passed (394)
+```
+
+### Files
+
+- Modified: `v2/src/indexer/indexer.ts` (Bug 37: deleted file detection + cleanup)
+- New: `v2/tests/indexer/r104-deleted-files.test.ts` (3 tests)
+- Modified: `v2/package.json` (version 0.39.0)
+
+### Total: 37 bugs + 10 optimizations + 39 tests across 29 rounds
+
+### Next steps
+
+1. **Call-sites persistent table** — enable cross-file CALLS in incremental mode
+2. **Import-aware resolution** — parse import statements
+3. **Precision benchmark** — manually verify 20-50 cross-file CALLS edges
+4. **Worker pool persistant** — for MCP/UI/watch daemon mode
+
 ## 0.38.0 — Round 103 (2026-07-09) Stale Flag Precision Lock
 
 **28th round (GPT 5.5 external audit R103).** 1 bug fixed. GPT 5.5 found that

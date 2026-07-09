@@ -151,10 +151,24 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // R86: Bug 28 fix — use estimatedFilesToIndex, not files.length
   const useParallel = numWorkers > 1 && estimatedFilesToIndex > 20;
 
+  // R104: Bug 37 fix — detect deleted files in incremental mode.
+  // Files that were indexed previously but no longer exist on disk must be
+  // cleaned up from nodes, edges, and file_hashes.
+  let deletedRelPaths: string[] = [];
+  if (opts.incremental) {
+    const currentRelPaths = new Set(files.map(f => nodeRelative(opts.rootPath, f)));
+    const indexedPaths = db.prepare(
+      'SELECT file_path FROM file_hashes WHERE project = ?'
+    ).all(opts.project) as Array<{ file_path: string }>;
+    deletedRelPaths = indexedPaths
+      .map(r => r.file_path)
+      .filter(p => !currentRelPaths.has(p));
+  }
+
   // R89: Bug 31 fix — early return for no-op incremental. If estimatedFilesToIndex
-  // is 0, no files need parsing. Skip the entire extraction phase and just update
-  // project stats. This avoids the double stat+DB pass (estimation + extraction).
-  if (opts.incremental && estimatedFilesToIndex === 0) {
+  // is 0 AND no deleted files, skip the entire extraction phase.
+  // R104: don't early-return if there are deleted files to clean up.
+  if (opts.incremental && estimatedFilesToIndex === 0 && deletedRelPaths.length === 0) {
     const totals = db.prepare(`
       SELECT
         (SELECT COUNT(*) FROM nodes WHERE project = ?) AS nodes,
@@ -200,27 +214,45 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     );
   }
 
+  // R104: Bug 37 fix — clean up deleted files in incremental mode.
+  // Delete nodes, edges, and file_hashes for files that no longer exist on disk.
+  if (opts.incremental && deletedRelPaths.length > 0) {
+    const deleteTx = db.transaction(() => {
+      const ph = deletedRelPaths.map(() => '?').join(',');
+      // Get node IDs for deleted files
+      const oldNodeIds = db.prepare(
+        `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
+      ).all(opts.project, ...deletedRelPaths) as Array<{ id: number }>;
+      if (oldNodeIds.length > 0) {
+        const idPh = oldNodeIds.map(() => '?').join(',');
+        const idParams = oldNodeIds.map(r => r.id);
+        db.prepare(
+          `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
+        ).run(opts.project, ...idParams, ...idParams);
+      }
+      db.prepare(`DELETE FROM nodes WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+      db.prepare(`DELETE FROM file_hashes WHERE project = ? AND file_path IN (${ph})`)
+        .run(opts.project, ...deletedRelPaths);
+    });
+    deleteTx();
+  }
+
   // R81: Bug 18 fix — after incremental, projects.node_count/edge_count must
   // reflect the TOTAL in the DB, not just the nodes/edges inserted in this run.
-  // Previously, a no-op incremental would set node_count=0 (result.nodes=0).
   const totals = db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM nodes WHERE project = ?) AS nodes,
       (SELECT COUNT(*) FROM edges WHERE project = ?) AS edges
   `).get(opts.project, opts.project) as { nodes: number; edges: number };
-  // R101/R102/R103: persist crossFileCallsStale in DB + return in IndexResult
-  // R102: Bug 35 fix — stale flag is monotonic. Once true, it stays true until
-  // full reindex. Incremental no-op → preserve existing. Full reindex → false.
-  // R103: Bug 36 fix — don't set stale=true for metadata-only updates (files=0).
-  // A metadata-only update (mtime changed, content same) doesn't change the
-  // graph, so cross-file CALLS remain valid. Only set stale=true when files
-  // are actually re-indexed (result.files > 0).
+  // R101/R102/R103/R104: persist crossFileCallsStale in DB + return in IndexResult
+  // R104: deleted files also make cross-file CALLS stale
   const existingStaleRow = opts.incremental
     ? db.prepare('SELECT cross_file_calls_stale FROM projects WHERE name = ?').get(opts.project) as { cross_file_calls_stale?: number } | undefined
     : undefined;
   const existingStale = existingStaleRow?.cross_file_calls_stale === 1;
   const crossFileStale = opts.incremental
-    ? existingStale || result.files > 0  // monotonic: preserve existing OR set true if graph changed
+    ? existingStale || result.files > 0 || deletedRelPaths.length > 0
     : false; // full reindex resets stale
   updateProjectStats(db, opts.project, opts.rootPath, totals.nodes, totals.edges, crossFileStale);
   db.close();
