@@ -497,6 +497,15 @@ function extractExports(rootNode: TSNode, filePath: string): ExportBinding[] {
       const aliasNode = spec.childForFieldName('alias');
       if (!nameNode) continue;
 
+      // R120: Check for inline type-only specifier: export { type Foo, bar }
+      // tree-sitter puts 'type' keyword inside export_specifier
+      let isSpecTypeOnly = false;
+      for (let k = 0; k < spec.childCount; k++) {
+        const specChild = spec.child(k);
+        if (specChild && specChild.type === 'type') { isSpecTypeOnly = true; break; }
+      }
+      if (isSpecTypeOnly) continue;
+
       const originalName = nameNode.text;
       const exportedName = aliasNode ? aliasNode.text : originalName;
 

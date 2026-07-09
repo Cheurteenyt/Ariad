@@ -1,5 +1,30 @@
 # Changelog — Codebase Memory V2
 
+## 0.52.1 — Round 120 (2026-07-09) Export Tracking Precision Lock
+
+**44th round (GPT 5.5 audit R125).** 1 bug fixed + 3 precision tests. GPT 5.5
+found that R119's `extractExports()` didn't handle inline type-only export
+specifiers (`export { type Foo, bar }`), and the deletion cleanup test wasn't
+strict enough.
+
+### Bug fixed (1)
+
+49. **Inline type-only export specifiers not filtered** (`fast-walker.ts`) — `export { type Foo, bar } from './types'` would extract `Foo` as a runtime export because the `type` keyword is inside the `export_specifier` node, not at the `export_statement` level. Fixed: added per-specifier `type` keyword check in `extractExports()`, same pattern as R111's import specifier check.
+
+### Tests (3)
+
+`v2/tests/indexer/r120-export-precision-lock.test.ts`
+
+1. **Deletion cleanup strengthened**: delete `b.ts` → `getEdges("foo").length = 0` (not just orphan=0)
+2. **Inline type-only**: `export { type Foo, bar }` — Foo NOT in exports table, bar resolves
+3. **Legacy DB graceful fallback**: empty exports table → resolver falls back to `fileSyms.get()` without crash
+
+### P2 finding: legacy DB migration
+
+Verified that `hasExports` as a legacy DB gate was too aggressive (most files use `export function foo()` which doesn't create export bindings). Removed the gate — `resolveExportedSymbol()` already falls back to `fileSyms.get()` when no export binding exists, so legacy DBs work correctly (just without export alias resolution until full reindex).
+
+### Total: 42 bugs + 11 optimizations + 134 indexer tests across 44 rounds
+
 ## 0.52.0 — Round 119 (2026-07-09) Export Alias / Re-export Tracking
 
 **43rd round (GPT 5.5 audit R124).** Major feature: export alias and re-export
