@@ -56,12 +56,21 @@ import type Database from 'better-sqlite3';
  *        corrects this. DBs indexed by R134 (v5) are missing top-level
  *        `type_only_default` rows and may have stale `node:fake` edges.
  *        Both must be re-parsed.
+ *   - 7: R141 — Discovery Policy Lock. R139/R140 changed the discovery policy
+ *        (external symlinks excluded, directory aliases deduplicated, fail-closed
+ *        realpath, canonical paths, deep SKIP_DIRS component check, file-symlink
+ *        dedup via dev:ino). R141 also closed the DATA-R141-01 silent graph wipe
+ *        (root inaccessible no longer wipes the DB). DBs indexed by R140 and
+ *        earlier may contain external-symlink nodes, alias-path file_path rows,
+ *        and duplicate File nodes from file symlinks — all of which must be
+ *        purged by a full reindex before the new policy is trustworthy. The
+ *        version bump forces the incremental gate to mark these DBs stale.
  *
  * When bumping this constant, also add a migration test that simulates an
  * upgrade from the previous version (delete the relevant rows, keep
  * file_hashes, run incremental, assert crossFileCallsStale=true).
  */
-export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 6;
+export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 7;
 
 /**
  * Tables created by the native indexer. Matches V1's schema so that
@@ -125,6 +134,8 @@ const SCHEMA_SQL = `
     --   4 = R133+ (type/value default lock, interface excluded from runtime count)
     --   5 = R134+ (type namespace default validity, builtinModules check)
     --   6 = R135/R136+ (builtin truth lock, top-level type default, version fix)
+    --   7 = R141+ (discovery policy lock: external symlinks, canonical paths,
+    --             file-symlink dedup, root discovery failure lock)
     extractor_semantics_version INTEGER DEFAULT 0
   );
 
