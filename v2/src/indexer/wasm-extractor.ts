@@ -25,11 +25,12 @@
 import { Parser, Language } from 'web-tree-sitter';
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
-import { relative as pathRelative, isAbsolute, relative, extname, basename, dirname, join } from 'node:path';
+import { relative, extname, basename, dirname, join, sep } from 'node:path';
 import { readFileSync, statSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { extractFast, type UnresolvedCallSite, type ImportBinding, type ExportBinding } from './fast-walker.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized, isExtractorSemanticsCurrent } from './cross-file-resolver.js';
+import { isPathInside } from '../utils/safe-path.js';
 const require2 = createRequire(import.meta.url);
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -135,28 +136,124 @@ export function detectLanguage(filePath: string): string | null {
 }
 
 /**
+ * R141 (PERF-R141-01): Check whether a real target path passes ANY component
+ * of SKIP_DIRS — not just the basename. Previously only `basename(realTarget)`
+ * was checked, so an alias like `link -> node_modules/pkg/src` (basename=`src`)
+ * bypassed the filter and let `node_modules/.../dep.ts` be indexed.
+ *
+ * The check is performed against the canonical path relative to realRoot,
+ * so a deep alias is rejected if any ancestor directory is in SKIP_DIRS or
+ * starts with '.' (hidden directory).
+ *
+ * `realRoot` is the resolved root. `realTarget` is the resolved target path
+ * (already confirmed to be inside realRoot by isPathInside).
+ */
+function hasSkippedComponent(realRoot: string, realTarget: string): boolean {
+  const rel = relative(realRoot, realTarget);
+  if (rel === '') return false; // the root itself
+  const components = rel.split(sep);
+  for (const component of components) {
+    if (component === '') continue;
+    if (SKIP_DIRS.has(component) || component.startsWith('.')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * R141 (IDX-R141-01): Build a stable identity key for a regular file.
+ *
+ * `dev:ino` is the most robust identifier — it distinguishes two distinct
+ * files even when they share a name, and identifies two paths pointing to
+ * the same file (hardlinks, file symlinks). On most platforms this is
+ * unique and stable across readdir order.
+ *
+ * Fallback: realpath canonical. Used when stat fails (extremely rare for a
+ * file we just lstat'd successfully, but defensively covers exotic
+ * filesystems like FUSE that may not expose dev/ino reliably).
+ *
+ * Returns null only if both stat AND realpath fail — at which point the
+ * caller skips the file (treat as inaccessible).
+ */
+function fileIdentityKey(fullPath: string): string | null {
+  try {
+    const st = statSync(fullPath, { bigint: true });
+    return `${st.dev}:${st.ino}`;
+  } catch {
+    try {
+      return realpathSync(fullPath);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
  * Walk a directory and return all supported source files.
+ *
+ * R141 (DATA-R141-01): If the root path is missing, not a directory, or
+ * unreadable, this function THROWS (was: silently returned []). The
+ * indexer must propagate the error so the caller can decide not to wipe
+ * the existing graph. The preflight is also performed by
+ * assertDiscoveryRoot() in safe-path.ts for callers that need to check
+ * BEFORE opening the DB.
+ *
+ * R141 (IDX-R141-01): File symlinks are deduplicated via a visitedFiles
+ * Set keyed by `dev:ino` (with realpath fallback). Two aliases to the
+ * same file produce exactly one result.
+ *
+ * R141 (IDX-R141-02): The CANONICAL real path (relative to realRoot)
+ * is the one pushed onto the stack and persisted — never the lexical
+ * alias. This makes discovery deterministic across readdir order.
+ *
+ * R141 (PERF-R141-01): SKIP_DIRS is checked against every component of
+ * the canonical target path, not just the basename. An alias to
+ * `node_modules/pkg/src` is now correctly skipped.
+ *
+ * R141 (SEC-R141-02): Regular-directory realpath failures are
+ * fail-CLOSED (skip the entry, do not push the lexical path). The
+ * previous behavior was fail-open: realpath failure was swallowed and
+ * the lexical `fullPath` was pushed anyway, allowing traversal past an
+ * EACCES/ELOOP/EIO boundary.
  */
 export function discoverSourceFilesWasm(rootPath: string): string[] {
-  const results: string[] = [];
-  // R139/R140: Resolve the real root path once. All discovered paths must be
-  // inside this real root to prevent symlink-based escapes.
+  // R141 (DATA-R141-01): Validate root BEFORE any work. Throw with a
+  // descriptive error so callers can distinguish root failure from
+  // "valid root with 0 source files". The previous behavior (return [])
+  // silently produced an empty graph and was certified as fresh.
   let realRoot: string;
+  let rootStat;
+  try {
+    rootStat = statSync(rootPath);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === 'ENOENT') {
+      throw new Error(`Discovery root not found: "${rootPath}"`);
+    }
+    throw new Error(`Discovery root not readable: "${rootPath}" (${code ?? 'unknown'})`);
+  }
+  if (!rootStat.isDirectory()) {
+    throw new Error(`Discovery root is not a directory: "${rootPath}"`);
+  }
   try {
     realRoot = realpathSync(rootPath);
-  } catch {
-    return results; // rootPath doesn't exist — nothing to discover
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    throw new Error(`Discovery root not readable: "${rootPath}" (${code ?? 'realpath failed'})`);
   }
+
+  const results: string[] = [];
   // R140: Track visited realpaths for ALL directories (regular + symlink)
   // to prevent duplicate indexing and cycles.
   const visitedDirs = new Set<string>([realRoot]);
-  const stack: string[] = [rootPath];
-
-  // R140: Cross-platform containment check using path.relative
-  function isInside(root: string, candidate: string): boolean {
-    const rel = pathRelative(root, candidate);
-    return rel === '' || (!rel.startsWith('..' + '/') && !rel.startsWith('..' + '\\') && rel !== '..' && !isAbsolute(rel));
-  }
+  // R141 (IDX-R141-01): Track visited file identities so two aliases to the
+  // same file produce exactly one result. The key is `dev:ino` (with
+  // realpath fallback) — see fileIdentityKey.
+  const visitedFiles = new Set<string>();
+  // R141 (IDX-R141-02): Push the canonical real path, not the lexical alias.
+  // This makes discovery deterministic across readdir order.
+  const stack: string[] = [realRoot];
 
   while (stack.length > 0) {
     const dir = stack.pop()!;
@@ -164,62 +261,127 @@ export function discoverSourceFilesWasm(rootPath: string): string[] {
     try {
       entries = readdirSync(dir);
     } catch {
+      // R141 (SEC-R141-02): fail-closed — skip directories we can't read
+      // rather than silently continuing (which could miss files but
+      // never produce wrong paths).
       continue;
     }
 
     for (const entry of entries) {
       const fullPath = join(dir, entry);
+      let lst;
       try {
-        const lst = lstatSync(fullPath);
-        if (lst.isSymbolicLink()) {
-          // R139/R140: Resolve symlink target and check containment.
-          try {
-            const realTarget = realpathSync(fullPath);
-            if (!isInside(realRoot, realTarget)) {
-              continue; // External symlink — skip
-            }
-            // R140: Check SKIP_DIRS against the target's basename too
-            const targetBase = basename(realTarget);
-            if (SKIP_DIRS.has(targetBase) || SKIP_DIRS.has(entry)) {
-              continue;
-            }
-            // R140: Check visited for ALL directories (dedup)
-            if (visitedDirs.has(realTarget)) {
-              continue;
-            }
-            const realStat = statSync(fullPath);
-            if (realStat.isDirectory()) {
-              if (!entry.startsWith('.')) {
-                visitedDirs.add(realTarget);
-                stack.push(fullPath);
-              }
-            } else {
-              const lang = detectLanguage(fullPath);
-              if (lang) results.push(fullPath);
-            }
-          } catch {
-            continue; // Broken symlink
-          }
-        } else if (lst.isDirectory()) {
-          if (!SKIP_DIRS.has(entry) && !entry.startsWith('.')) {
-            // R140: Resolve regular dirs too and check visited (dedup)
-            try {
-              const realDir = realpathSync(fullPath);
-              if (visitedDirs.has(realDir)) {
-                continue; // Already visited via symlink or another path
-              }
-              visitedDirs.add(realDir);
-            } catch {
-              // If realpath fails, still push (may not exist yet — unlikely for a dir we just lstat'd)
-            }
-            stack.push(fullPath);
-          }
-        } else if (lst.isFile()) {
-          const lang = detectLanguage(fullPath);
-          if (lang) results.push(fullPath);
-        }
+        lst = lstatSync(fullPath);
       } catch {
-        // skip inaccessible
+        // skip inaccessible entry
+        continue;
+      }
+
+      if (lst.isSymbolicLink()) {
+        // R139/R140/R141: Resolve symlink target and check containment.
+        let realTarget: string;
+        try {
+          realTarget = realpathSync(fullPath);
+        } catch {
+          // Broken or unreadable symlink — skip (fail-closed).
+          continue;
+        }
+        // R141 (QUAL-R141-01): use the unified isPathInside — same predicate
+        // as vault writes. No more drift between discovery and vault.
+        if (!isPathInside(realRoot, realTarget)) {
+          continue; // External symlink — skip
+        }
+        // R141 (PERF-R141-01): Check SKIP_DIRS against ALL components of the
+        // canonical target path (relative to realRoot), not just basename.
+        // Catches `link -> node_modules/pkg/src` (basename=`src` is fine,
+        // but `node_modules` is in the path).
+        if (hasSkippedComponent(realRoot, realTarget)) {
+          continue;
+        }
+        // R140: Also check the entry name itself (alias name) — an alias
+        // named `node_modules` pointing inside the project is rare but
+        // should still be skipped for consistency.
+        if (SKIP_DIRS.has(entry) || entry.startsWith('.')) {
+          continue;
+        }
+
+        let realStat;
+        try {
+          // R141: statSync(realTarget) not statSync(fullPath) — we want the
+          // type of the target, not the symlink. They're equivalent on most
+          // platforms, but using realTarget is more explicit.
+          realStat = statSync(realTarget);
+        } catch {
+          continue; // Target disappeared between realpath and stat — skip
+        }
+
+        if (realStat.isDirectory()) {
+          // R141 (IDX-R141-02): Push the CANONICAL realTarget, not fullPath.
+          // This makes the alias transparent: the discovery proceeds from
+          // the real path, so all descendant files are persisted with
+          // canonical paths.
+          if (visitedDirs.has(realTarget)) {
+            continue;
+          }
+          visitedDirs.add(realTarget);
+          stack.push(realTarget);
+        } else {
+          // R141 (IDX-R141-01): Dedup file symlinks via dev:ino identity.
+          // Two aliases to the same file (or an alias + the original) yield
+          // exactly one entry in results.
+          const identity = fileIdentityKey(realTarget);
+          if (identity === null) {
+            continue; // Couldn't identify the file — skip (fail-closed)
+          }
+          if (visitedFiles.has(identity)) {
+            continue;
+          }
+          visitedFiles.add(identity);
+          // R141 (IDX-R141-02): Persist the CANONICAL path relative to realRoot.
+          // The alias name is intentionally dropped — qualified names and
+          // file_hashes must be stable across readdir order.
+          const lang = detectLanguage(realTarget);
+          if (lang) results.push(realTarget);
+        }
+      } else if (lst.isDirectory()) {
+        if (SKIP_DIRS.has(entry) || entry.startsWith('.')) {
+          continue;
+        }
+        // R141 (SEC-R141-02): Fail-CLOSED realpath for regular directories.
+        // The previous code swallowed ALL realpath errors and pushed the
+        // lexical fullPath anyway. That was fail-OPEN: an EACCES or ELOOP
+        // on a regular directory would silently let traversal continue
+        // past the boundary. Now we push only the canonical realTarget —
+        // if realpath fails, we skip the directory entirely.
+        let realDir: string;
+        try {
+          realDir = realpathSync(fullPath);
+        } catch {
+          // EACCES, ELOOP, EIO, etc. — fail-closed: skip the directory.
+          // We do NOT push fullPath because that could traverse a path
+          // we couldn't canonicalize (potential TOCTOU/security risk).
+          continue;
+        }
+        if (visitedDirs.has(realDir)) {
+          continue; // Already visited via symlink or another path
+        }
+        visitedDirs.add(realDir);
+        // R141 (IDX-R141-02): Push canonical realDir, not lexical fullPath.
+        stack.push(realDir);
+      } else if (lst.isFile()) {
+        // R141 (IDX-R141-01): Dedup regular files too (hardlinks). Without
+        // this, two hardlinks to the same file would produce two File nodes
+        // with different paths — same problem as file symlinks.
+        const identity = fileIdentityKey(fullPath);
+        if (identity === null) {
+          continue; // stat failed — skip
+        }
+        if (visitedFiles.has(identity)) {
+          continue;
+        }
+        visitedFiles.add(identity);
+        const lang = detectLanguage(fullPath);
+        if (lang) results.push(fullPath);
       }
     }
   }

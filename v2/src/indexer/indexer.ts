@@ -12,6 +12,7 @@ import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION } from './schema.js';
 import { discoverSourceFilesWasm, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
+import { assertDiscoveryRoot, DiscoveryRootError } from '../utils/safe-path.js';
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 import { join, relative as nodeRelative } from 'node:path';
@@ -70,8 +71,56 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // falls back to single-threaded.
   const numWorkers = opts.workers ?? Math.max(2, cpus().length - 1);
 
+  // R141 (DATA-R141-01): Validate the discovery root BEFORE opening the DB
+  // (dry-run) or BEFORE clearProjectData (full mode) or BEFORE computing
+  // deletedRelPaths (incremental mode). The previous flow let a missing or
+  // unreadable root silently produce an empty result that wiped the graph.
+  //
+  // dry-run:  no DB opened — just report the error in IndexResult.errors.
+  // full:     no clearProjectData — the existing graph is preserved; the
+  //           caller can retry later when the root is reachable again.
+  // incr:     deletedRelPaths is NOT computed (would be the entire project);
+  //           stale=true is set so the caller knows the index is stale;
+  //           the existing graph is preserved.
+  try {
+    assertDiscoveryRoot(opts.rootPath);
+  } catch (error) {
+    const message = error instanceof DiscoveryRootError
+      ? `Discovery root error (${error.reason}): "${error.rootPath}"`
+      : `Discovery root error: "${opts.rootPath}" (${(error as Error).message})`;
+    return {
+      dbPath,
+      durationMs: Date.now() - start,
+      nodes: 0,
+      edges: 0,
+      files: 0,
+      skipped: 0,
+      errors: [{ file: opts.rootPath, error: message }],
+      languages: new Set(),
+      parallel: false,
+      workerCount: 0,
+      crossFileCallsStale: true, // R141: root failure → stale (don't trust any prior state)
+    };
+  }
+
   if (opts.dryRun) {
-    const files = discoverSourceFilesWasm(opts.rootPath);
+    // R141: discovery root is already validated above; discoverSourceFilesWasm
+    // is now guaranteed not to throw for root reasons. We still wrap in
+    // try/catch as a defensive safety net for transient I/O errors mid-walk.
+    let files: string[];
+    try {
+      files = discoverSourceFilesWasm(opts.rootPath);
+    } catch (error) {
+      return {
+        dbPath, durationMs: Date.now() - start, nodes: 0, edges: 0,
+        files: 0, skipped: 0,
+        errors: [{ file: opts.rootPath, error: (error as Error).message }],
+        languages: new Set(),
+        parallel: false,
+        workerCount: 0,
+        crossFileCallsStale: true,
+      };
+    }
     const langs = new Set<string>();
     for (const f of files) {
       const lang = detectLanguage(f);
@@ -91,13 +140,39 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // - Full mode: clear everything (as before)
   // - Incremental mode: don't clear; per-file deletes happen in extractFromFilesWasm
   //   for files that have changed (identified by hash mismatch)
+  // R141 (DATA-R141-01): root was already validated above. As an additional
+  // TOCTOU safeguard, we run discoverSourceFilesWasm BEFORE clearProjectData
+  // in full mode. If discovery throws (extremely unlikely after the root
+  // preflight, but possible for exotic filesystems), the existing graph is
+  // preserved instead of being wiped.
+  let files: string[];
+  try {
+    files = discoverSourceFilesWasm(opts.rootPath);
+  } catch (error) {
+    // R141 (DATA-R141-01): discovery failed AFTER root validation — likely a
+    // transient I/O error or a TOCTOU race. Do NOT clearProjectData. Close
+    // the DB and return an error so the caller can retry.
+    db.close();
+    const message = (error as Error).message;
+    return {
+      dbPath,
+      durationMs: Date.now() - start,
+      nodes: 0,
+      edges: 0,
+      files: 0,
+      skipped: 0,
+      errors: [{ file: opts.rootPath, error: `Discovery failed: ${message}` }],
+      languages: new Set(),
+      parallel: false,
+      workerCount: 0,
+      crossFileCallsStale: true,
+    };
+  }
   if (!opts.incremental) {
     clearProjectData(db, opts.project);
   }
   // In incremental mode, we do NOT clear nodes/edges here. The extractor
   // will delete old nodes for changed files before re-inserting.
-
-  const files = discoverSourceFilesWasm(opts.rootPath);
 
   // Detect languages and group files by language
   const langGroups = new Map<string, string[]>();

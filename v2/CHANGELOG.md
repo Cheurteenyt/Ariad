@@ -1,5 +1,118 @@
 # Changelog — Codebase Memory V2
 
+## 0.56.2 — Round 141 (2026-07-10) Discovery Canonical Lock
+
+**66th round (GPT 5.6 Sol audit R140).** 1 P1 + 4 P1/P2 + 1 P2 + 1 P2/P3
+fixed. Closes the 7 confirmed findings of the R140 audit. R140 is accepted
+by the audit (the P0 depth bypass is really closed), but the audit identified
+a new P1: silent graph wipe when the discovery root is unreachable.
+
+### Data integrity (1 P1 — very high)
+
+97. **P1 silent graph wipe on unreachable root** (`indexer.ts`, `safe-path.ts`,
+    `wasm-extractor.ts`) — `discoverSourceFilesWasm` caught root realpath
+    failure and returned `[]`. The full indexer ran `clearProjectData()`
+    BEFORE discovery, so a missing or unreadable root silently destroyed the
+    valid graph and certified an empty DB as fresh (`stale=false`,
+    `version=CURRENT`). A network drive unmount or temporary EACCES could
+    wipe weeks of indexing with no error. Fixed: `assertDiscoveryRoot()`
+    validates root BEFORE any DB mutation (throws `DiscoveryRootError` with
+    `code: 'DISCOVERY_ROOT'` and `reason: not_found | not_directory |
+    not_readable`). The indexer catches the error and returns it in
+    `IndexResult.errors` with `crossFileCallsStale=true`. The existing graph
+    is preserved. Incremental mode also bails out — `deletedRelPaths` is NOT
+    computed (which would have wiped the graph by treating all files as
+    deleted). (DATA-R141-01)
+
+### Discovery canonical filesystem identity (3 P1/P2)
+
+98. **File symlinks indexed twice** (`wasm-extractor.ts`) — `visitedDirs`
+    only deduplicated directories. A file symlink `alias.ts -> original.ts`
+    produced two File nodes with different `file_path` values, two sets of
+    qualified names, two sets of edges. Fixed: added `visitedFiles` Set keyed
+    by `dev:ino` (with `realpath` fallback for exotic filesystems). Two
+    aliases to the same file yield exactly one result. Regular files are
+    also deduplicated (catches hardlinks). (IDX-R141-01)
+
+99. **Non-deterministic path selection** (`wasm-extractor.ts`) — The lexical
+    alias path was pushed onto the stack and persisted. `readdirSync` order
+    is not portable, so the same project could produce `link/inner.ts` on
+    one OS and `subdir/inner.ts` on another. Qualified names, file_hashes,
+    and notes→code links were unstable. Fixed: the CANONICAL real path
+    (relative to `realRoot`) is always pushed and persisted. Alias names are
+    dropped. Discovery is now deterministic across readdir order, OS, and
+    filesystem. (IDX-R141-02)
+
+100. **Deep SKIP_DIRS bypass via alias** (`wasm-extractor.ts`) — Only
+     `basename(realTarget)` was checked against `SKIP_DIRS`. An alias
+     `source-alias -> node_modules/pkg/src` had basename `src` (not in
+     SKIP_DIRS), so `node_modules/.../dep.ts` was indexed. Fixed:
+     `hasSkippedComponent()` checks EVERY component of the canonical target
+     path (relative to `realRoot`) against `SKIP_DIRS` and the
+     `entry.startsWith('.')` hidden-directory rule. Catches deep aliases to
+     `node_modules/`, `vendor/`, `.cache/`, `dist/`, etc. (PERF-R141-01)
+
+### Security (1 P2)
+
+101. **Fail-open regular directory realpath** (`wasm-extractor.ts`) — Regular
+     directories swallowed ALL `realpathSync` errors (`catch {}`) and pushed
+     the lexical `fullPath` anyway. An `EACCES` or `ELOOP` on a regular
+     directory silently let traversal continue past the boundary. Fixed:
+     fail-CLOSED. `realpathSync` failure on a regular directory now skips
+     the directory entirely — the lexical path is never pushed. Combined
+     with the canonical-path fix (#99), this also closes a TOCTOU window
+     where a symlink could be substituted between validation and traversal.
+     (SEC-R141-02)
+
+### Architecture (1 P2/P3)
+
+102. **Unified path containment** (`safe-path.ts`, `wasm-extractor.ts`) —
+     `isPathInside` existed in two places with different implementations:
+     `safe-path.ts` used `path.sep`, `wasm-extractor.ts` used manual
+     `'..' + '/'` and `'..' + '\\'` checks. A future fix applied to one
+     might not be applied to the other, breaking "Unified Path Containment".
+     Fixed: `isPathInside` is now exported from `safe-path.ts` as the single
+     source of truth. `wasm-extractor.ts` imports it. Both vault writes and
+     discovery use the same predicate. (QUAL-R141-01)
+
+### Migration (1 P2 — security)
+
+103. **Discovery policy change not versioned** (`schema.ts`) — R139/R140
+     changed the discovery policy (external symlinks excluded, directory
+     aliases deduplicated, fail-closed realpath, canonical paths, deep
+     SKIP_DIRS check, file-symlink dedup). But
+     `CURRENT_EXTRACTOR_SEMANTICS_VERSION` stayed at 6. DBs indexed by R140
+     and earlier may contain external-symlink nodes, alias-path `file_path`
+     rows, and duplicate File nodes from file symlinks — all of which would
+     remain visible (and certified fresh) after upgrading the package. Fixed:
+     bumped to 7. The incremental gate marks these DBs stale, forcing a full
+     reindex before the new policy is trustworthy. (MIG-R141-01)
+
+### Tests (25 new, 1 updated)
+
+- **DATA-R141-01** (6 tests): nonexistent root, file-as-root, incremental
+  root failure, `assertDiscoveryRoot` throws on missing root, rejects file,
+  returns realpath for symlinked root.
+- **IDX-R141-01** (3 tests): file symlink dedup, two aliases to one file,
+  indexing produces one File node.
+- **IDX-R141-02** (2 tests): directory alias canonical path, indexing
+  persists canonical `file_path` (TEST-R141-06: exact path assertion).
+- **PERF-R141-01** (3 tests): alias to `node_modules/pkg/src`, `vendor/lib/src`,
+  `.cache/gen` all skipped.
+- **QUAL-R141-01** (2 tests): `isPathInside` exported and consistent,
+  discovery uses same predicate as vault writes.
+- **TEST-R141-01** (2 tests): real `writeNote` sink test (external file
+  absent), legitimate internal write succeeds.
+- **SEC-R141-02** (1 test): regular directory traversal persists canonical
+  paths.
+- **MIG-R141-01** (3 tests): version is 7, full reindex sets version=7,
+  DB with version=6 is stale on incremental.
+- **Regression** (3 tests): R140 P0 depth bypass still closed, R139 external
+  symlink still rejected, R139 symlink cycle still no infinite loop.
+- **Updated**: R139 test pins version to 7 (was 6).
+
+### Total: 103 bugs + 11 optimizations + 265 indexer tests across 66 rounds
+
 ## 0.56.1 — Round 140 (2026-07-10) Fail-Closed Path Hotfix
 
 **65th round (GPT 5.6 Sol audit R139).** 1 P0 + 1 P1 + 1 P2 fixed. Hotfix for
