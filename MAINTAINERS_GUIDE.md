@@ -198,6 +198,10 @@ When receiving an audit report from another AI (Claude Sonnet 5, etc.):
   bumped whenever the extractor's semantic output changes in a way that invalidates existing
   `file_hashes`. Incremental mode compares the stored version to this constant; a mismatch
   forces a full reindex before any cross-file resolution is published. Currently 8.
+- **Discovery policy version** (`v2/src/indexer/schema.ts` `CURRENT_DISCOVERY_POLICY_VERSION`):
+  R154+. Tracks changes to the broken-symlink / alias-history / contribution / visibility
+  policy. When the stored version is less than current, the cold-start lock applies.
+  Currently 1. Separate from extractor semantics (which tracks AST output).
 - **Backup format version** (`backup.ts`): independent schema version,
   bumped only when the JSON shape changes.
 - **DB migration version**: 4 migrations (initial_schema, optimize_indexes,
@@ -258,6 +262,31 @@ These invariants MUST hold for every round. Violations are P1 bugs.
 10. **R153 — Typed outcome.** `IndexResult.outcome` MUST be set in all return
     paths. The CLI MUST print warnings BEFORE the outcome banner. The outcome
     values are: `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `STALE`, `PARTIAL`, `FAILED`.
+
+11. **R154 — Bootstrap state.** `alias_history_initialized` and
+    `discovery_policy_version` MUST be set on successful index. The cold-start
+    lock fires when `alias_history_initialized=0` OR
+    `discovery_policy_version < CURRENT_DISCOVERY_POLICY_VERSION` AND there
+    are broken aliases AND existing nodes > 0. The lock blocks all deletions
+    (incremental) and forces hasUncertainty (full).
+
+12. **R154 — Root fingerprint.** `alias_history` is scoped by
+    `(project, root_fingerprint, alias_path)`. Reusing the same project name
+    with a different root MUST NOT inherit stale history. The fingerprint is
+    `canonicalRoot:st_dev`.
+
+13. **R154 — Contribution filter.** Only contributive aliases are historized:
+    file aliases require `detectLanguage !== null`; directory aliases require
+    at least one discovered file under the prefix. Non-contributive aliases
+    are tracked as warnings but NOT persisted.
+
+14. **R154 — Target visibility.** Broken aliases with a still-visible target
+    (directly or via another alias) do NOT force stale. Only genuinely absent
+    targets are protected.
+
+15. **R154 — Atomicity + GC.** `persistAliasHistory` MUST be wrapped in
+    `try { } finally { db.close() }`. The GC uses `last_observed_run_id`
+    stamping (O(1) SQL), NOT dynamic `NOT IN` params.
 
 ## Round history (last 10 rounds)
 

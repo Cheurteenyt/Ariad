@@ -15,7 +15,7 @@
 
 import Database from 'better-sqlite3';
 import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
-import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION, loadAliasHistory, persistAliasHistory } from './schema.js';
+import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION, CURRENT_DISCOVERY_POLICY_VERSION, loadAliasHistory, persistAliasHistory, computeRootFingerprint } from './schema.js';
 import { discoverSourceFilesStructured, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
 import type { DiscoveryResult } from './wasm-extractor.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
@@ -246,6 +246,9 @@ function computeOutcome(
 export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult> {
   const start = Date.now();
   const dbPath = defaultCodeDbPath(opts.project);
+  // R154 (PERF-R154-01): runId for alias_history GC. Monotonic per-run value
+  // used to stamp observed aliases and GC entries not seen this run.
+  const runId = start;
   // R79: use at least 2 workers for parallelism, even on 2-core machines.
   // WASM parsing is CPU-bound but also has I/O (file reads), so 2 workers
   // on a 2-core machine still provides overlap. On 1-core machines (CI),
@@ -427,21 +430,32 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // deletion-only, main) can include `warnings: discoveryWarnings`.
   const discoveryWarnings = buildDiscoveryWarnings(discovery);
 
-  // R153 (DATA-R153-01/02): Alias history lookup. For each broken alias in
-  // discovery.brokenAliases, check if it was previously valid (has an entry
-  // in alias_history). If so, the old canonical target must be protected
+  // R153 (DATA-R153-01/02) + R154 (ALIAS-R154-01, MIG-R154-01, ALIAS-R154-03):
+  // Alias history lookup. For each broken alias in discovery.brokenAliases,
+  // check if it was previously valid (has an entry in alias_history scoped by
+  // root_fingerprint). If so, the old canonical target must be protected
   // from deletion:
   //   - file target → protected exact path (excluded from deletedRelPaths)
   //   - directory target → protected subtree (prefix match)
   //
-  // This closes the silent historical-target deletion vector introduced by
-  // R152: a previously-valid alias whose target temporarily disappears must
-  // NOT cause the target's nodes/hashes/imports/exports to be deleted.
+  // R154 (ALIAS-R154-01): The history is scoped by root_fingerprint so a
+  // project reconfigured to a different root does NOT inherit stale history.
   //
-  // In full mode, ANY protected path forces hasUncertainty=true (abort the
-  // full to preserve the old graph). In incremental mode, protected paths
-  // are filtered out of deletedRelPaths.
-  const aliasHistory = loadAliasHistory(db, opts.project);
+  // R154 (MIG-R154-01): Cold-start lock. If alias_history is not yet
+  // initialized for this project (alias_history_initialized=0 OR
+  // discovery_policy_version < CURRENT), we cannot trust the history. In this
+  // case, if there are ANY broken aliases AND existing nodes, we apply the
+  // cold-start lock: no deletions allowed, full-mode uncertainty. This closes
+  // the R152→R153 cold-start gap where a DB with nodes but no history could
+  // silently lose data.
+  //
+  // R154 (ALIAS-R154-03): Target visibility check. Even if a broken alias has
+  // a history entry, if the target is STILL visible in the current discovery
+  // (either directly or via another alias), we do NOT need to protect it —
+  // the target's data is already in currentRelPaths. We only protect targets
+  // that are genuinely absent from the current discovery.
+  const rootFingerprint = computeRootFingerprint(canonicalRoot);
+  const aliasHistory = loadAliasHistory(db, opts.project, rootFingerprint);
   const protectedPaths = new Set<string>();
   const protectedSubtrees: string[] = [];
   const historicalBrokenAliases: Array<{ aliasPath: string; canonicalTarget: string; targetKind: string; code: string }> = [];
@@ -461,7 +475,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       }
     }
   }
-  const hasHistoricalBrokenAliases = historicalBrokenAliases.length > 0;
+  // R154 (ALIAS-R154-03): hasHistoricalBrokenAliases is computed AFTER the
+  // visibility filter (hasEffectiveHistoricalBrokenAliases) — see below.
 
   // R142 (DATA-R142-02): Partial discovery lock. If discovery encountered
   // errors (subtree EACCES, fatal symlink errors, etc.), the file list may
@@ -565,21 +580,107 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // A broken alias that was NEVER valid (no history entry) remains a warning
   // only — there's no old target data to protect.
   //
+  // R154 (MIG-R154-01): Cold-start lock. Read the project's bootstrap state
+  // (alias_history_initialized, discovery_policy_version) and existing node
+  // count. If the history is not yet initialized (or the policy version is
+  // stale), AND there are broken aliases, AND the project has existing nodes,
+  // we cannot trust that the broken aliases were never valid — the history
+  // might just be empty because it was never populated. In this case, we
+  // apply the cold-start lock: treat ALL broken aliases as potentially
+  // historical, forcing hasUncertainty (full mode aborts) and blocking all
+  // deletions (incremental mode preserves everything). This closes the
+  // R152→R153 cold-start gap.
+  //
+  // R154 (ALIAS-R154-03): Target visibility check. Even if a broken alias has
+  // a history entry, if the target is STILL visible in the current discovery
+  // (either directly as a file, or via another still-valid alias), we do NOT
+  // need to protect it — the target's data is already in currentRelPaths.
+  // We only protect targets that are genuinely absent from the current
+  // discovery. This prevents false stale when the target is accessible via
+  // another path.
+  const projectBootstrap = db.prepare(
+    'SELECT alias_history_initialized AS historyInit, discovery_policy_version AS policyVersion FROM projects WHERE name = ?'
+  ).get(opts.project) as { historyInit?: number; policyVersion?: number } | undefined;
+  const historyInitialized = projectBootstrap?.historyInit === 1;
+  const policyVersionCurrent = (projectBootstrap?.policyVersion ?? 0) >= CURRENT_DISCOVERY_POLICY_VERSION;
+  const bootstrapComplete = historyInitialized && policyVersionCurrent;
+
+  // R154 (ALIAS-R154-03): Build the set of current relative paths (files only)
+  // to check target visibility. A target that's still in this set doesn't need
+  // protection — it's already being indexed.
+  const currentRelPathsSet = new Set<string>();
+  for (const f of discovery.files) {
+    currentRelPathsSet.add(nodeRelative(canonicalRoot, f));
+  }
+
+  // R154 (ALIAS-R154-03): Filter protected paths/subtrees to only those whose
+  // target is genuinely absent from the current discovery. If the target is
+  // still visible (directly or via another alias), remove it from protection.
+  // This prevents false stale when e.g. real.ts exists directly AND alias.ts
+  // is broken — real.ts is already in currentRelPaths, so no protection needed.
+  const visibleProtectedPaths = new Set<string>();
+  for (const p of protectedPaths) {
+    if (!currentRelPathsSet.has(p)) {
+      visibleProtectedPaths.add(p);
+    }
+  }
+  const visibleProtectedSubtrees = protectedSubtrees.filter(prefix => {
+    // A directory target is "visible" if ANY current path is under it.
+    for (const current of currentRelPathsSet) {
+      if (current === prefix || current.startsWith(prefix + sep)) {
+        return false; // visible — don't protect
+      }
+    }
+    return true; // genuinely absent — protect
+  });
+  // Recompute historicalBrokenAliases to only include those with genuinely
+  // absent targets. This drives the uncertainty decision and the message.
+  const effectiveHistoricalBrokenAliases = historicalBrokenAliases.filter(a => {
+    if (a.targetKind === 'directory') {
+      return visibleProtectedSubtrees.includes(a.canonicalTarget);
+    }
+    return visibleProtectedPaths.has(a.canonicalTarget);
+  });
+  const hasEffectiveHistoricalBrokenAliases = effectiveHistoricalBrokenAliases.length > 0;
+
+  // R154 (MIG-R154-01): Cold-start lock. If bootstrap is not complete AND
+  // there are broken aliases AND the project has existing nodes, apply the
+  // lock. We can't trust that the broken aliases were never valid.
+  let coldStartLock = false;
+  if (!bootstrapComplete && discovery.brokenAliases.length > 0) {
+    const existingNodes = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(opts.project) as { c: number }).c;
+    if (existingNodes > 0) {
+      coldStartLock = true;
+    }
+  }
+
+  // R154 (ALIAS-R154-03): Update protectedPaths/protectedSubtrees to the
+  // visibility-filtered versions so downstream deletion filtering uses them.
+  protectedPaths.clear();
+  for (const p of visibleProtectedPaths) protectedPaths.add(p);
+  protectedSubtrees.length = 0;
+  for (const s of visibleProtectedSubtrees) protectedSubtrees.push(s);
+
   // The remaining sources of `hasUncertainty` are:
   //   - uncertainPaths (ENOENT_LSTAT, ENOENT_IDENTITY — TOCTOU races on files
   //     that were confirmed to exist by readdir)
   //   - uncertainSubtrees (ENOENT_REALPATH_DIR — TOCTOU races on directories)
   //   - empty relTarget (DATA-R151-01 — root-level uncertainty)
-  //   - historicalBrokenAliases (R153 — previously-valid alias now broken)
+  //   - effectiveHistoricalBrokenAliases (R153+R154 — previously-valid alias
+  //     now broken, target genuinely absent)
+  //   - coldStartLock (R154 — history not initialized, can't trust broken aliases)
   const hasEmptyRelTarget = discovery.uncertainSubtrees.some(s => s === '');
-  const effectiveGlobalDeletionUncertainty = hasEmptyRelTarget;
-  const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasHistoricalBrokenAliases;
+  const effectiveGlobalDeletionUncertainty = hasEmptyRelTarget || coldStartLock;
+  const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasEffectiveHistoricalBrokenAliases;
   if (!opts.incremental && hasUncertainty) {
     db.close();
-    const aliasPart = hasHistoricalBrokenAliases
-      ? `, ${historicalBrokenAliases.length} historically-valid alias(es) now broken`
+    const aliasPart = hasEffectiveHistoricalBrokenAliases
+      ? `, ${effectiveHistoricalBrokenAliases.length} historically-valid alias(es) now broken`
       : '';
-    const uncertainMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent${aliasPart}. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
+    const coldStartPart = coldStartLock
+      ? `, cold-start lock (alias_history not yet initialized — run a successful full index first)`
+      : '';
+    const uncertainMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent${aliasPart}${coldStartPart}. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
     markProjectStalePreservingGraph(dbPath, opts.project, uncertainMsg);
     return {
       dbPath,
@@ -594,6 +695,9 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       workerCount: 0,
       crossFileCallsStale: true,
       warnings: discoveryWarnings,
+      // R154 (OUTCOME-R154-02): outcome is STALE (no errors despite the
+      // errors array — the "error" is really a stale reason). The CLI maps
+      // STALE to exit 2. The errors array carries the human-readable reason.
       outcome: 'STALE',
     };
   }
@@ -603,6 +707,31 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   }
   // In incremental mode, we do NOT clear nodes/edges here. The extractor
   // will delete old nodes for changed files before re-inserting.
+
+  // R154 (ALIAS-R154-02): Contribution filter. Only persist resolved aliases
+  // that actually contributed code to the graph. A file alias is contributive
+  // if its target has a supported language (detectLanguage !== null). A
+  // directory alias is contributive if at least one discovered file is under
+  // its canonical target prefix. Non-contributive aliases (e.g. alias →
+  // LICENSE.txt, alias → empty directory, alias → FIFO) are NOT historized,
+  // so when they break later they don't force stale/full-abort despite never
+  // having contributed code data.
+  const contributiveAliases = discovery.resolvedAliases.filter(a => {
+    if (a.targetKind === 'file') {
+      // Re-check: does the target have a supported language?
+      const targetAbs = join(canonicalRoot, a.canonicalTarget);
+      return detectLanguage(targetAbs) !== null;
+    }
+    // Directory: contributive if at least one discovered file is under the prefix.
+    const prefix = a.canonicalTarget;
+    for (const f of discovery.files) {
+      const rel = nodeRelative(canonicalRoot, f);
+      if (rel === prefix || rel.startsWith(prefix + sep)) {
+        return true;
+      }
+    }
+    return false;
+  });
 
   // Detect languages and group files by language
   const langGroups = new Map<string, string[]>();
@@ -783,21 +912,35 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
               ? `Source snapshot uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent. Retry incremental when filesystem is stable.`
               : 'Project was already stale; no-op incremental did not refresh')
         : null;
-      updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, noOpStale, existingInitialized, existingSemanticsVersion, noOpError);
+      updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, noOpStale, existingInitialized, existingSemanticsVersion, noOpError,
+        // R154: on success, mark history initialized + upgrade policy version + set root fingerprint.
+        !noOpStale ? true : null,
+        !noOpStale ? CURRENT_DISCOVERY_POLICY_VERSION : null,
+        !noOpStale ? rootFingerprint : null,
+      );
       return { noOpStale };
     });
     const { noOpStale } = noOpTx();
-    // R153 (DATA-R153-01/02): Persist alias_history even on no-op. Aliases
-    // may have been added/removed/changed without any file content changing
-    // (e.g., a symlink was deleted). The GC in persistAliasHistory removes
-    // entries for aliases no longer on disk.
+    // R153 (DATA-R153-01/02) + R154: Persist alias_history even on no-op.
+    // R154: use contributiveAliases (filtered), rootFingerprint, runId.
+    // R154 (TX-R154-02): try/finally to guarantee db.close() even on exception.
     if (!noOpStale) {
       const liveAliasPaths = new Set<string>();
-      for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+      for (const a of contributiveAliases) liveAliasPaths.add(a.aliasPath);
       for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
-      persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+      try {
+        persistAliasHistory(db, opts.project, rootFingerprint, runId, contributiveAliases, liveAliasPaths);
+      } finally {
+        // R154 (TX-R154-02): ensure db is closed even if persistAliasHistory throws.
+        // If persistAliasHistory failed, the graph is already marked fresh (noOpStale=false)
+        // but the history may be inconsistent. The next run's cold-start check will catch
+        // this (history_initialized was set, but GC may have partial state). Acceptable
+        // trade-off: the graph data is correct, only the history GC may be incomplete.
+        try { db.close(); } catch { /* ignore close error */ }
+      }
+    } else {
+      db.close();
     }
-    db.close();
     return {
       dbPath,
       durationMs: Date.now() - start,
@@ -912,17 +1055,27 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
             ? `Source snapshot uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent. Retry incremental when filesystem is stable.`
             : null)
       : null;
-    updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, existingSemanticsVersion, deletionError);
-    // R153 (DATA-R153-01/02): Persist alias_history on deletion-only too.
-    // Aliases may have been added/removed/changed. The GC removes entries for
-    // aliases no longer on disk.
+    updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, existingSemanticsVersion, deletionError,
+      // R154: on success, mark history initialized + upgrade policy version + set root fingerprint.
+      !crossFileStale ? true : null,
+      !crossFileStale ? CURRENT_DISCOVERY_POLICY_VERSION : null,
+      !crossFileStale ? rootFingerprint : null,
+    );
+    // R153 (DATA-R153-01/02) + R154: Persist alias_history on deletion-only too.
+    // R154: use contributiveAliases (filtered), rootFingerprint, runId.
+    // R154 (TX-R154-02): try/finally to guarantee db.close() even on exception.
     if (!crossFileStale) {
       const liveAliasPaths = new Set<string>();
-      for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+      for (const a of contributiveAliases) liveAliasPaths.add(a.aliasPath);
       for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
-      persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+      try {
+        persistAliasHistory(db, opts.project, rootFingerprint, runId, contributiveAliases, liveAliasPaths);
+      } finally {
+        try { db.close(); } catch { /* ignore close error */ }
+      }
+    } else {
+      db.close();
     }
-    db.close();
     return {
       dbPath,
       durationMs: Date.now() - start,
@@ -1083,31 +1236,37 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   } else if (opts.incremental && crossFileStale && semanticsStale) {
     indexError = `Semantics version ${existingSemanticsVersion} ≠ current ${CURRENT_EXTRACTOR_SEMANTICS_VERSION} — full reindex required`;
   }
-  updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, semanticsVersion, indexError);
+  updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, semanticsVersion, indexError,
+    // R154: on success, mark history initialized + upgrade policy version + set root fingerprint.
+    !crossFileStale ? true : null,
+    !crossFileStale ? CURRENT_DISCOVERY_POLICY_VERSION : null,
+    !crossFileStale ? rootFingerprint : null,
+  );
 
-  // R153 (DATA-R153-01/02): Persist alias_history on successful index.
-  // Only persist when the graph is fresh (crossFileStale=false) — on a stale
-  // or failed run, the discovery may have been incomplete and the alias
-  // observations may not be trustworthy. On a fresh run, all resolved aliases
-  // are UPSERTed and aliases no longer on disk are garbage-collected.
-  //
-  // We do NOT persist on the full-uncertainty abort (that returns earlier),
-  // because the discovery was complete but we aborted to preserve the old
-  // graph — the alias observations ARE valid, but persisting them would
-  // overwrite the old alias_history with the same data (no-op). Skipping
-  // the persist is fine; the next successful run will persist.
-  //
-  // liveAliasPaths = resolvedAliases.aliasPath ∪ brokenAliases.aliasPath.
-  // This is the set of aliases observed on disk this run. Entries for
-  // aliases not in this set are garbage-collected (the symlink was removed).
+  // R153 (DATA-R153-01/02) + R154: Persist alias_history on successful index.
+  // R154 (TX-R154-01): Atomicity — the graph is already marked fresh by
+  // updateProjectStats above. If persistAliasHistory fails, the graph is
+  // fresh but the history is stale. To mitigate: the next run's cold-start
+  // check reads alias_history_initialized (which WAS set on success). If the
+  // history is empty despite initialized=1, the protection won't fire but
+  // no false stale either. The risk is: a future broken alias won't be
+  // protected. This is the same risk as R153 (pre-R154) but now bounded to
+  // the persist-failure case, not the cold-start case.
+  // R154 (TX-R154-02): try/finally to guarantee db.close() even on exception.
+  // R154 (ALIAS-R154-02): use contributiveAliases (filtered) instead of all resolvedAliases.
+  // R154 (PERF-R154-01): use runId for GC instead of NOT IN dynamic params.
   if (!crossFileStale) {
     const liveAliasPaths = new Set<string>();
-    for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+    for (const a of contributiveAliases) liveAliasPaths.add(a.aliasPath);
     for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
-    persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+    try {
+      persistAliasHistory(db, opts.project, rootFingerprint, runId, contributiveAliases, liveAliasPaths);
+    } finally {
+      try { db.close(); } catch { /* ignore close error */ }
+    }
+  } else {
+    db.close();
   }
-
-  db.close();
 
   return {
     ...result,
