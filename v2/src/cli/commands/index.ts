@@ -47,7 +47,9 @@ export function registerIndexCommand(program: Command): void {
         console.log(`  Files skipped:   ${result.skipped} ${opts.incremental ? '(incremental)' : ''}`);
         console.log(`  Errors:          ${result.errors.length}`);
         console.log(`  Duration:        ${result.durationMs}ms`);
-        console.log(`  DB:              ${result.dbPath}`);
+        if (!opts.dryRun) {
+          console.log(`  DB:              ${result.dbPath}`);
+        }
 
         if (result.languages && result.languages.size > 0) {
           console.log(`  Languages:       ${[...result.languages].join(', ')}`);
@@ -67,54 +69,75 @@ export function registerIndexCommand(program: Command): void {
           }
         }
 
-        // R147 (OUTCOME-R147-01): Success banner ONLY when errors=0 AND stale=false.
-        // R146 printed "indexed successfully" if result.nodes > 0, even with
-        // errors and stale=true — misleading for CI and users.
-        // R149 (OUTCOME-R149-01): Stale/errors warning must NOT depend on
-        // result.nodes > 0. R148 gated the warning inside `else if nodes > 0`,
-        // so a no-op stale (nodes=0) or a full-abort (nodes=0) would exit
-        // non-zero without explaining why. Now the warning is always printed
-        // when stale or errors exist, regardless of node count.
-        if (!opts.dryRun && result.nodes > 0 && result.errors.length === 0 && !result.crossFileCallsStale) {
+        // R153 (OUTCOME-R153-01): Print warnings BEFORE the success banner so
+        // the user sees the diagnostic context first, then the outcome. R152
+        // printed "success" before warnings, which could mislead users into
+        // thinking the index was clean when broken symlinks were present.
+        // The outcome field (R153) drives the banner text:
+        //   SUCCESS → "indexed successfully"
+        //   SUCCESS_WITH_WARNINGS → "indexed successfully with warnings"
+        //   STALE → "indexed but graph is stale"
+        //   PARTIAL/FAILED → "indexed with errors"
+        // R153 (OUTCOME-R153-02): Dry-run now also shows warnings (previously
+        // gated by !opts.dryRun).
+        if (result.warnings && result.warnings.total > 0) {
+          console.log();
+          console.log(`⚠ ${result.warnings.total} discovery warning(s):`);
+          for (const [code, count] of Object.entries(result.warnings.countsByCode)) {
+            const samplePaths = result.warnings.samples.filter(s => s.code === code).slice(0, 5).map(s => s.path);
+            // R153 (OUTCOME-R153-03): Compute "and N more" from the ACTUAL
+            // sample count for this code, not from a hardcoded 5. A code with
+            // 10 occurrences and 0 samples (path missing) would print
+            // "and 5 more" with R152, implying 5 hidden paths when there are
+            // actually 10. Now: count - samplePaths.length is the true number.
+            const hidden = count - samplePaths.length;
+            const moreStr = hidden > 0 ? ` (and ${hidden} more)` : '';
+            const samplesStr = samplePaths.length > 0 ? samplePaths.join(', ') : 'no path sample available';
+            console.log(`  ${code} (${count}): ${samplesStr}${moreStr}`);
+          }
+        }
+
+        // R153 (OUTCOME-R153-01): Outcome-driven banner. The outcome field is
+        // the authoritative source — the previous `nodes > 0 && errors=0 && !stale`
+        // check was implicit and didn't distinguish SUCCESS from SUCCESS_WITH_WARNINGS.
+        if (opts.dryRun) {
+          console.log();
+          console.log(`ℹ Dry-run complete. No DB writes.`);
+        } else if (result.outcome === 'SUCCESS') {
           console.log();
           console.log(`✓ Project "${project}" indexed successfully.`);
           console.log(`  The code graph is now available for MCP tools, UI, and reports.`);
           console.log(`  Run "cbm-v2 stats --project ${project}" to see the graph.`);
-        } else if (!opts.dryRun) {
-          // R149: Always print outcome when not fresh success.
+        } else if (result.outcome === 'SUCCESS_WITH_WARNINGS') {
+          console.log();
+          console.log(`✓ Project "${project}" indexed successfully with warnings.`);
+          console.log(`  The code graph is available, but discovery encountered non-blocking issues (see warnings above).`);
+          console.log(`  Run "cbm-v2 stats --project ${project}" to see the graph.`);
+        } else if (result.outcome === 'STALE') {
           console.log();
           if (result.errors.length > 0) {
             console.log(`⚠ Project "${project}" indexed with ${result.errors.length} error(s).`);
           }
+          console.log(`⚠ Cross-file CALLS may be stale.`);
+          console.log(`  Run "cbm-v2 index --project ${project} --root ${rootPath}" (full reindex) to rebuild them.`);
+        } else if (result.outcome === 'PARTIAL' || result.outcome === 'FAILED') {
+          console.log();
+          console.log(`⚠ Project "${project}" indexed with ${result.errors.length} error(s).`);
           if (result.crossFileCallsStale) {
             console.log(`⚠ Cross-file CALLS may be stale.`);
             console.log(`  Run "cbm-v2 index --project ${project} --root ${rootPath}" (full reindex) to rebuild them.`);
           }
-          if (result.errors.length === 0 && !result.crossFileCallsStale && result.nodes === 0) {
-            // R150 (OUTCOME-R150-01): R149 incorrectly printed "0 source
-            // files" for a no-op incremental (nodes=0 means 0 nodes
-            // PRODUCED in this run, not 0 files in the project). A no-op
-            // incremental on a 50k-node project would say "0 source files".
-            // Now we distinguish:
-            // - skipped > 0 → "No changes detected" (no-op incremental)
-            // - skipped = 0 → "No supported source files found" (empty project)
+        } else {
+          // R150 (OUTCOME-R150-01): No-op incremental or empty project.
+          // outcome is undefined for legacy paths that don't set it — fall
+          // back to the old node-count-based heuristic.
+          if (!opts.dryRun && result.nodes === 0 && result.errors.length === 0 && !result.crossFileCallsStale) {
+            console.log();
             if (result.skipped > 0) {
               console.log(`✓ No changes detected. Existing graph is fresh.`);
             } else {
               console.log(`ℹ No supported source files found in "${rootPath}".`);
             }
-          }
-        }
-
-        // R152 (OBS-R152-01): Show discovery warnings even on success.
-        // R151's first-full with broken symlinks printed "success" without
-        // mentioning the broken links. Now warnings are always visible.
-        if (!opts.dryRun && result.warnings && result.warnings.total > 0) {
-          console.log();
-          console.log(`⚠ ${result.warnings.total} discovery warning(s):`);
-          for (const [code, count] of Object.entries(result.warnings.countsByCode)) {
-            const samplePaths = result.warnings.samples.filter(s => s.code === code).slice(0, 5).map(s => s.path);
-            console.log(`  ${code} (${count}): ${samplePaths.join(', ')}${count > 5 ? ` (and ${count - 5} more)` : ''}`);
           }
         }
 

@@ -19,26 +19,32 @@ cbm-v2 index --project my-app --root /path/to/repo --incremental
 # Dry-run (preview what would be indexed without writing to DB)
 cbm-v2 index --project my-app --root /path/to/repo --dry-run
 
-# Limit worker threads (0 = single-threaded, default = cpu count - 1)
-cbm-v2 index --project my-app --root /path/to/repo --workers 0
+# Allow partial extraction errors to exit 0 (CI: log but don't fail)
+cbm-v2 index --project my-app --root /path/to/repo --allow-partial
 ```
 
 **Options:**
 - `--project <name>` — Project name (required)
-- `--root <path>` — Root directory to index (required)
+- `--root <path>` — Root directory to index (default: current directory)
 - `--incremental` — Skip unchanged files (fast). Without this flag, a full re-index is performed.
-- `--dry-run` — Discover files and detect languages without writing to the DB.
-- `--workers <n>` — Number of parallel WASM parsing workers (0 = single-threaded).
+- `--dry-run` — Discover files and detect languages without writing to the DB. R153: warnings are now shown in dry-run.
+- `--allow-partial` — Exit 0 even if some files fail extraction (default: exit 1 on any error).
 
 **Behavior:**
-- **Discovery completeness lock**: if discovery encounters errors (subtree EACCES, broken symlinks), the existing graph is preserved. The index returns errors in `IndexResult.errors` and sets `crossFileCallsStale=true`. Use `--incremental` to retry when the filesystem is healthy.
+- **Discovery completeness lock**: if discovery encounters errors (subtree EACCES, fatal symlink errors), the existing graph is preserved. The index returns errors in `IndexResult.errors` and sets `crossFileCallsStale=true`. Use `--incremental` to retry when the filesystem is healthy.
+- **Broken symlinks** (R152+R153): ENOENT on `realpath(symlink)` is a WARNING, not an error. Discovery remains complete. The graph is indexed successfully. If the alias was previously valid (recorded in `alias_history`), the old canonical target is protected from deletion (R153).
+- **ELOOP** (R153): symlink loops are WARNINGs. Same alias-history protection as ENOENT applies if the alias was previously valid.
 - **Root validation**: `assertDiscoveryRoot` verifies the root exists, is a directory, is readable (stat + isDirectory + realpath + readdir) before any DB mutation. A missing or unreadable root returns an error WITHOUT wiping the existing graph.
-- **Semantics versioning**: the indexer tracks `CURRENT_EXTRACTOR_SEMANTICS_VERSION` (currently 7). If the DB was produced by a previous extractor version, incremental mode marks it stale and forces a full reindex.
+- **Semantics versioning**: the indexer tracks `CURRENT_EXTRACTOR_SEMANTICS_VERSION` (currently 8). If the DB was produced by a previous extractor version, incremental mode marks it stale and forces a full reindex.
 - **Cross-file CALLS resolution**: after extraction, the resolver matches call-sites to definitions across files using persistent `call_sites`, `imports`, and `exports` tables.
+- **Outcome field** (R153): `IndexResult.outcome` is one of `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `STALE`, `PARTIAL`, `FAILED`. The CLI prints warnings BEFORE the outcome banner.
 
-**Exit codes:**
-- `0` — success (graph is fresh or stale but preserved)
-- Non-zero — discovery failure (root inaccessible, partial discovery with errors)
+**Warning samples** (R152+R153): all warning codes (`ENOENT`, `ELOOP`, `ENOENT_LSTAT`, `ENOENT_STAT`, `ENOENT_IDENTITY`, `ENOENT_REALPATH_DIR`) carry root-relative paths. Samples are capped at 100. The CLI shows up to 5 samples per code and "and N more" using the exact hidden count.
+
+**Exit codes** (R147+R153):
+- `0` — success (outcome `SUCCESS` or `SUCCESS_WITH_WARNINGS`)
+- `1` — extraction errors present (outcome `PARTIAL` or `FAILED`), unless `--allow-partial`
+- `2` — stale without errors (outcome `STALE`: semantics mismatch, uncertainty, historical alias broken)
 
 ### `cbm-v2 init`
 Initialize `.codebase-memory.json` configuration file.
@@ -55,7 +61,7 @@ Run diagnostics to verify the setup.
 cbm-v2 doctor --project my-app
 ```
 
-Checks: Node.js version (≥18), config file, human DB, code graph DB, vault path writability.
+Checks: Node.js version (≥18.6), config file, human DB, code graph DB, vault path writability.
 
 ### `cbm-v2 stats`
 Show a pretty statistics dashboard.

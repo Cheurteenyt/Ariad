@@ -239,13 +239,53 @@ export interface DiscoveryResult {
    * R150 (DATA-R150-02): Global deletion uncertainty. When true, the indexer
    * MUST NOT treat ANY path as a confirmed deletion. Set when a broken
    * symlink is encountered that may have been valid at the previous run.
+   *
+   * R152 (AVAIL-R152-01): This flag is no longer set by discovery for broken
+   * symlinks — R152 treats them as warnings only (no global uncertainty).
+   * R153 (API-R153-01): Kept for backward compatibility with external callers,
+   * but always `false` since R152. The alias-history-based protection in the
+   * indexer supersedes this coarse global flag. Deprecated; do not rely on it.
    */
   globalDeletionUncertainty: boolean;
   /**
    * R151 (OBS-R151-01): Warning samples with paths, capped at 100.
    * Lets the user identify which symlinks to fix.
+   * R153 (OBS-R153-02): All warning codes now carry a root-relative path
+   * (previously only ENOENT and ELOOP had paths). ENOENT_LSTAT, ENOENT_STAT,
+   * ENOENT_IDENTITY, and ENOENT_REALPATH_DIR now include the affected path
+   * for diagnostics.
    */
   warningSamples: Array<{ path: string; code: string }>;
+  /**
+   * R153 (DATA-R153-01/02): Aliases that were resolved successfully during
+   * discovery (realpath succeeded, target inside realRoot). The indexer
+   * persists these to alias_history so future runs can protect their
+   * canonical targets if the alias breaks.
+   *
+   * Each entry is root-relative:
+   *   - aliasPath: lexical path of the symlink (e.g. "src/alias.ts")
+   *   - canonicalTarget: resolved path of the target (e.g. "src/generated/a.ts")
+   *   - targetKind: 'file' | 'directory' (determines protection scope)
+   */
+  resolvedAliases: Array<{
+    aliasPath: string;
+    canonicalTarget: string;
+    targetKind: 'file' | 'directory';
+  }>;
+  /**
+   * R153 (DATA-R153-01/02): Aliases that were broken during discovery
+   * (ENOENT or ELOOP on realpath). The indexer looks these up in
+   * alias_history to determine if they were previously valid. If so, the
+   * old canonical target is protected from deletion.
+   *
+   * Each entry is root-relative:
+   *   - aliasPath: lexical path of the symlink (e.g. "src/alias.ts")
+   *   - code: 'ENOENT' or 'ELOOP'
+   */
+  brokenAliases: Array<{
+    aliasPath: string;
+    code: string;
+  }>;
   /** Diagnostic counters. */
   skippedExternalSymlinks: number;
   skippedPolicyPaths: number;
@@ -458,7 +498,13 @@ export function discoverSourceFilesStructured(
   // Without alias history, we cannot distinguish permanently broken from
   // temporarily broken. When set, ALL deletions are blocked — the indexer
   // must not treat ANY path as a confirmed deletion.
+  // R152 (AVAIL-R152-01): No longer set for broken symlinks (warnings only).
+  // R153 (API-R153-01): Kept for backward compat, always false.
   let globalDeletionUncertainty = false;
+  // R153 (DATA-R153-01/02): Track resolved and broken aliases for the
+  // indexer's alias-history-based deletion protection.
+  const resolvedAliases: Array<{ aliasPath: string; canonicalTarget: string; targetKind: 'file' | 'directory' }> = [];
+  const brokenAliases: Array<{ aliasPath: string; code: string }> = [];
 
   /**
    * R145 (DISC-R145-01): Record a discovery warning. Warnings don't make
@@ -527,8 +573,10 @@ export function discoverSourceFilesStructured(
           // R147 (DATA-R147-01): Record the path as uncertain. The indexer
           // must NOT treat this as a confirmed deletion — the file may have
           // been temporarily absent (atomic save, codegen, package manager).
-          recordWarning('ENOENT_LSTAT');
-          uncertainPaths.push(relative(realRoot, fullPath));
+          // R153 (OBS-R153-02): include the root-relative path for diagnostics.
+          const relLstatPath = relative(realRoot, fullPath);
+          recordWarning('ENOENT_LSTAT', relLstatPath);
+          uncertainPaths.push(relLstatPath);
           continue;
         }
         // EACCES, EIO, etc. — fatal.
@@ -557,6 +605,7 @@ export function discoverSourceFilesStructured(
           // R143 treated ALL realpath failures as "broken symlink, skip"
           // which masked real filesystem problems (EACCES, EIO, ELOOP).
           const code = (error as { code?: string }).code ?? 'unknown';
+          const relAlias = relative(realRoot, fullPath);
           if (code === 'ENOENT') {
             // Broken symlink (target deleted, stale alias) — WARNING.
             // Common in npm, git worktrees, IDEs. Does NOT indicate a
@@ -586,7 +635,11 @@ export function discoverSourceFilesStructured(
             // from ever being indexed. The first full creates the initial
             // graph; subsequent runs with broken symlinks protect it.
             // R152 (SEC-R152-01): Use root-relative path for privacy and portability.
-            recordWarning('ENOENT', relative(realRoot, fullPath));
+            // R153 (DATA-R153-01): Record the broken alias for the indexer's
+            // alias-history lookup. The indexer will check if this alias was
+            // previously valid and protect its old canonical target.
+            recordWarning('ENOENT', relAlias);
+            brokenAliases.push({ aliasPath: relAlias, code: 'ENOENT' });
             // R152: globalDeletionUncertainty is no longer set by discovery
             // for broken symlinks. See indexer.ts R152 comment for rationale.
             continue;
@@ -597,7 +650,11 @@ export function discoverSourceFilesStructured(
             // I/O issue. Skip (discovery remains complete).
             // R145 (DISC-R145-01): track as warning so it's visible.
             // R152 (OBS-R152-02): include path for diagnostics.
-            recordWarning('ELOOP', relative(realRoot, fullPath));
+            // R153 (DATA-R153-02): Record the broken alias. An alias that
+            // was previously valid but is now a loop must protect its old
+            // target via alias_history — same policy as ENOENT.
+            recordWarning('ELOOP', relAlias);
+            brokenAliases.push({ aliasPath: relAlias, code: 'ELOOP' });
             continue;
           }
           // R144 (DISC-R144-01): EACCES, EIO, ENOMEM, EMFILE — FATAL.
@@ -649,8 +706,10 @@ export function discoverSourceFilesStructured(
             // (target/a.ts, target/b.ts) would only be protected by the
             // subtree prefix filter. Without this, an incremental index
             // could delete all old nodes under the directory.
-            recordWarning('ENOENT_STAT');
+            // R153 (OBS-R153-02): include the root-relative path of the
+            // target (realTarget is known because realpath succeeded).
             const relTarget = relative(realRoot, realTarget);
+            recordWarning('ENOENT_STAT', relTarget);
             uncertainPaths.push(relTarget);
             uncertainSubtrees.push(relTarget);
             continue;
@@ -659,6 +718,16 @@ export function discoverSourceFilesStructured(
           recordError(realTarget, error);
           continue;
         }
+
+        // R153 (DATA-R153-01): At this point, realpath + stat both succeeded,
+        // the target is inside realRoot and not policy-skipped. Record the
+        // resolved alias so the indexer can persist it to alias_history.
+        // Future runs that find this alias broken will look up the old
+        // canonical target here and protect its data.
+        const relAlias = relative(realRoot, fullPath);
+        const relTarget = relative(realRoot, realTarget);
+        const targetKind: 'file' | 'directory' = realStat.isDirectory() ? 'directory' : 'file';
+        resolvedAliases.push({ aliasPath: relAlias, canonicalTarget: relTarget, targetKind });
 
         if (realStat.isDirectory()) {
           // R141 (IDX-R141-02): Push the CANONICAL realTarget, not fullPath.
@@ -692,8 +761,9 @@ export function discoverSourceFilesStructured(
             // But the same ENOENT race is a warning everywhere else. Now we
             // treat it as a warning too — record the uncertain path so the
             // indexer doesn't delete the old data for this file.
-            recordWarning('ENOENT_IDENTITY');
-            uncertainPaths.push(relative(realRoot, realTarget));
+            // R153 (OBS-R153-02): include the root-relative path.
+            recordWarning('ENOENT_IDENTITY', relTarget);
+            uncertainPaths.push(relTarget);
             continue;
           }
           // R143 (ID-R143-01): deterministic tie-breaking. R144 (PERF-R144-02):
@@ -733,8 +803,10 @@ export function discoverSourceFilesStructured(
             // R147 (DATA-R147-02): Record the subtree as uncertain. The indexer
             // must NOT delete any path under this prefix — the directory may
             // have been temporarily absent.
-            recordWarning('ENOENT_REALPATH_DIR');
-            uncertainSubtrees.push(relative(realRoot, fullPath));
+            // R153 (OBS-R153-02): include the root-relative path for diagnostics.
+            const relDirPath = relative(realRoot, fullPath);
+            recordWarning('ENOENT_REALPATH_DIR', relDirPath);
+            uncertainSubtrees.push(relDirPath);
             continue;
           }
           // EACCES, EIO, ELOOP, etc. — fatal.
@@ -761,8 +833,10 @@ export function discoverSourceFilesStructured(
         if (identity === null) {
           // R147 (DISC-R147-01): TOCTOU race — file disappeared between lstat
           // and stat/realpath in fileIdentityKey. Warning, not fatal.
-          recordWarning('ENOENT_IDENTITY');
-          uncertainPaths.push(relative(realRoot, fullPath));
+          // R153 (OBS-R153-02): include the root-relative path for diagnostics.
+          const relFilePath = relative(realRoot, fullPath);
+          recordWarning('ENOENT_IDENTITY', relFilePath);
+          uncertainPaths.push(relFilePath);
           continue;
         }
         // R143 (ID-R143-01): deterministic tie-breaking for hardlinks.
@@ -807,6 +881,8 @@ export function discoverSourceFilesStructured(
     uncertainSubtrees,
     globalDeletionUncertainty,
     warningSamples,
+    resolvedAliases,
+    brokenAliases,
     skippedExternalSymlinks,
     skippedPolicyPaths,
     duplicates,

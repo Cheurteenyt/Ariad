@@ -69,7 +69,10 @@ describe('R149: Fast-Path Uncertainty Dominance', () => {
       join(__dirname, '..', '..', 'src', 'indexer', 'wasm-extractor.ts'), 'utf-8'
     );
     // R149: ENOENT_STAT now adds realTarget to uncertainPaths.
-    expect(source).toContain("uncertainPaths.push(relative(realRoot, realTarget))");
+    // R153: refactored to use relTarget local variable (OBS-R153-02: add path
+    // to warning). The push is still present, just via the local.
+    expect(source).toContain("uncertainPaths.push(relTarget)");
+    expect(source).toContain("recordWarning('ENOENT_STAT', relTarget)");
   });
 
   // ── OUTCOME-R149-01: CLI stale warning when nodes=0 ──────────────────
@@ -79,8 +82,10 @@ describe('R149: Fast-Path Uncertainty Dominance', () => {
       join(__dirname, '..', '..', 'src', 'cli', 'commands', 'index.ts'), 'utf-8'
     );
     // R149: the else-if branch no longer requires result.nodes > 0.
-    expect(source).toContain('} else if (!opts.dryRun) {');
+    // R153: refactored to outcome-driven branches. The old nodes>0 gate is
+    // gone — outcome === SUCCESS_WITH_WARNINGS fires regardless of node count.
     expect(source).not.toContain('} else if (!opts.dryRun && result.nodes > 0) {');
+    expect(source).toContain("result.outcome === 'SUCCESS_WITH_WARNINGS'");
   });
 
   // ── No-op fast path includes hasUncertainty (code inspection) ─────────

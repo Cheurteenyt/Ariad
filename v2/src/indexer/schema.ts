@@ -74,6 +74,12 @@ import type Database from 'better-sqlite3';
  *        deduplicated). DBs indexed by R143 (v7) may have the wrong path/grammar
  *        for hardlinks — they must be re-parsed. The version bump forces the
  *        incremental gate to mark these DBs stale.
+ *        R152/R153 NOTE: R152 changed the broken-symlink policy (warnings only,
+ *        no globalDeletionUncertainty) and R153 added the alias_history table
+ *        for historical-target protection. Neither changes the extractor's AST
+ *        output for a stable file, so the semantics version remains 8. A v8 DB
+ *        upgraded to R153 code will simply have an empty alias_history until
+ *        the next successful run populates it.
  *
  * When bumping this constant, also add a migration test that simulates an
  * upgrade from the previous version (delete the relevant rows, keep
@@ -222,6 +228,38 @@ const SCHEMA_SQL = `
     line INTEGER NOT NULL
   );
 
+  -- R153 (DATA-R153-01/02): Alias history table.
+  -- Persists symlink alias → canonical target mappings observed during
+  -- successful discovery runs. When a subsequent run finds the alias broken
+  -- (ENOENT or ELOOP on realpath), the indexer looks up the old canonical
+  -- target here and protects its data from deletion:
+  --   - file target → protected exact path (excluded from deletedRelPaths)
+  --   - directory target → protected subtree (prefix match)
+  --
+  -- This closes the silent historical-target deletion vector introduced by
+  -- R152: a previously-valid alias whose target temporarily disappears must
+  -- NOT cause the target's nodes/hashes/imports/exports to be deleted.
+  --
+  -- Schema:
+  --   - project + alias_path: PRIMARY KEY (one entry per alias per project)
+  --   - alias_path: root-relative LEXICAL path of the symlink (e.g. "src/alias.ts")
+  --   - canonical_target: root-relative CANONICAL path of the target when valid
+  --   - target_kind: 'file' | 'directory' (determines protection scope)
+  --   - last_seen_success_at: ISO timestamp of the last run where realpath succeeded
+  --
+  -- The table is NOT cleared by clearProjectData — it must survive full
+  -- reindexes to protect future runs. Old entries for removed aliases are
+  -- garbage-collected by the indexer after each successful run.
+  CREATE TABLE IF NOT EXISTS alias_history (
+    id INTEGER PRIMARY KEY,
+    project TEXT NOT NULL,
+    alias_path TEXT NOT NULL,
+    canonical_target TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    last_seen_success_at TEXT NOT NULL,
+    UNIQUE(project, alias_path)
+  );
+
   -- Indexes matching V1's layout for query compatibility.
   CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project);
   CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name);
@@ -240,6 +278,9 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_imports_project_file ON imports(project, file_path);
   -- R119: index for exports — (project, file_path) for per-file delete/replace.
   CREATE INDEX IF NOT EXISTS idx_exports_project_file ON exports(project, file_path);
+  -- R153: index for alias_history — (project) for full-project load,
+  -- (project, alias_path) UNIQUE constraint already provides lookup by alias.
+  CREATE INDEX IF NOT EXISTS idx_alias_history_project ON alias_history(project);
 `;
 
 /**
@@ -269,6 +310,9 @@ export function initIndexerSchema(db: Database.Database): void {
   migrateProjectsExtractorSemanticsVersion(db);
   // R144: add last_successful_index_at, last_index_attempt_at, last_index_error
   migrateProjectsIndexStateColumns(db);
+  // R153: alias_history table (created by SCHEMA_SQL on fresh DBs; migration
+  // function handles legacy DBs that don't have it yet).
+  migrateAliasHistoryTable(db);
   // R106: call_sites table is created by SCHEMA_SQL (CREATE IF NOT EXISTS),
   // but the index idx_call_sites_project_file must exist for legacy DBs that
   // already had the table created without it. CREATE INDEX IF NOT EXISTS in
@@ -471,10 +515,131 @@ function migrateProjectsIndexStateColumns(db: Database.Database): void {
 }
 
 /**
- * Clear all data for a project (nodes, edges, file_hashes, call_sites, imports) before re-indexing.
+ * R153 (DATA-R153-01/02): Create the alias_history table on legacy DBs that
+ * pre-date R153. SCHEMA_SQL already creates it on fresh DBs, but CREATE TABLE
+ * IF NOT EXISTS is a no-op if the table already exists (e.g., a v8 DB that was
+ * opened by R153 code for the first time). The table is required for the
+ * indexer's alias-history-based deletion protection.
+ *
+ * Idempotent — uses CREATE IF NOT EXISTS for both the table and the index.
+ */
+function migrateAliasHistoryTable(db: Database.Database): void {
+  // Check if the table exists. If not, CREATE IF NOT EXISTS in SCHEMA_SQL
+  // already handled it. If it exists but is missing the index, add the index.
+  // This guard exists for paranoia: a partially-migrated DB might have the
+  // table but not the index.
+  const tableExists = db.prepare(
+    "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='alias_history'"
+  ).get() as { c: number };
+  if (tableExists.c === 0) {
+    // SCHEMA_SQL already ran with CREATE IF NOT EXISTS — if we're here, the
+    // table genuinely doesn't exist (fresh DB or migration ran before SCHEMA_SQL).
+    // Re-create it explicitly to be safe.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS alias_history (
+        id INTEGER PRIMARY KEY,
+        project TEXT NOT NULL,
+        alias_path TEXT NOT NULL,
+        canonical_target TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        last_seen_success_at TEXT NOT NULL,
+        UNIQUE(project, alias_path)
+      );
+    `);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_alias_history_project ON alias_history(project)');
+}
+
+/**
+ * R153 (DATA-R153-01/02): Load all alias_history entries for a project.
+ * Returns a Map keyed by alias_path (root-relative lexical) for O(1) lookup.
+ *
+ * Used by the indexer after discovery to determine which broken aliases were
+ * previously valid. The returned entries drive the protected-paths set that
+ * filters deletedRelPaths in incremental mode and forces hasUncertainty in
+ * full mode.
+ */
+export interface AliasHistoryEntry {
+  aliasPath: string;
+  canonicalTarget: string;
+  targetKind: 'file' | 'directory';
+  lastSeenSuccessAt: string;
+}
+
+export function loadAliasHistory(db: Database.Database, project: string): Map<string, AliasHistoryEntry> {
+  const rows = db.prepare(
+    'SELECT alias_path, canonical_target, target_kind, last_seen_success_at FROM alias_history WHERE project = ?'
+  ).all(project) as Array<{ alias_path: string; canonical_target: string; target_kind: string; last_seen_success_at: string }>;
+  const map = new Map<string, AliasHistoryEntry>();
+  for (const row of rows) {
+    map.set(row.alias_path, {
+      aliasPath: row.alias_path,
+      canonicalTarget: row.canonical_target,
+      targetKind: row.target_kind === 'directory' ? 'directory' : 'file',
+      lastSeenSuccessAt: row.last_seen_success_at,
+    });
+  }
+  return map;
+}
+
+/**
+ * R153 (DATA-R153-01/02): Persist alias_history updates for a project.
+ *
+ * For each resolved alias (realpath succeeded): UPSERT the entry with the
+ * new canonical_target, target_kind, and last_seen_success_at=now. This
+ * overwrites any previous entry for the same alias_path.
+ *
+ * For broken aliases: do NOT touch the existing entry — we want to preserve
+ * the last_known canonical_target so future runs can protect it. If the alias
+ * was never seen valid, no entry exists; nothing to do.
+ *
+ * Garbage collection: entries for alias_paths that no longer appear on disk
+ * (the symlink was removed) are deleted. The `liveAliasPaths` set contains
+ * all alias_paths observed during this discovery (both resolved and broken).
+ */
+export function persistAliasHistory(
+  db: Database.Database,
+  project: string,
+  resolvedAliases: Array<{ aliasPath: string; canonicalTarget: string; targetKind: 'file' | 'directory' }>,
+  liveAliasPaths: Set<string>,
+): void {
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    // 1. UPSERT resolved aliases.
+    const upsert = db.prepare(`
+      INSERT INTO alias_history (project, alias_path, canonical_target, target_kind, last_seen_success_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(project, alias_path) DO UPDATE SET
+        canonical_target = excluded.canonical_target,
+        target_kind = excluded.target_kind,
+        last_seen_success_at = excluded.last_seen_success_at
+    `);
+    for (const alias of resolvedAliases) {
+      upsert.run(project, alias.aliasPath, alias.canonicalTarget, alias.targetKind, now);
+    }
+    // 2. Garbage-collect entries for aliases no longer on disk.
+    // Build a parameterized IN clause from liveAliasPaths.
+    if (liveAliasPaths.size > 0) {
+      const ph = [...liveAliasPaths].map(() => '?').join(',');
+      db.prepare(
+        `DELETE FROM alias_history WHERE project = ? AND alias_path NOT IN (${ph})`
+      ).run(project, ...liveAliasPaths);
+    } else {
+      // No aliases observed at all — clear all entries for this project.
+      db.prepare('DELETE FROM alias_history WHERE project = ?').run(project);
+    }
+  });
+  tx();
+}
+
+/**
+ * Clear all data for a project (nodes, edges, file_hashes, call_sites, imports, exports) before re-indexing.
  * Does NOT clear the projects table — that's updated separately.
+ * Does NOT clear alias_history — R153: the alias history must survive full
+ *   reindexes to protect future runs from silent historical-target deletion.
  * R106: also clears call_sites (persistent cross-file resolution table).
  * R110: also clears imports (persistent import bindings table).
+ * R119: also clears exports (persistent export bindings table).
  */
 export function clearProjectData(db: Database.Database, project: string): void {
   const tx = db.transaction(() => {

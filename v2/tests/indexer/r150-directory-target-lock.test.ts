@@ -42,12 +42,23 @@ describe('R150: Directory-Target Lock', () => {
 
   // ── DATA-R150-02: broken symlink → globalDeletionUncertainty ──────────
 
-  it('DATA-R150-02a: broken symlink records warning with relative path (R152)', () => {
-    const source = require('node:fs').readFileSync(
-      join(__dirname, '..', '..', 'src', 'indexer', 'wasm-extractor.ts'), 'utf-8'
-    );
-    // R152: recordWarning uses relative path, not absolute.
-    expect(source).toContain("recordWarning('ENOENT', relative(realRoot, fullPath))");
+  it('DATA-R150-02a: broken symlink records warning with relative path (R152, R153 runtime)', async () => {
+    // R153 (TEST-R153-03): converted from source inspection to runtime test.
+    // Creates a broken symlink and asserts the warning sample uses a
+    // root-relative path (not absolute, does not contain the tmp dir).
+    writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
+    symlinkSync('/nonexistent', join(projectDir, 'broken.ts'));
+    const r = await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
+    expect(r.errors.length).toBe(0);
+    expect(r.warnings).toBeDefined();
+    expect(r.warnings!.total).toBeGreaterThan(0);
+    const enoentSamples = r.warnings!.samples.filter(s => s.code === 'ENOENT');
+    expect(enoentSamples.length).toBeGreaterThan(0);
+    const sample = enoentSamples[0];
+    // Path must be root-relative (just "broken.ts"), not absolute.
+    expect(sample.path).toBe('broken.ts');
+    expect(sample.path.startsWith('/')).toBe(false);
+    expect(sample.path).not.toContain(tmpDir);
   });
 
   it('DATA-R150-02b: broken symlink on first full does NOT block (R151)', async () => {

@@ -1,5 +1,124 @@
 # Changelog — Codebase Memory V2
 
+## 0.58.0 — Round 153 (2026-07-11) Alias History + Warning Propagation
+
+**78th round (GPT 5.6 Sol audit R152).** 2 P1 + 2 P1/P2 + 4 P2 fixed.
+Closes the 8 confirmed code findings of the R152 audit.
+
+### Alias history (2 P1)
+
+176. **P1 symlink historically valid then broken silently deletes target**
+     (`schema.ts`, `wasm-extractor.ts`, `indexer.ts`) — R152 treated ALL
+     broken symlinks (ENOENT on realpath) as warnings only, with no
+     protection for the canonical target. If an alias was previously valid
+     (target indexed under the canonical path), and the target temporarily
+     disappeared, the old target's nodes/hashes/imports/exports would be
+     deleted from `deletedRelPaths` (incremental) or wiped by
+     `clearProjectData` (full). The graph could then be announced fresh
+     despite missing data. Fixed: added `alias_history` table
+     (`alias_path`, `canonical_target`, `target_kind`, `last_seen_success_at`)
+     that persists across full reindexes. Discovery now records resolved
+     aliases (realpath succeeded) and broken aliases (ENOENT/ELOOP). The
+     indexer loads previous alias_history, and for each broken alias with
+     a history entry, adds the old canonical target to a protected paths
+     set: file targets get exact-match protection, directory targets get
+     subtree-prefix protection. In incremental mode, protected paths are
+     filtered from `deletedRelPaths`. In full mode, any protected path
+     forces `hasUncertainty=true` (abort the full to preserve the graph).
+     The R152 comment claiming "old data for the symlink path" was false —
+     R141 persists the canonical target path, not the alias. (DATA-R153-01)
+
+177. **P1 ELOOP on historically-valid alias not protected**
+     (`wasm-extractor.ts`, `indexer.ts`) — Same vector as DATA-R153-01 but
+     for ELOOP. An alias that was previously valid and is now a loop must
+     protect its old canonical target. Fixed: ELOOP now records the broken
+     alias with code='ELOOP', and the indexer applies the same
+     alias-history-based protection as ENOENT. (DATA-R153-02)
+
+### Warning propagation (2 P1/P2)
+
+178. **P1/P2 warnings dropped from dry-run, partial discovery, and full
+     uncertainty returns** (`indexer.ts`) — R152 built `discoveryWarnings`
+     AFTER several early returns (dry-run, full partial, incremental
+     partial). The full-uncertainty return built it but didn't include it
+     in the returned object. Warnings that coexisted with errors were lost.
+     Fixed: `buildDiscoveryWarnings()` helper is called IMMEDIATELY after
+     discovery succeeds, BEFORE the partial discovery check. All return
+     paths now include `warnings: discoveryWarnings`. (OBS-R153-01)
+
+179. **P1/P2 four warning codes still missing paths**
+     (`wasm-extractor.ts`) — R152 claimed "all warning events use the same
+     structured type" but `ENOENT_LSTAT`, `ENOENT_STAT`, `ENOENT_IDENTITY`,
+     and `ENOENT_REALPATH_DIR` were called without a path argument. CLI
+     output could show `ENOENT_LSTAT (12): ` with nothing after the colon.
+     Fixed: all four codes now pass the root-relative path:
+     `ENOENT_LSTAT` → `relative(realRoot, fullPath)`,
+     `ENOENT_STAT` → `relative(realRoot, realTarget)`,
+     `ENOENT_IDENTITY` → `relative(realRoot, realTarget)` (symlink) or
+     `relative(realRoot, fullPath)` (regular file),
+     `ENOENT_REALPATH_DIR` → `relative(realRoot, fullPath)`. (OBS-R153-02)
+
+### CLI outcome contract (3 P2)
+
+180. **P2 success banner printed before warnings** (`cli/commands/index.ts`)
+     — R152 printed "✓ indexed successfully" THEN warnings. For a broken
+     symlink that was historically valid, the graph could already be
+     incomplete. Fixed: added typed `outcome` field to `IndexResult`
+     (`SUCCESS` | `SUCCESS_WITH_WARNINGS` | `STALE` | `PARTIAL` | `FAILED`).
+     The CLI prints warnings BEFORE the outcome banner. The banner text
+     reflects the outcome: "indexed successfully" (SUCCESS),
+     "indexed successfully with warnings" (SUCCESS_WITH_WARNINGS),
+     "indexed but graph is stale" (STALE), "indexed with errors"
+     (PARTIAL/FAILED). (OUTCOME-R153-01)
+
+181. **P2 dry-run silences warnings** (`cli/commands/index.ts`) — Dry-run
+     is the mode where users inspect discovery, but R152 gated warnings
+     with `!opts.dryRun`. Fixed: warnings are now printed regardless of
+     dry-run mode. The dry-run banner is "ℹ Dry-run complete. No DB
+     writes." (OUTCOME-R153-02)
+
+182. **P2 CLI "and N more" uses hardcoded 5** (`cli/commands/index.ts`)
+     — R152 computed `count - 5` for the hidden count, but the cap of 100
+     samples or missing paths could leave fewer than 5 samples for a code.
+     The output could say "and 5 more" when 10 paths were actually hidden.
+     Fixed: `hidden = count - samplePaths.length` (the true number of
+     hidden paths for this code). When samplePaths is empty, the output
+     shows "no path sample available" instead of an empty list.
+     (OUTCOME-R153-03)
+
+### API cleanup (1 P2)
+
+183. **P2 `globalDeletionUncertainty` field dead in API**
+     (`wasm-extractor.ts`) — R152 stopped setting
+     `globalDeletionUncertainty` for broken symlinks, but the field
+     remained in `DiscoveryResult`. External callers could be misled into
+     thinking it carries information. Fixed: the field is kept for
+     backward compatibility but marked deprecated in the JSDoc. It is
+     always `false` since R152. The structured `resolvedAliases` and
+     `brokenAliases` fields replace it with precise per-alias info.
+     (API-R153-01)
+
+### Tests (24 new, 4 updated)
+
+- **DATA-R153-01** (6 tests): file alias valid→broken→restored (incremental
+  + full), directory alias valid→broken→restored, no-history→no-protection,
+  unrelated deletion still works.
+- **DATA-R153-02** (1 test): ELOOP historical protection.
+- **OBS-R153-01** (1 test): dry-run includes warnings.
+- **OBS-R153-02** (2 tests): ENOENT and ELOOP carry root-relative paths
+  (runtime, not source inspection).
+- **OUTCOME-R153-01** (3 tests): SUCCESS, SUCCESS_WITH_WARNINGS, STALE.
+- **API-R153-01** (2 tests): globalDeletionUncertainty always false,
+  resolvedAliases/brokenAliases populated.
+- **TEST-R153-04** (6 tests): CLI process spawn — exit codes, stdout
+  content, warning ordering, dry-run warnings, exact sample count.
+- **Regression** (3 tests): semantics v8 (no bump), alias_history survives
+  full reindex, removed alias garbage-collected.
+- **Updated** (4 tests): R148/R149/R150/R151 source-inspection tests
+  converted to runtime tests or updated for R153 code patterns.
+
+### Total: 183 bugs + 11 optimizations + 418 indexer tests across 78 rounds
+
 ## 0.57.3 — Round 152 (2026-07-11) Symlink Idempotence + Warning Propagation
 
 **77th round (GPT 5.6 Sol audit R151).** 2 P1 + 1 P1/P2 + 2 P2 fixed.

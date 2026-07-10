@@ -1,15 +1,21 @@
 // v2/src/indexer/indexer.ts
-// R68: Native TypeScript/JavaScript indexer — orchestrateur.
+// R69: Native WASM-based code indexer — orchestrateur.
 //
-// Walks a project directory, extracts code structure using ts-morph,
-// and writes to SQLite (compatible with V1's schema).
+// Walks a project directory, extracts code structure using web-tree-sitter
+// (WASM, 112 languages), and writes to SQLite (compatible with V1's schema).
 //
-// This gives V2 partial autonomy for TS/JS projects. V1 is still needed
-// for 158 other languages (Python, Go, Rust, C, etc.).
+// R69 replaced the R68 ts-morph extractor (TS/JS only) with a WASM-based
+// extractor that supports 112 languages via tree-sitter WASM grammars.
+// No V1 `cbm` binary is needed.
+//
+// R153: Added alias_history table for historical-target protection. When a
+// symlink alias was previously valid and is now broken (ENOENT/ELOOP), the
+// old canonical target's data is preserved (filtered from deletedRelPaths
+// in incremental mode; forces hasUncertainty in full mode).
 
 import Database from 'better-sqlite3';
 import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
-import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION } from './schema.js';
+import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION, loadAliasHistory, persistAliasHistory } from './schema.js';
 import { discoverSourceFilesStructured, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
 import type { DiscoveryResult } from './wasm-extractor.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
@@ -140,12 +146,89 @@ export interface IndexResult {
    * R152 (OBS-R152-01): Discovery warnings propagated to the caller.
    * Includes broken symlinks, ELOOP, ENOENT_LSTAT, etc.
    * Lets the CLI/UI/MCP show warnings even when the index succeeded.
+   *
+   * R153 (OBS-R153-01): Now propagated in ALL return paths that have a
+   * discovery result (dry-run, partial discovery, full uncertainty, no-op,
+   * deletion-only, main path). Previously several early returns dropped
+   * the warnings field.
    */
   warnings?: {
     total: number;
     countsByCode: Record<string, number>;
     samples: Array<{ path: string; code: string }>;
   };
+  /**
+   * R153 (OUTCOME-R153-01): Typed outcome for explicit CLI/UI/MCP contracts.
+   * Replaces the implicit "errors=0 AND stale=false → success" logic that
+   * was scattered across consumers. The outcome is computed by the indexer
+   * based on errors, stale, and warnings:
+   *
+   *   - 'SUCCESS': no errors, not stale, no warnings.
+   *   - 'SUCCESS_WITH_WARNINGS': no errors, not stale, but warnings present
+   *     (e.g., broken symlinks that don't block the index).
+   *   - 'STALE': no errors but crossFileCallsStale=true (semantics mismatch,
+   *     uncertainty, partial discovery aborted to preserve graph).
+   *   - 'PARTIAL': errors present but --allow-partial would still exit 0.
+   *   - 'FAILED': errors present and the index did not complete.
+   *
+   * The CLI uses this to print the correct banner BEFORE warnings (so the
+   * user sees the outcome first, then the diagnostic detail).
+   */
+  outcome?: 'SUCCESS' | 'SUCCESS_WITH_WARNINGS' | 'STALE' | 'PARTIAL' | 'FAILED';
+}
+
+/**
+ * R153 (OBS-R153-01): Build the warnings field from a discovery result.
+ * Returns `undefined` when there are no warnings (so the field is omitted
+ * from the JSON-serialized IndexResult for clean runs).
+ *
+ * This helper is called IMMEDIATELY after discovery succeeds, so all
+ * subsequent return paths can include `warnings: discoveryWarnings` without
+ * re-computing it. R152 built this field AFTER several early returns,
+ * causing warnings to be dropped from dry-run, partial discovery, and
+ * full-uncertainty returns.
+ */
+function buildDiscoveryWarnings(discovery: DiscoveryResult): IndexResult['warnings'] {
+  if (discovery.totalWarnings === 0) return undefined;
+  return {
+    total: discovery.totalWarnings,
+    countsByCode: discovery.warningCountsByCode,
+    samples: discovery.warningSamples,
+  };
+}
+
+/**
+ * R153 (OUTCOME-R153-01): Compute the typed outcome from the final state.
+ * The CLI uses this to print the correct banner. The outcome is determined
+ * by errors, stale flag, and warnings presence:
+ *   - errors > 0 → 'PARTIAL' (allow-partial would still exit 0) or 'FAILED'
+ *   - stale → 'STALE'
+ *   - warnings > 0 → 'SUCCESS_WITH_WARNINGS'
+ *   - else → 'SUCCESS'
+ *
+ * Note: 'PARTIAL' vs 'FAILED' distinction is informational — the CLI's exit
+ * code logic (separate from this) decides whether to exit 0 or 1 based on
+ * --allow-partial. We mark errors > 0 as 'PARTIAL' when the run otherwise
+ * completed (discovery succeeded, extraction produced partial results) and
+ * 'FAILED' when the run aborted before extraction (root failure, discovery
+ * exception, partial discovery lock).
+ */
+function computeOutcome(
+  errors: Array<{ file: string; error: string }>,
+  crossFileCallsStale: boolean,
+  warnings: IndexResult['warnings'],
+  aborted: boolean,
+): 'SUCCESS' | 'SUCCESS_WITH_WARNINGS' | 'STALE' | 'PARTIAL' | 'FAILED' {
+  if (errors.length > 0) {
+    return aborted ? 'FAILED' : 'PARTIAL';
+  }
+  if (crossFileCallsStale) {
+    return 'STALE';
+  }
+  if (warnings !== undefined && warnings.total > 0) {
+    return 'SUCCESS_WITH_WARNINGS';
+  }
+  return 'SUCCESS';
 }
 
 /**
@@ -191,6 +274,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         parallel: false,
         workerCount: 0,
         crossFileCallsStale: true,
+        outcome: 'FAILED',
       };
     }
     let discovery: DiscoveryResult;
@@ -205,6 +289,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         parallel: false,
         workerCount: 0,
         crossFileCallsStale: true,
+        outcome: 'FAILED',
       };
     }
     const langs = new Set<string>();
@@ -212,6 +297,10 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       const lang = detectLanguage(f);
       if (lang) langs.add(lang);
     }
+    // R153 (OBS-R153-01): Build warnings immediately after discovery so all
+    // return paths can include them. R152 dropped warnings from dry-run.
+    const dryRunWarnings = buildDiscoveryWarnings(discovery);
+    const dryRunStale = !discovery.complete;
     return {
       dbPath, durationMs: Date.now() - start, nodes: 0, edges: 0,
       files: discovery.files.length, skipped: 0,
@@ -219,7 +308,14 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       languages: langs,
       parallel: false,
       workerCount: 0,
-      crossFileCallsStale: !discovery.complete,
+      crossFileCallsStale: dryRunStale,
+      warnings: dryRunWarnings,
+      outcome: computeOutcome(
+        discovery.errors.map(e => ({ file: e.path, error: `${e.code}: ${e.message}` })),
+        dryRunStale,
+        dryRunWarnings,
+        true,
+      ),
     };
   }
 
@@ -256,6 +352,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       parallel: false,
       workerCount: 0,
       crossFileCallsStale: true,
+      outcome: 'FAILED',
     };
   }
 
@@ -302,6 +399,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       parallel: false,
       workerCount: 0,
       crossFileCallsStale: true,
+      outcome: 'FAILED',
     };
   }
 
@@ -321,6 +419,49 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     }
     return `${total} discovery error(s) (codes: ${codeSummary}): ${sampleStr}`;
   }
+
+  // R153 (OBS-R153-01): Build warnings IMMEDIATELY after discovery succeeds,
+  // BEFORE the partial discovery check. R152 built this field AFTER the
+  // partial-discovery returns, causing warnings to be dropped when discovery
+  // was partial. Now all return paths (partial, full uncertainty, no-op,
+  // deletion-only, main) can include `warnings: discoveryWarnings`.
+  const discoveryWarnings = buildDiscoveryWarnings(discovery);
+
+  // R153 (DATA-R153-01/02): Alias history lookup. For each broken alias in
+  // discovery.brokenAliases, check if it was previously valid (has an entry
+  // in alias_history). If so, the old canonical target must be protected
+  // from deletion:
+  //   - file target → protected exact path (excluded from deletedRelPaths)
+  //   - directory target → protected subtree (prefix match)
+  //
+  // This closes the silent historical-target deletion vector introduced by
+  // R152: a previously-valid alias whose target temporarily disappears must
+  // NOT cause the target's nodes/hashes/imports/exports to be deleted.
+  //
+  // In full mode, ANY protected path forces hasUncertainty=true (abort the
+  // full to preserve the old graph). In incremental mode, protected paths
+  // are filtered out of deletedRelPaths.
+  const aliasHistory = loadAliasHistory(db, opts.project);
+  const protectedPaths = new Set<string>();
+  const protectedSubtrees: string[] = [];
+  const historicalBrokenAliases: Array<{ aliasPath: string; canonicalTarget: string; targetKind: string; code: string }> = [];
+  for (const broken of discovery.brokenAliases) {
+    const entry = aliasHistory.get(broken.aliasPath);
+    if (entry) {
+      historicalBrokenAliases.push({
+        aliasPath: broken.aliasPath,
+        canonicalTarget: entry.canonicalTarget,
+        targetKind: entry.targetKind,
+        code: broken.code,
+      });
+      if (entry.targetKind === 'directory') {
+        protectedSubtrees.push(entry.canonicalTarget);
+      } else {
+        protectedPaths.add(entry.canonicalTarget);
+      }
+    }
+  }
+  const hasHistoricalBrokenAliases = historicalBrokenAliases.length > 0;
 
   // R142 (DATA-R142-02): Partial discovery lock. If discovery encountered
   // errors (subtree EACCES, fatal symlink errors, etc.), the file list may
@@ -358,6 +499,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         parallel: false,
         workerCount: 0,
         crossFileCallsStale: true,
+        warnings: discoveryWarnings,
+        outcome: 'FAILED',
       };
     }
     // R144 (MIG-R144-02): incremental mode + partial → same unified helper.
@@ -377,17 +520,10 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       parallel: false,
       workerCount: 0,
       crossFileCallsStale: true,
+      warnings: discoveryWarnings,
+      outcome: 'FAILED',
     };
   }
-
-  // R152 (OBS-R152-01): Build warnings field from discovery for all return paths.
-  const discoveryWarnings = discovery.totalWarnings > 0
-    ? {
-        total: discovery.totalWarnings,
-        countsByCode: discovery.warningCountsByCode,
-        samples: discovery.warningSamples,
-      }
-    : undefined;
 
   // R142 (PATH-R142-01): use canonicalRoot (from assertDiscoveryRoot) for
   // all relative-path computation. This ensures file_path values never
@@ -419,27 +555,31 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // broken from temporarily broken. Blocking ALL fulls permanently (R150) or
   // blocking only subsequent fulls (R151) both create unacceptable trade-offs.
   //
-  // The correct long-term fix is alias history (R152B in the roadmap), which
-  // will persist alias→canonical mappings and only protect targets that were
-  // previously seen as valid. Until then, broken symlinks are treated as
-  // permanently broken — the old data for the symlink path (if any) is stale
-  // but not deleted (the path just doesn't appear in currentRelPaths, so it
-  // would be deleted in incremental; but the incremental stale flag ensures
-  // the graph is marked stale, not fresh).
+  // R153 (DATA-R153-01/02): Alias history now provides the missing information.
+  // A broken alias that was previously valid (has an entry in alias_history)
+  // MUST trigger the full-mode uncertainty lock — the old canonical target's
+  // data would be destroyed by clearProjectData. The lock preserves the old
+  // graph until the target is restored and a successful re-index repopulates
+  // alias_history with the new (valid) target.
   //
-  // The only remaining sources of `hasUncertainty` are:
+  // A broken alias that was NEVER valid (no history entry) remains a warning
+  // only — there's no old target data to protect.
+  //
+  // The remaining sources of `hasUncertainty` are:
   //   - uncertainPaths (ENOENT_LSTAT, ENOENT_IDENTITY — TOCTOU races on files
   //     that were confirmed to exist by readdir)
   //   - uncertainSubtrees (ENOENT_REALPATH_DIR — TOCTOU races on directories)
   //   - empty relTarget (DATA-R151-01 — root-level uncertainty)
-  // These are all genuine TOCTOU races (the entry was seen by readdir but
-  // disappeared before lstat/realpath/stat), not broken symlinks.
+  //   - historicalBrokenAliases (R153 — previously-valid alias now broken)
   const hasEmptyRelTarget = discovery.uncertainSubtrees.some(s => s === '');
   const effectiveGlobalDeletionUncertainty = hasEmptyRelTarget;
-  const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty;
+  const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasHistoricalBrokenAliases;
   if (!opts.incremental && hasUncertainty) {
     db.close();
-    const uncertainMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
+    const aliasPart = hasHistoricalBrokenAliases
+      ? `, ${historicalBrokenAliases.length} historically-valid alias(es) now broken`
+      : '';
+    const uncertainMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent${aliasPart}. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
     markProjectStalePreservingGraph(dbPath, opts.project, uncertainMsg);
     return {
       dbPath,
@@ -453,6 +593,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       parallel: false,
       workerCount: 0,
       crossFileCallsStale: true,
+      warnings: discoveryWarnings,
+      outcome: 'STALE',
     };
   }
 
@@ -547,18 +689,28 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     // R151 (AVAIL-R151-01): Use effectiveGlobalDeletionUncertainty instead
     // of discovery.globalDeletionUncertainty — the indexer decides based on
     // whether the project has existing nodes (first-index policy).
+    // R153 (DATA-R153-01/02): Also filter out protected paths from alias
+    // history. A previously-valid alias whose target is now broken must
+    // NOT have its old canonical target deleted. Protected paths are
+    // computed from brokenAliases ∩ aliasHistory above.
     if (effectiveGlobalDeletionUncertainty) {
       deletedRelPaths = [];
-    } else if (discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0) {
+    } else {
       const uncertainPathSet = new Set(discovery.uncertainPaths);
       const uncertainSubtreePrefixes = discovery.uncertainSubtrees;
       // R148 (COMPAT-R148-01): Use path.sep instead of hardcoded '/' for
       // cross-platform subtree prefix matching. On Windows, path.relative()
       // produces backslash-separated paths, so '/' would never match.
       deletedRelPaths = deletedRelPaths.filter(p => {
-        // Exact match — the file was seen as uncertain.
+        // R153: alias-history protection — exact match.
+        if (protectedPaths.has(p)) return false;
+        // R153: alias-history protection — subtree match.
+        for (const prefix of protectedSubtrees) {
+          if (p === prefix || p.startsWith(prefix + sep)) return false;
+        }
+        // R147: uncertain path — exact match.
         if (uncertainPathSet.has(p)) return false;
-        // Subtree match — the path is under an uncertain directory.
+        // R147: uncertain subtree — prefix match.
         for (const prefix of uncertainSubtreePrefixes) {
           if (p === prefix || p.startsWith(prefix + sep)) return false;
         }
@@ -635,6 +787,16 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       return { noOpStale };
     });
     const { noOpStale } = noOpTx();
+    // R153 (DATA-R153-01/02): Persist alias_history even on no-op. Aliases
+    // may have been added/removed/changed without any file content changing
+    // (e.g., a symlink was deleted). The GC in persistAliasHistory removes
+    // entries for aliases no longer on disk.
+    if (!noOpStale) {
+      const liveAliasPaths = new Set<string>();
+      for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+      for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
+      persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+    }
     db.close();
     return {
       dbPath,
@@ -649,6 +811,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       workerCount: 0,
       crossFileCallsStale: noOpStale,
       warnings: discoveryWarnings,
+      outcome: computeOutcome([], noOpStale, discoveryWarnings, false),
     };
   }
 
@@ -750,6 +913,15 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
             : null)
       : null;
     updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, existingSemanticsVersion, deletionError);
+    // R153 (DATA-R153-01/02): Persist alias_history on deletion-only too.
+    // Aliases may have been added/removed/changed. The GC removes entries for
+    // aliases no longer on disk.
+    if (!crossFileStale) {
+      const liveAliasPaths = new Set<string>();
+      for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+      for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
+      persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+    }
     db.close();
     return {
       dbPath,
@@ -764,6 +936,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       workerCount: 0,
       crossFileCallsStale: crossFileStale,
       warnings: discoveryWarnings,
+      outcome: computeOutcome([], crossFileStale, discoveryWarnings, false),
     };
   }
 
@@ -911,6 +1084,29 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     indexError = `Semantics version ${existingSemanticsVersion} ≠ current ${CURRENT_EXTRACTOR_SEMANTICS_VERSION} — full reindex required`;
   }
   updateProjectStats(db, opts.project, effectiveRoot, totals.nodes, totals.edges, crossFileStale, callSitesInitialized, semanticsVersion, indexError);
+
+  // R153 (DATA-R153-01/02): Persist alias_history on successful index.
+  // Only persist when the graph is fresh (crossFileStale=false) — on a stale
+  // or failed run, the discovery may have been incomplete and the alias
+  // observations may not be trustworthy. On a fresh run, all resolved aliases
+  // are UPSERTed and aliases no longer on disk are garbage-collected.
+  //
+  // We do NOT persist on the full-uncertainty abort (that returns earlier),
+  // because the discovery was complete but we aborted to preserve the old
+  // graph — the alias observations ARE valid, but persisting them would
+  // overwrite the old alias_history with the same data (no-op). Skipping
+  // the persist is fine; the next successful run will persist.
+  //
+  // liveAliasPaths = resolvedAliases.aliasPath ∪ brokenAliases.aliasPath.
+  // This is the set of aliases observed on disk this run. Entries for
+  // aliases not in this set are garbage-collected (the symlink was removed).
+  if (!crossFileStale) {
+    const liveAliasPaths = new Set<string>();
+    for (const a of discovery.resolvedAliases) liveAliasPaths.add(a.aliasPath);
+    for (const a of discovery.brokenAliases) liveAliasPaths.add(a.aliasPath);
+    persistAliasHistory(db, opts.project, discovery.resolvedAliases, liveAliasPaths);
+  }
+
   db.close();
 
   return {
@@ -922,6 +1118,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     workerCount: useParallel ? numWorkers : 0,
     crossFileCallsStale: crossFileStale,
     warnings: discoveryWarnings,
+    outcome: computeOutcome(result.errors, crossFileStale, discoveryWarnings, false),
   };
 }
 

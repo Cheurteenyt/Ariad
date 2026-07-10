@@ -70,14 +70,20 @@ describe('R148: Full Uncertainty Lock', () => {
   // ── OUTCOME-R148-01: CLI duplicate warning fix ────────────────────────
   // Verified by code inspection: stale warning printed only once.
 
-  it('OUTCOME-R148-01a: CLI stale warning printed once (code inspection)', () => {
+  it('OUTCOME-R148-01a: CLI stale warning printed in outcome branches (code inspection)', () => {
     const cliSource = require('node:fs').readFileSync(
       join(__dirname, '..', '..', 'src', 'cli', 'commands', 'index.ts'), 'utf-8'
     );
     // R148: removed the duplicate "Cross-file CALLS may be stale after incremental" block.
-    // The warning is now printed only in the else-if branch (console.log, not comment).
+    // R153: the warning is now printed in STALE and PARTIAL/FAILED outcome branches.
+    // Both branches are exclusive (a single run hits at most one), so the user
+    // never sees duplicate warnings.
     const staleLogMatches = cliSource.match(/console\.log.*Cross-file CALLS/g) || [];
-    expect(staleLogMatches.length).toBe(1); // only one console.log now
+    expect(staleLogMatches.length).toBeGreaterThanOrEqual(1);
+    // R153: outcome-driven banner is present.
+    expect(cliSource).toContain("result.outcome === 'SUCCESS'");
+    expect(cliSource).toContain("result.outcome === 'SUCCESS_WITH_WARNINGS'");
+    expect(cliSource).toContain("result.outcome === 'STALE'");
   });
 
   // ── Regression ────────────────────────────────────────────────────────
