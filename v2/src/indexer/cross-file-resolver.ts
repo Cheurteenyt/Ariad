@@ -253,6 +253,38 @@ function resolveModulePath(
 }
 
 /**
+ * R128: Delete ALL cross-file CALLS edges for a project.
+ *
+ * This is the single source of truth for cross-file edge cleanup. All paths
+ * that need to remove stale/legacy edges (no-op, deletion-only, stale-semantics
+ * incremental, full-failure) MUST use this helper to ensure consistent
+ * identification of cross-file edges.
+ *
+ * Identifies cross-file edges by `properties_json` containing
+ * `"resolution":"cross_file"`. Intra-file CALLS edges
+ * (`resolution="intra_file"`) are preserved.
+ *
+ * Must be called INSIDE a transaction by the caller.
+ *
+ * R128 context: R127 added stale-semantics cleanup to 3 resolver call sites,
+ * but (a) the no-op fast path didn't clean edges (MIG-R128-01), and (b) the
+ * cleanup was gated behind `callSitesInitialized` which could be false after
+ * a partial full index (MIG-R128-02). R128 centralizes the cleanup here and
+ * makes `semanticsStale` dominate `callSitesInitialized` in all paths.
+ */
+export function clearCrossFileCallEdges(
+  db: Database.Database,
+  project: string,
+): number {
+  const info = db.prepare(
+    `DELETE FROM edges
+     WHERE project = ? AND type = 'CALLS'
+       AND properties_json LIKE '%"resolution":"cross_file%'`
+  ).run(project);
+  return info.changes;
+}
+
+/**
  * R106: Rebuild ALL cross-file CALLS edges for a project from the persistent
  * call_sites table + current nodes table.
  *
@@ -475,6 +507,20 @@ export function rebuildCrossFileCallsEdges(
           // in the unresolved module — we just can't verify.
           return { kind: 'unknown', reason: 'unresolved_reexport_module' };
         }
+        // R128: IDX-R128-01 — if the re-exported name is 'default', check
+        // defaultExportByFile first. `export { default } from './b'` re-exports
+        // b's default export, which is tracked in defaultExportByFile (not in
+        // the exports table). Without this check, the recursive call to
+        // resolveExportedSymbol(resolvedFile, 'default') would return 'unknown'
+        // (b.ts has no exports table entry for 'default'), making the import
+        // terminal and producing a false negative for a valid ESM import.
+        if (expBinding.importedName === 'default' || exportedName === 'default') {
+          const defaultQn = defaultExportByFile.get(resolvedFile);
+          if (defaultQn) return { kind: 'resolved', qn: defaultQn };
+          // No default marker — fall through to recursive resolution, which
+          // may find an explicit `export { default }` in the target file, or
+          // return missing/unknown.
+        }
         return resolveExportedSymbol(resolvedFile, expBinding.importedName || exportedName, depth + 1, new Set(visited));
       }
     }
@@ -498,12 +544,25 @@ export function rebuildCrossFileCallsEdges(
     const starTargets = new Set<string>();
     let hasAmbiguous = false;
     let hasUnknown = false;
-    // R127: OBS-R127-01 — track the first child unknown reason so the parent
-    // returns an accurate diagnostic instead of always hardcoding
-    // 'unresolved_reexport_module'. The first reason encountered is used
-    // (priority: unresolved source > child reason). This is informational —
-    // the terminal semantics (no fallback when semanticsCurrent) are unchanged.
-    let unknownReason: UnknownReason = 'unresolved_reexport_module';
+    // R128: OBS-R128-01 — priority-based UnknownReason (not last-wins).
+    // R127 used "last unknown wins" which made the diagnostic depend on SQL
+    // row order. R128 uses explicit priority so the diagnostic is stable:
+    //   unresolved_reexport_module (4) > untracked_export_form (3)
+    //   > legacy_export_tracking (2) > depth_limit (1)
+    // Higher priority wins. This is informational — the terminal semantics
+    // (no fallback when semanticsCurrent) are unchanged.
+    const unknownReasonPriority: Record<UnknownReason, number> = {
+      'unresolved_reexport_module': 4,
+      'untracked_export_form': 3,
+      'legacy_export_tracking': 2,
+      'depth_limit': 1,
+    };
+    let unknownReason: UnknownReason | null = null;
+    function trackUnknown(reason: UnknownReason) {
+      if (unknownReason === null || unknownReasonPriority[reason] > unknownReasonPriority[unknownReason]) {
+        unknownReason = reason;
+      }
+    }
     for (const starExp of fileExp.stars) {
       const starResolvedFile = resolveModulePath(starExp.sourceModule, filePath, knownFiles);
       if (!starResolvedFile) {
@@ -511,7 +570,7 @@ export function rebuildCrossFileCallsEdges(
         // mark this branch as unknown so the parent can't claim an exact
         // target from a different branch.
         hasUnknown = true;
-        unknownReason = 'unresolved_reexport_module';
+        trackUnknown('unresolved_reexport_module');
         continue;
       }
       const result = resolveExportedSymbol(starResolvedFile, exportedName, depth + 1, new Set(visited));
@@ -525,13 +584,14 @@ export function rebuildCrossFileCallsEdges(
         // ignored, which let another branch's resolved target become a false
         // "exact" edge even when the unknown branch could have produced a
         // different target or an ambiguity.
-        // R127: OBS-R127-01 — preserve the child's reason for diagnostics.
+        // R128: OBS-R128-01 — priority-based reason tracking.
         hasUnknown = true;
-        unknownReason = result.reason;
+        trackUnknown(result.reason);
       }
       // 'missing' doesn't add targets and is NOT propagated (a star branch
       // that definitively doesn't export the name is fine).
     }
+    const finalUnknownReason: UnknownReason = unknownReason ?? 'unresolved_reexport_module';
 
     // R126: precedence — ambiguous > unknown > resolved-count.
     //   - If any branch is ambiguous, the overall result is ambiguous (ESM
@@ -545,12 +605,12 @@ export function rebuildCrossFileCallsEdges(
     }
     if (hasUnknown && starTargets.size === 0) {
       // All branches were unknown or missing — unknown wins over missing.
-      return { kind: 'unknown', reason: unknownReason };
+      return { kind: 'unknown', reason: finalUnknownReason };
     }
     if (hasUnknown && starTargets.size > 0) {
       // At least one resolved + at least one unknown — we cannot trust the
       // resolved target to be the unique answer.
-      return { kind: 'unknown', reason: unknownReason };
+      return { kind: 'unknown', reason: finalUnknownReason };
     }
     if (starTargets.size === 1) {
       return { kind: 'resolved', qn: starTargets.values().next().value! };
@@ -713,9 +773,21 @@ export function rebuildCrossFileCallsEdges(
                   resolution = 'cross_file_import_exact';
                   confidence = 1.0;
                 } else {
-                  // Fallback: try the local name (old R110 behavior — works when
-                  // the default export name matches the local import name)
-                  const defaultResult = resolveExportedSymbol(resolvedFile, cs.callee, 0, new Set());
+                  // R128: IDX-R128-01/02 — resolve 'default' NOT cs.callee.
+                  // Previously this called resolveExportedSymbol(resolvedFile, cs.callee)
+                  // which used the local import name (e.g. 'foo'). This caused two bugs:
+                  //   - IDX-R128-01: `export { default } from './b'` didn't resolve
+                  //     (the barrel's binding is under 'default', not 'foo')
+                  //   - IDX-R128-02: `import foo from './index'` where index has
+                  //     `export * from './b'` and b has `export default function foo()`
+                  //     plus `export { foo }` — the star traversal found 'foo' as a
+                  //     named export, creating a false edge for an ESM-invalid import.
+                  // The correct ESM semantics: a default import asks for the 'default'
+                  // export of the source module. `export *` does NOT propagate 'default'
+                  // (R127 IDX-R127-02 guard), so the star traversal correctly returns
+                  // missing for 'default'. Explicit `export { default }` or
+                  // `export { foo as default }` are handled by the named-export check.
+                  const defaultResult = resolveExportedSymbol(resolvedFile, 'default', 0, new Set());
                   if (defaultResult.kind === 'resolved') {
                     targetQn = defaultResult.qn;
                     resolution = 'cross_file_import_exact';

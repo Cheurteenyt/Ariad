@@ -1,5 +1,93 @@
 # Changelog — Codebase Memory V2
 
+## 0.54.5 — Round 128 (2026-07-10) Stale Edge Dominance + Default Import Fix
+
+**53rd round (GPT 5.6 Sol audit R127).** 4 P1 bugs fixed + 1 P2 diagnostic fix.
+This round closes the stale-edge cleanup gaps and the default import resolution
+bugs identified in the R127 audit.
+
+### Bugs fixed (4 P1)
+
+70. **No-op stale doesn't delete existing edges** (`indexer.ts`) — The R127
+    no-op fast path set `crossFileCallsStale=true` but never deleted existing
+    cross-file edges. A stale DB (version=0) with old edges from R122–R125A
+    could remain readable by MCP/UI tools even after the stale flag was set.
+    Fixed: the no-op path now calls `clearCrossFileCallEdges()` inside the same
+    transaction as the flag update when `semanticsStale` is true. (MIG-R128-01)
+
+71. **`initialized=false` bypasses stale cleanup** (`wasm-extractor.ts`,
+    `indexer.ts`) — In all 3 resolver call sites (single-thread, parallel,
+    post-cleanup), the `!callSitesInitialized` check came BEFORE the
+    `!semanticsCurrent` check. A DB with `initialized=false` (e.g. after a
+    partial full index that set `initialized=false` per DATA-R127-01) would
+    skip the stale-semantics cleanup entirely, leaving old edges readable.
+    Fixed: `semanticsStale` now dominates `callSitesInitialized` in all paths.
+    The order is now: `if (!semanticsCurrent) { cleanup } else if
+    (!initialized) { skip } else { rebuild }`. (MIG-R128-02)
+
+72. **Explicit `export { default } from` doesn't resolve** (`cross-file-resolver.ts`)
+    — `import foo from './index'` where index has `export { default } from './b'`
+    is valid ESM, but the resolver's default-import fallback called
+    `resolveExportedSymbol(resolvedFile, cs.callee)` where `cs.callee` is the
+    local import name (e.g. `foo`), NOT `'default'`. The barrel's binding is
+    stored under `exportedName='default'`, so the lookup returned `missing`.
+    Fixed: the default-import path now resolves `'default'` (not `cs.callee`).
+    Combined with the R127 star guard (`exportedName === 'default' → missing`),
+    this correctly handles: direct default marker, `export { default }`,
+    `export { foo as default }`, star (blocked), and absence (missing terminal).
+    (IDX-R128-01)
+
+73. **Default via star with named homonym → false edge** (`cross-file-resolver.ts`)
+    — `import foo from './index'` where index has `export * from './b'` and b
+    has `export default function foo()` plus `export { foo }` is ESM-invalid
+    (star doesn't propagate default). But the resolver asked for
+    `resolveExportedSymbol(index, 'foo')`, traversed the star, found the named
+    export `foo`, and created a false edge. Fixed by the same change as #72:
+    resolving `'default'` instead of `cs.callee` means the star guard blocks
+    the traversal. (IDX-R128-02)
+
+### Diagnostic improvement (1 P2)
+
+- **OBS-R128-01: Priority-based UnknownReason** (`cross-file-resolver.ts`) —
+  R127's `unknownReason` tracking was "last unknown wins", making the
+  diagnostic depend on SQL row order. R128 uses explicit priority:
+  `unresolved_reexport_module (4) > untracked_export_form (3) >
+  legacy_export_tracking (2) > depth_limit (1)`. Higher priority wins,
+  producing stable diagnostics regardless of row order. The terminal semantics
+  are unchanged.
+
+### Architecture: `clearCrossFileCallEdges` helper
+
+R127 inlined the cross-file edge cleanup SQL in 3 places. R128 extracts a
+single `clearCrossFileCallEdges(db, project)` helper that is now the single
+source of truth for cross-file edge cleanup. All 4 cleanup call sites
+(no-op, deletion-only, single-thread incremental, parallel incremental,
+post-cleanup) use this helper, ensuring consistent identification of cross-file
+edges (`properties_json LIKE '%"resolution":"cross_file%'`).
+
+### Tests (7 new)
+
+- **MIG-R128-01**: no-op stale → existing cross-file edges deleted (0 remaining)
+- **MIG-R128-02**: initialized=false + version 0 → stale cleanup still runs (0 edges)
+- **IDX-R128-01**: `export { default } from './b'` → default import resolves to b.ts
+- **IDX-R128-02**: default via star + named homonym → 0 edges (ESM-invalid)
+- **Positive control**: direct default import → 1 exact edge
+- **Positive control**: default export function → default marker exists
+- **Deletion-only stale**: edges cleaned
+
+### Not addressed (deferred per audit recommendation)
+
+- **SEC-CARRY-01** (P0 symlink escape) — separate round
+- **DATA-R128-01/02** (full atomic publication) — staging tables, future round
+- **IDX-CARRY-01/02** (`export const foo = () =>`, multi-declarator) — R129
+- **PERF-R128-01/02** (early stale detection, resolver cache) — R130
+- **API-R128-01** (`requiresFullReindex`/`staleReason`) — P2, future
+- **UX-R128-01** (CLI success before stale warning) — P2, future
+- **DOC-R128-01** ("Full Publication Atomicity" title) — addressed: R128
+  changelog does not claim atomicity, only "stale edge dominance"
+
+### Total: 73 bugs + 11 optimizations + 179 indexer tests across 53 rounds
+
 ## 0.54.4 — Round 127 (2026-07-10) Semantics Gate Fast Paths + Full Publication Atomicity
 
 **52nd round (GPT 5.6 Sol audit R126).** 5 P1 bugs fixed + 2 P2 precision bugs

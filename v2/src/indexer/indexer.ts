@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION } from './schema.js';
 import { discoverSourceFilesWasm, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
-import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, isCallSitesInitialized } from './cross-file-resolver.js';
+import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
 import { Worker } from 'node:worker_threads';
 import { cpus } from 'node:os';
 import { join, relative as nodeRelative } from 'node:path';
@@ -204,22 +204,24 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // DB (version=0) with stale=false must be flipped to stale=true so the
   // caller knows a full reindex is required.
   if (opts.incremental && estimatedFilesToIndex === 0 && deletedRelPaths.length === 0) {
-    const totals = db.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM nodes WHERE project = ?) AS nodes,
-        (SELECT COUNT(*) FROM edges WHERE project = ?) AS edges
-    `).get(opts.project, opts.project) as { nodes: number; edges: number };
-    // R102: Bug 35 fix — preserve existing cross_file_calls_stale from DB.
-    // A no-op incremental must NOT reset stale to false. The graphe may still
-    // be stale from a previous incremental that changed files. Only a full
-    // reindex can reset stale to false.
-    // R127: MIG-R127-01 — semanticsStale must force stale=true even on no-op.
-    // Previously the no-op path read the version but never compared it to
-    // CURRENT, so a stale DB (version=0) with stale=false stayed falsely fresh.
-    const noOpStale = existingStale || semanticsStale;
-    // R107: preserve existing call_sites_initialized (no-op doesn't change it)
-    // R126: preserve existing extractor_semantics_version (no-op doesn't change it)
-    updateProjectStats(db, opts.project, opts.rootPath, totals.nodes, totals.edges, noOpStale, existingInitialized, existingSemanticsVersion);
+    // R128: MIG-R128-01 — no-op must clean stale cross-file edges when
+    // semanticsStale. Previously the no-op only set the stale flag but left
+    // old edges readable by MCP/UI. Now we delete them in the same transaction
+    // as the flag update, so consumers can't read stale data.
+    const noOpTx = db.transaction(() => {
+      if (semanticsStale) {
+        clearCrossFileCallEdges(db, opts.project);
+      }
+      const totals = db.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM nodes WHERE project = ?) AS nodes,
+          (SELECT COUNT(*) FROM edges WHERE project = ?) AS edges
+      `).get(opts.project, opts.project) as { nodes: number; edges: number };
+      const noOpStale = existingStale || semanticsStale;
+      updateProjectStats(db, opts.project, opts.rootPath, totals.nodes, totals.edges, noOpStale, existingInitialized, existingSemanticsVersion);
+      return { noOpStale };
+    });
+    const { noOpStale } = noOpTx();
     db.close();
     return {
       dbPath,
@@ -291,11 +293,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(opts.project) as { c: number }).c;
       if (semanticsStale) {
         // R127: stale semantics — delete cross-file edges but don't rebuild.
-        // The caller must do a full reindex before any edges can be trusted.
-        db.prepare(
-          `DELETE FROM edges WHERE project = ? AND type = 'CALLS'
-             AND properties_json LIKE '%"resolution":"cross_file%'`
-        ).run(opts.project);
+        // R128: use clearCrossFileCallEdges helper (single source of truth).
+        clearCrossFileCallEdges(db, opts.project);
         // Don't set crossFileResolved=true — we want stale=true.
       } else if (callSitesInitialized && nodesCount > 0) {
         rebuildCrossFileCallsEdges(db, opts.project, true);
@@ -397,16 +396,14 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       // R108: use isCallSitesInitialized (not hasCallSites) — always rebuild
       // when initialized=true, even if call_sites is empty.
       // R127: MIG-R127-03 — when semanticsStale, DON'T run the resolver.
-      // Delete cross-file edges instead (the caller will set stale=true).
-      if (isCallSitesInitialized(db, opts.project)) {
-        if (semanticsStale) {
-          db.prepare(
-            `DELETE FROM edges WHERE project = ? AND type = 'CALLS'
-               AND properties_json LIKE '%"resolution":"cross_file%'`
-          ).run(opts.project);
-        } else {
-          rebuildCrossFileCallsEdges(db, opts.project, true);
-        }
+      // R128: MIG-R128-02 — semanticsStale MUST dominate callSitesInitialized.
+      // Previously this was gated behind `isCallSitesInitialized(...)`, which
+      // meant a DB with initialized=false (partial full index) would skip the
+      // stale-semantics cleanup. Now we check semanticsStale first.
+      if (semanticsStale) {
+        clearCrossFileCallEdges(db, opts.project);
+      } else if (isCallSitesInitialized(db, opts.project)) {
+        rebuildCrossFileCallsEdges(db, opts.project, true);
       }
     });
     deleteTx();
@@ -859,15 +856,13 @@ async function indexParallel(
     if (incremental) {
       const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(project) as { c: number }).c;
       const semCurrent = (db.prepare('SELECT extractor_semantics_version AS v FROM projects WHERE name = ?').get(project) as { v?: number } | undefined)?.v === CURRENT_EXTRACTOR_SEMANTICS_VERSION;
-      if (!callSitesInitialized) {
-        // R107: Legacy DB. Skip resolution. Caller marks stale=true.
-      } else if (!semCurrent) {
+      // R128: MIG-R128-02 — semanticsStale dominates callSitesInitialized.
+      if (!semCurrent) {
         // R127: MIG-R127-03 — stale semantics. Don't run the resolver.
-        // Delete cross-file edges and leave crossFileResolved=false.
-        db.prepare(
-          `DELETE FROM edges WHERE project = ? AND type = 'CALLS'
-             AND properties_json LIKE '%"resolution":"cross_file%'`
-        ).run(project);
+        // R128: use clearCrossFileCallEdges helper.
+        clearCrossFileCallEdges(db, project);
+      } else if (!callSitesInitialized) {
+        // R107: Legacy DB. Skip resolution. Caller marks stale=true.
       } else if (nodesCount > 0) {
         // R108: initialized=true → always rebuild (even if call_sites=0).
         const added = rebuildCrossFileCallsEdges(db, project, true);
