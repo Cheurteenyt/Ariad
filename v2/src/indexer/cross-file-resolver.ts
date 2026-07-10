@@ -459,18 +459,24 @@ export function rebuildCrossFileCallsEdges(
   }
   interface FileExports {
     // R130: IDX-R130-01 — named exports stored as an array to detect duplicates.
-    // Previously used Map<string, NamedBinding> which silently overwrote
-    // duplicate exports (last-wins). ESM rejects duplicate exports with
-    // SyntaxError, so the resolver must return `unknown` (invalid_duplicate_export)
-    // when >1 binding exists for the same exportedName.
     named: Map<string, NamedBinding[]>;
     stars: Array<{ sourceModule: string }>;
+    // R131: IDX-R131-01/03/04 — module-level invalidity flag.
+    // If set, the ENTIRE module is invalid (ESM early error). Any import
+    // from this file returns `unknown` (invalid_duplicate_export) regardless
+    // of the requested name. This is checked at the START of
+    // resolveExportedSymbol, before any name lookup.
+    // Causes:
+    //   - >1 binding for ANY exportedName (IDX-R131-01)
+    //   - default marker + default binding both present (IDX-R131-03)
+    //   - unresolved star source (IDX-R131-04)
+    fileInvalidReason: UnknownReason | null;
   }
   const exportsByFile = new Map<string, FileExports>();
   for (const exp of allExports) {
     let fileExp = exportsByFile.get(exp.file_path);
     if (!fileExp) {
-      fileExp = { named: new Map(), stars: [] };
+      fileExp = { named: new Map(), stars: [], fileInvalidReason: null };
       exportsByFile.set(exp.file_path, fileExp);
     }
     if (exp.export_kind === 'star_re_export') {
@@ -480,8 +486,6 @@ export function rebuildCrossFileCallsEdges(
       }
     } else {
       // R130: IDX-R130-01 — accumulate bindings instead of overwriting.
-      // If >1 binding exists for the same exportedName, the resolver will
-      // return `unknown` (invalid_duplicate_export) — ESM SyntaxError.
       const binding: NamedBinding = {
         localName: exp.local_name, sourceModule: exp.source_module,
         importedName: exp.imported_name, exportKind: exp.export_kind,
@@ -489,8 +493,43 @@ export function rebuildCrossFileCallsEdges(
       const existing = fileExp.named.get(exp.exported_name);
       if (existing) {
         existing.push(binding);
+        // R131: IDX-R131-01 — >1 binding for ANY name invalidates the module.
+        fileExp.fileInvalidReason = 'invalid_duplicate_export';
       } else {
         fileExp.named.set(exp.exported_name, [binding]);
+      }
+    }
+  }
+
+  // R131: IDX-R131-03 — detect default marker + default binding collision.
+  // A direct `export default function foo()` creates a marker in
+  // defaultExportByFile. An explicit `export { foo as default }` or
+  // `export { default } from './b'` creates a binding in exportsByFile
+  // with exportedName='default'. If both exist, ESM rejects with
+  // SyntaxError: Duplicate export of 'default'.
+  for (const [filePath, fileExp] of exportsByFile) {
+    if (fileExp.fileInvalidReason) continue; // already invalid
+    if (defaultExportByFile.has(filePath) && fileExp.named.has('default')) {
+      fileExp.fileInvalidReason = 'invalid_duplicate_export';
+    }
+  }
+
+  // R131: IDX-R131-04 — detect unresolved star source (module dependency preflight).
+  // `export { foo } from './good'; export * from './missing';` — ESM throws
+  // ERR_MODULE_NOT_FOUND even though foo is available. The module is invalid
+  // because it has an unresolvable dependency. We check all star sources
+  // upfront and mark the file invalid if any can't be resolved.
+  // NOTE: named re-export sources are NOT checked here — ESM resolves them
+  // lazily (only when the specific name is imported). Star sources are
+  // resolved eagerly because `export *` must enumerate all exports at link
+  // time. This is consistent with Node.js behavior.
+  for (const [filePath, fileExp] of exportsByFile) {
+    if (fileExp.fileInvalidReason) continue; // already invalid
+    for (const starExp of fileExp.stars) {
+      const starResolvedFile = resolveModulePath(starExp.sourceModule, filePath, knownFiles);
+      if (!starResolvedFile) {
+        fileExp.fileInvalidReason = 'unresolved_reexport_module';
+        break;
       }
     }
   }
@@ -533,11 +572,20 @@ export function rebuildCrossFileCallsEdges(
       return { kind: 'unknown', reason: 'legacy_export_tracking' };
     }
 
+    // R131: IDX-R131-01/03/04 — module-level invalidity check.
+    // If the file has ANY module-level early error (duplicate explicit export
+    // on ANY name, default marker + default binding, unresolved star source),
+    // ESM rejects the entire module. Any import from this file returns
+    // `unknown` regardless of the requested name. This check MUST precede
+    // the name lookup — a collision on `bar` invalidates an import of `foo`.
+    if (fileExp.fileInvalidReason) {
+      return { kind: 'unknown', reason: fileExp.fileInvalidReason };
+    }
+
     // R123: Check named exports first (explicit exports win over star)
-    // R130: IDX-R130-01 — named exports are now stored as an array.
-    // If >1 binding exists for the same exportedName, ESM rejects the module
-    // with SyntaxError. Return `unknown` (invalid_duplicate_export) — terminal
-    // for modern DBs, no edge published.
+    // R130: named exports are stored as an array. The per-name duplicate
+    // check is now redundant (fileInvalidReason covers it globally), but
+    // kept as a defensive guard for direct calls.
     const expBindings = fileExp.named.get(exportedName);
     if (expBindings && expBindings.length > 1) {
       // R130: duplicate explicit export — ESM SyntaxError.
@@ -834,37 +882,36 @@ export function rebuildCrossFileCallsEdges(
                 // R111: Default import: import foo from './b'
                 // The local name (foo) may differ from the exported name (realName).
                 // Use the default export marker to find the correct QN.
-                const defaultQn = defaultExportByFile.get(resolvedFile);
-                if (defaultQn) {
-                  targetQn = defaultQn;
-                  resolution = 'cross_file_import_exact';
-                  confidence = 1.0;
+                // R131: IDX-R131-03 — check fileInvalidReason BEFORE consulting
+                // the default marker. A file with `export default function foo()`
+                // + `export { foo as default }` has both a marker and a binding
+                // for 'default', making it ESM-invalid. The marker would return
+                // a false exact edge without this check.
+                const resolvedFileExp = exportsByFile.get(resolvedFile);
+                if (resolvedFileExp?.fileInvalidReason) {
+                  // R131: module is invalid — terminal when semanticsCurrent.
+                  if (semanticsCurrent) continue;
+                  // legacy DB: fall through to name-based fallback below
                 } else {
-                  // R128: IDX-R128-01/02 — resolve 'default' NOT cs.callee.
-                  // Previously this called resolveExportedSymbol(resolvedFile, cs.callee)
-                  // which used the local import name (e.g. 'foo'). This caused two bugs:
-                  //   - IDX-R128-01: `export { default } from './b'` didn't resolve
-                  //     (the barrel's binding is under 'default', not 'foo')
-                  //   - IDX-R128-02: `import foo from './index'` where index has
-                  //     `export * from './b'` and b has `export default function foo()`
-                  //     plus `export { foo }` — the star traversal found 'foo' as a
-                  //     named export, creating a false edge for an ESM-invalid import.
-                  // The correct ESM semantics: a default import asks for the 'default'
-                  // export of the source module. `export *` does NOT propagate 'default'
-                  // (R127 IDX-R127-02 guard), so the star traversal correctly returns
-                  // missing for 'default'. Explicit `export { default }` or
-                  // `export { foo as default }` are handled by the named-export check.
-                  const defaultResult = resolveExportedSymbol(resolvedFile, 'default', 0, new Set());
-                  if (defaultResult.kind === 'resolved') {
-                    targetQn = defaultResult.qn;
+                  const defaultQn = defaultExportByFile.get(resolvedFile);
+                  if (defaultQn) {
+                    targetQn = defaultQn;
                     resolution = 'cross_file_import_exact';
                     confidence = 1.0;
-                  } else if (defaultResult.kind === 'ambiguous' || defaultResult.kind === 'missing') {
-                    continue; // R124: no fallback for invalid explicit import
-                  } else if (defaultResult.kind === 'unknown') {
-                    // R126: IDX-R125-01 — terminal when semanticsCurrent.
-                    if (semanticsCurrent) continue;
-                    // legacy DB: fall through to name-based fallback
+                  } else {
+                    // R128: IDX-R128-01/02 — resolve 'default' NOT cs.callee.
+                    const defaultResult = resolveExportedSymbol(resolvedFile, 'default', 0, new Set());
+                    if (defaultResult.kind === 'resolved') {
+                      targetQn = defaultResult.qn;
+                      resolution = 'cross_file_import_exact';
+                      confidence = 1.0;
+                    } else if (defaultResult.kind === 'ambiguous' || defaultResult.kind === 'missing') {
+                      continue; // R124: no fallback for invalid explicit import
+                    } else if (defaultResult.kind === 'unknown') {
+                      // R126: IDX-R125-01 — terminal when semanticsCurrent.
+                      if (semanticsCurrent) continue;
+                      // legacy DB: fall through to name-based fallback
+                    }
                   }
                 }
               } else {
