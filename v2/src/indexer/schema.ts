@@ -32,12 +32,20 @@ import type Database from 'better-sqlite3';
  *        detection, default marker vs binding, star source preflight) before
  *        any name lookup (IDX-R131-01/03/04). DBs indexed by R126–R130 have
  *        deduplicated export rows, so they must be re-parsed.
+ *   - 3: R132 — External Star Fix + Default Occurrence Count. The star
+ *        source preflight no longer marks modules invalid for bare/external
+ *        specifiers (IDX-R132-05: `export * from 'node:path'` is valid ESM).
+ *        The extractor now counts all `export default` statements (not just
+ *        the first resolvable one), enabling detection of two direct defaults
+ *        (IDX-R132-06) and identifier-reference default + binding default
+ *        collision (IDX-R132-07). DBs indexed by R131–R132 have markers
+ *        without the count field, so they must be re-parsed.
  *
  * When bumping this constant, also add a migration test that simulates an
  * upgrade from the previous version (delete the relevant rows, keep
  * file_hashes, run incremental, assert crossFileCallsStale=true).
  */
-export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 2;
+export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 3;
 
 /**
  * Tables created by the native indexer. Matches V1's schema so that
@@ -90,13 +98,14 @@ const SCHEMA_SQL = `
     -- had call_sites. Without this flag, hasCallSites()===false is ambiguous.
     call_sites_initialized INTEGER DEFAULT 0,
     -- R126: extractor semantics version. Bumped whenever the extractor's
-    -- semantic output changes in a way that requires re-parsing existing files
-    -- (e.g. R125B fixed "export *" detection — DBs indexed by R122–R125A have
-    -- valid file_hashes but missing star_re_export rows). Incremental mode
-    -- compares this to CURRENT_EXTRACTOR_SEMANTICS_VERSION; a mismatch forces
-    -- a full reindex before any cross-file resolution is published.
+    -- semantic output changes in a way that requires re-parsing existing files.
+    -- Incremental mode compares this to CURRENT_EXTRACTOR_SEMANTICS_VERSION;
+    -- a mismatch forces a full reindex before any cross-file resolution is
+    -- published.
     --   0 = pre-R126 (legacy, never set explicitly)
     --   1 = R126+ (star detection + terminal unknown/unresolved)
+    --   2 = R131+ (module validity lock, no export dedup)
+    --   3 = R132+ (external star fix, default occurrence count)
     extractor_semantics_version INTEGER DEFAULT 0
   );
 

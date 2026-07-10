@@ -271,6 +271,8 @@ export async function extractFromFilesWasm(
     imports: ImportBinding[];
     // R111: default export QN (for default import resolution)
     defaultExportQn: string | null;
+    // R132: count of `export default` statements (for duplicate detection)
+    defaultExportCount: number;
     // R119: export bindings for export-aware resolution
     exports: ExportBinding[];
   }
@@ -402,7 +404,7 @@ export async function extractFromFilesWasm(
         const fileQn = `${project}::${relPath}`;
         const extracted = extractFast(tree.rootNode, project, relPath, fileQn, source.length);
 
-        allExtracts.push({ relPath, nodes: extracted.nodes, edges: extracted.edges, unresolvedCalls: extracted.unresolvedCalls, imports: extracted.imports, defaultExportQn: extracted.defaultExportQn, exports: extracted.exports });
+        allExtracts.push({ relPath, nodes: extracted.nodes, edges: extracted.edges, unresolvedCalls: extracted.unresolvedCalls, imports: extracted.imports, defaultExportQn: extracted.defaultExportQn, defaultExportCount: extracted.defaultExportCount, exports: extracted.exports });
         result.files++;
 
         // R82: Bug 20 fix — ONLY after extractFast succeeds, schedule the mutations.
@@ -573,13 +575,19 @@ export async function extractFromFilesWasm(
     const newImports: ImportBinding[] = [];
     for (const ext of allExtracts) {
       newImports.push(...ext.imports);
-      // R111: store default export QN as a marker row so the resolver can
-      // retrieve it per-file. Use local_name='__default_export__' as a sentinel.
-      if (ext.defaultExportQn) {
+      // R111/R132: store default export QN + count as a marker row.
+      // R132: the count is stored in source_module (previously empty string).
+      // The resolver reads it to detect:
+      //   - count > 1 → duplicate direct defaults (IDX-R132-06)
+      //   - count > 0 + fileExp.named.has('default') → collision (IDX-R132-07)
+      if (ext.defaultExportQn || ext.defaultExportCount > 0) {
         newImports.push({
           localName: '__default_export__',
-          sourceModule: '',
-          importedName: ext.defaultExportQn,
+          // R132: encode the count in source_module for the resolver to read.
+          sourceModule: String(ext.defaultExportCount),
+          // R132: if qn is null (identifier reference), use empty string.
+          // The resolver checks count > 0 for collision detection even without a qn.
+          importedName: ext.defaultExportQn || '',
           importKind: 'default_export',
           line: 0,
           filePath: ext.relPath,

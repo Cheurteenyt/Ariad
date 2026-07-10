@@ -86,10 +86,17 @@ export interface FastFileResult {
   // R111: qualified name of the default export target (if any).
   // For `export default function realName() {}`, this is the QN of realName.
   // For `export default foo;` (re-export of a variable), this is the QN of foo.
-  // Null if the file has no default export.
+  // Null if the file has no default export OR if the default is an identifier
+  // reference that can't be resolved (R132: count is still > 0 in that case).
   // Used by import-aware resolution for `import foo from './b'` where the
   // local name (foo) differs from the exported name (realName).
   defaultExportQn: string | null;
+  // R132: IDX-R132-06/07 — count of `export default` statements in the file.
+  // If > 1, the file has duplicate defaults (ESM SyntaxError). If > 0 and
+  // the exports table also has a binding with exportedName='default', that's
+  // also a collision. This count includes identifier references (`export
+  // default foo`) even when defaultExportQn is null.
+  defaultExportCount: number;
 }
 
 // ── Node type sets (same as worker.ts) ─────────────────────────────────
@@ -350,66 +357,68 @@ export function extractFast(
   // For `import foo from './b'`, the local name (foo) may differ from the
   // exported name (realName). We detect the default export target QN so the
   // resolver can map the local name to the correct symbol.
-  const defaultExportQn = extractDefaultExport(rootNode, qnByNode, fileQn);
+  const { qn: defaultExportQn, count: defaultExportCount } = extractDefaultExport(rootNode, qnByNode, fileQn);
 
-  return { nodes, edges, astNodeCount: 0, unresolvedCalls, imports, defaultExportQn, exports };
+  return { nodes, edges, astNodeCount: 0, unresolvedCalls, imports, defaultExportQn, defaultExportCount, exports };
 }
 
 /**
- * R111: Extract the qualified name of the default export target.
+ * R111/R132: Extract the default export QN and count all `export default` occurrences.
  *
- * Handles `export default function realName() {}` and `export default class Foo {}`.
- * For anonymous defaults (`export default function() {}`), returns the file QN
- * (since there's no named symbol to point to).
- * For `export default foo;` (re-export of a variable), looks up `foo` in qnByNode.
+ * Returns `{ qn, count }`:
+ *   - qn: QN of the FIRST resolvable default (function/class), or null
+ *     (identifier reference or no default)
+ *   - count: total number of `export default` statements (for collision detection)
  *
- * Returns null if the file has no default export.
+ * R132: IDX-R132-06 — count > 1 means duplicate defaults (ESM SyntaxError).
+ * R132: IDX-R132-07 — count > 0 with qn=null means identifier reference;
+ *   the resolver still knows a direct default exists for collision detection
+ *   with `export { foo as default }`.
  */
 function extractDefaultExport(
   rootNode: TSNode,
   qnByNode: Map<number, string>,
   fileQn: string,
-): string | null {
+): { qn: string | null; count: number } {
   const allExports = rootNode.descendantsOfType(EXPORT_TYPES);
+  let count = 0;
+  let qn: string | null = null;
+  let qnFound = false;
+
   for (const exp of allExports) {
-    // Check if this is a default export by looking for 'default' keyword child
     let isDefault = false;
     for (let i = 0; i < exp.childCount; i++) {
       const child = exp.child(i);
-      if (child && child.type === 'default') {
-        isDefault = true;
-        break;
-      }
+      if (child && child.type === 'default') { isDefault = true; break; }
     }
     if (!isDefault) continue;
 
-    // The default export target is typically a function/class declaration or identifier.
-    // Walk children to find the target.
+    // R132: count ALL `export default` statements.
+    count++;
+
+    if (qnFound) continue; // already have a QN from an earlier default
+
     for (let i = 0; i < exp.childCount; i++) {
       const child = exp.child(i);
       if (!child) continue;
       const childType = child.type;
 
-      // export default function realName() {} — function_declaration
-      // export default class Foo {} — class_declaration
       if (FUNCTION_TYPES.includes(childType) || CLASS_TYPES.includes(childType) || METHOD_TYPES.includes(childType)) {
-        const qn = qnByNode.get(child.id);
-        if (qn) return qn;
-        // Function/class wasn't indexed (e.g., anonymous) — use file QN as fallback
-        return fileQn;
+        const resolvedQn = qnByNode.get(child.id);
+        qn = resolvedQn ?? fileQn;
+        qnFound = true;
+        break;
       }
 
       // export default foo; — identifier reference
-      // Look up foo in qnByNode. But qnByNode is keyed by node.id of DECLARATIONS,
-      // not references. So we can't resolve this directly here.
-      // The resolver will handle this case by falling back to name-based lookup.
+      // R132: can't resolve, but count is already incremented. qn stays null
+      // but qnFound is NOT set, so a later function/class default can still set it.
       if (childType === 'identifier') {
-        // Can't resolve without a full symbol table — return null to trigger fallback
-        return null;
+        break;
       }
     }
   }
-  return null;
+  return { qn, count };
 }
 
 /**

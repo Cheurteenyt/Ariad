@@ -192,13 +192,13 @@ describe('R131: Module Validity Lock', () => {
 
   // ── Semantics version bump ──────────────────────────────────────────────
 
-  it('full reindex sets extractor_semantics_version=2 (R131 bump)', async () => {
+  it('full reindex sets extractor_semantics_version=CURRENT (R131/R132 bump)', async () => {
     writeFileSync(join(projectDir, 'a.ts'), `export function foo() { return 1; }\n`);
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     const db = getDb();
     const row = db.prepare('SELECT extractor_semantics_version AS v FROM projects WHERE name = ?').get(projectName) as { v: number };
     expect(row.v).toBe(CURRENT_EXTRACTOR_SEMANTICS_VERSION);
-    expect(row.v).toBe(2);
+    expect(row.v).toBe(3); // R132 bumped from 2 to 3
     db.close();
   });
 });

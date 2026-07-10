@@ -811,12 +811,13 @@ async function indexParallel(
       for (const fileResult of batchResult.results) {
         if (fileResult.error || !fileResult.imports) continue;
         newImports.push(...fileResult.imports);
-        // R111: store default export QN as a marker row
-        if (fileResult.defaultExportQn) {
+        // R111/R132: store default export QN + count as a marker row.
+        // R132: count stored in source_module for collision detection.
+        if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
           newImports.push({
             localName: '__default_export__',
-            sourceModule: '',
-            importedName: fileResult.defaultExportQn,
+            sourceModule: String(fileResult.defaultExportCount),
+            importedName: fileResult.defaultExportQn || '',
             importKind: 'default_export',
             line: 0,
             filePath: fileResult.filePath,
