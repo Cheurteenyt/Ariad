@@ -29,7 +29,7 @@ import { readFileSync, statSync, readdirSync } from 'node:fs';
 import { relative, extname, basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { extractFast, type UnresolvedCallSite, type ImportBinding, type ExportBinding } from './fast-walker.js';
-import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, isCallSitesInitialized, isExtractorSemanticsCurrent } from './cross-file-resolver.js';
+import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized, isExtractorSemanticsCurrent } from './cross-file-resolver.js';
 const require2 = createRequire(import.meta.url);
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -622,21 +622,24 @@ export async function extractFromFilesWasm(
     if (incremental) {
       const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(project) as { c: number }).c;
       const semanticsCurrent = isExtractorSemanticsCurrent(db, project);
-      if (!callSitesInitialized) {
-        // R107: Legacy DB (pre-R106, or R106 full reindex never completed).
-        // call_sites is not authoritative for unchanged files. Skip resolution
-        // to avoid creating an incomplete graph. Caller marks stale=true to
-        // force full reindex which will set call_sites_initialized=1.
-      } else if (!semanticsCurrent) {
+      // R128: MIG-R128-02 — semanticsStale MUST dominate callSitesInitialized.
+      // Previously `!callSitesInitialized` was checked first, which meant a
+      // DB with initialized=false (e.g. after a partial full index that set
+      // initialized=false) would skip the stale-semantics cleanup entirely,
+      // leaving old edges readable. Now we check semanticsStale first.
+      if (!semanticsCurrent) {
         // R127: MIG-R127-03 — stale extractor semantics. The file_hashes are
         // valid but the exports/call_sites/imports rows were produced by an
         // older extractor. Don't run the resolver (it would publish legacy
         // fallback edges). Delete existing cross-file edges and leave
         // crossFileCallsResolved=false so the caller sets stale=true.
-        db.prepare(
-          `DELETE FROM edges WHERE project = ? AND type = 'CALLS'
-             AND properties_json LIKE '%"resolution":"cross_file%'`
-        ).run(project);
+        // R128: use clearCrossFileCallEdges helper.
+        clearCrossFileCallEdges(db, project);
+      } else if (!callSitesInitialized) {
+        // R107: Legacy DB (pre-R106, or R106 full reindex never completed).
+        // call_sites is not authoritative for unchanged files. Skip resolution
+        // to avoid creating an incomplete graph. Caller marks stale=true to
+        // force full reindex which will set call_sites_initialized=1.
       } else if (nodesCount > 0) {
         // R108: initialized=true → call_sites is authoritative (even if empty).
         // Always rebuild: inserts new edges if call_sites has entries, OR
