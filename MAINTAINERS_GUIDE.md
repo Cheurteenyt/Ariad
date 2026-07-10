@@ -22,9 +22,13 @@ The canonical workflow for every change (audit fix, new feature, bug fix):
    README/docs references, and any affected operational docs.
 5. **Commit** — one commit per round (e.g. R56). Message format:
    `docs(v2): 0.12.3 R56 self-audit + MAINTAINERS_GUIDE (3 improvements)`
-6. **Push** — `git push origin v2/r<n>-<short-name> -o merge_request.create
+6. **Push** — `git push gitlab v2/r<n>-<short-name> -o merge_request.create
    -o merge_request.target=main -o merge_request.title="..."` (single line,
    no newlines in push options).
+   **R141+ hybrid workflow**: clone from GitHub mirror (HTTPS), push to GitLab
+   via paramiko SSH wrapper (`scripts/ssh-wrapper.py`). Use `git -C` with
+   absolute paths (bash loses CWD between calls). Verify SHA after push.
+   See `v2/CHANGELOG.md` R141+ entries for the established pattern.
 7. **MR** — GitLab MR with `mr-preflight` job (R54) passes in ~2s. Merge
    → mirror auto → GitHub Actions CI (3 jobs: backend, frontend, quota-report).
 
@@ -193,13 +197,13 @@ When receiving an audit report from another AI (Claude Sonnet 5, etc.):
 - **Extractor semantics version** (`v2/src/indexer/schema.ts` `CURRENT_EXTRACTOR_SEMANTICS_VERSION`):
   bumped whenever the extractor's semantic output changes in a way that invalidates existing
   `file_hashes`. Incremental mode compares the stored version to this constant; a mismatch
-  forces a full reindex before any cross-file resolution is published. Currently 7.
+  forces a full reindex before any cross-file resolution is published. Currently 8.
 - **Backup format version** (`backup.ts`): independent schema version,
   bumped only when the JSON shape changes.
 - **DB migration version**: 4 migrations (initial_schema, optimize_indexes,
   cbm_links_junction_table, human_nodes_fts).
 
-## Invariants (R143+)
+## Invariants (R143+, R153 additions)
 
 These invariants MUST hold for every round. Violations are P1 bugs.
 
@@ -207,6 +211,8 @@ These invariants MUST hold for every round. Violations are P1 bugs.
    output changes in a way that invalidates existing `file_hashes` (new rows,
    changed rows, removed rows), `CURRENT_EXTRACTOR_SEMANTICS_VERSION` MUST be
    bumped. Incremental mode relies on this to force a full reindex.
+   R152/R153 NOTE: policy changes (broken symlink handling, alias history)
+   that don't change the AST output do NOT require a bump.
 
 2. **Partial discovery → no publish, no delete.** If `discovery.complete=false`,
    the indexer MUST NOT `clearProjectData` (full mode) or compute
@@ -233,6 +239,25 @@ These invariants MUST hold for every round. Violations are P1 bugs.
 7. **Workflow Git hybrid.** GitHub HTTPS for clone/history (fast), GitLab SSH
    deploy key for push/MR. Use `git -C <abs>` (bash loses CWD). Verify
    `local SHA = remote SHA` after push.
+
+8. **R153 — Alias history protection.** A broken alias (ENOENT or ELOOP on
+   realpath) that was previously valid (has an entry in `alias_history`)
+   MUST protect its old canonical target from deletion:
+   - file target → excluded from `deletedRelPaths` (incremental)
+   - directory target → subtree-prefix excluded from `deletedRelPaths` (incremental)
+   - any protected path → `hasUncertainty=true` (full mode aborts to preserve graph)
+   The `alias_history` table MUST survive `clearProjectData` (full reindex).
+   Entries for aliases no longer on disk MUST be garbage-collected on the
+   next successful run.
+
+9. **R153 — Warning propagation.** `IndexResult.warnings` MUST be present in
+   ALL return paths that have a discovery result (dry-run, partial discovery,
+   full uncertainty, no-op, deletion-only, main). `discoveryWarnings` MUST be
+   built IMMEDIATELY after discovery succeeds, BEFORE any early return.
+
+10. **R153 — Typed outcome.** `IndexResult.outcome` MUST be set in all return
+    paths. The CLI MUST print warnings BEFORE the outcome banner. The outcome
+    values are: `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `STALE`, `PARTIAL`, `FAILED`.
 
 ## Round history (last 10 rounds)
 

@@ -52,12 +52,18 @@ describe('R151: Broken Symlink Liveness', () => {
 
   // ── OBS-R151-01: Warning samples with paths ───────────────────────────
 
-  it('OBS-R151-01a: broken symlink warning includes relative path (R152)', () => {
-    const source = require('node:fs').readFileSync(
-      join(__dirname, '..', '..', 'src', 'indexer', 'wasm-extractor.ts'), 'utf-8'
-    );
-    expect(source).toContain("recordWarning('ENOENT', relative(realRoot, fullPath))");
-    expect(source).toContain('warningSamples');
+  it('OBS-R151-01a: broken symlink warning includes relative path (R152, R153 runtime)', async () => {
+    // R153 (TEST-R153-03): converted from source inspection to runtime test.
+    writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
+    symlinkSync('/nonexistent', join(projectDir, 'broken.ts'));
+    const r = await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
+    expect(r.errors.length).toBe(0);
+    expect(r.warnings).toBeDefined();
+    expect(r.warnings!.samples.length).toBeGreaterThan(0);
+    const enoentSamples = r.warnings!.samples.filter(s => s.code === 'ENOENT');
+    expect(enoentSamples.length).toBeGreaterThan(0);
+    expect(enoentSamples[0].path).toBe('broken.ts');
+    expect(enoentSamples[0].path.startsWith('/')).toBe(false);
   });
 
   it('OBS-R151-01b: DiscoveryResult includes warningSamples (code inspection)', () => {

@@ -63,7 +63,8 @@ V2 includes a native code indexer (`v2/src/indexer/`) that does NOT require V1:
 - **`fast-walker.ts`** — AST walker for exports, imports, call-sites
 - **`cross-file-resolver.ts`** — matches call-sites to definitions across files
 - **`indexer.ts`** — orchestrator: full/incremental, parallel workers, semantic versioning
-- **`schema.ts`** — SQLite schema, `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 7`
+- **`schema.ts`** — SQLite schema, `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 8`
+  (R144+). R153 added `alias_history` table for historical-target protection.
 - **`worker.ts`** — worker thread for parallel WASM parsing
 
 Key invariants (see [MAINTAINERS_GUIDE.md](MAINTAINERS_GUIDE.md)):
@@ -230,10 +231,11 @@ The project uses `npm install --no-audit --no-fund` (not `npm ci`) because
 
 ### Required checks before merge
 ```bash
-cd v2 && npm run build && npx vitest run     # 355 backend tests
+cd v2 && npm run build && npx vitest run     # see v2/CHANGELOG.md for current test count
 cd ../graph-ui && npx tsc --noEmit && npx vitest run  # 23 frontend tests
 ```
-All 378 tests must pass with 0 regressions. A failed pipeline blocks merge.
+All tests must pass with 0 regressions. A failed pipeline blocks merge.
+See `v2/CHANGELOG.md` for the current test count (R153: 418 indexer tests + 773 project tests).
 
 See `MAINTAINERS_GUIDE.md` for the full workflow (SSH setup, deploy keys,
 branch protection, MR push options, etc.).

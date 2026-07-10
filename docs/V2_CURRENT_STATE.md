@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R145 (2026-07-11).
+> **Authoritative snapshot of the current product state.** Updated R153 (2026-07-11).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -13,6 +13,57 @@ Codebase Memory V2 is a **hybrid** code intelligence system:
 3. **V2 Human Memory Layer** — ADRs, bug notes, refactor plans, conventions, risk assessments. Obsidian vault sync. Graph UI. 7 MCP tools.
 
 Both indexers write to the same V1-compatible SQLite schema, so `CodeGraphReader` reads either transparently.
+
+## R153 — Alias History + Warning Propagation
+
+R153 (round 78) closes the silent historical-target deletion vector introduced
+by R152. When a symlink alias was previously valid and is now broken (ENOENT
+or ELOOP on realpath), the old canonical target's data is preserved:
+
+- **`alias_history` table** (`schema.ts`): persists `alias_path`,
+  `canonical_target`, `target_kind`, `last_seen_success_at` across full
+  reindexes. Garbage-collected entries for aliases no longer on disk.
+- **Discovery tracking** (`wasm-extractor.ts`): `resolvedAliases` (realpath
+  succeeded) and `brokenAliases` (ENOENT/ELOOP) are returned in
+  `DiscoveryResult`.
+- **Indexer protection** (`indexer.ts`): for each broken alias with a
+  history entry, the old canonical target is added to a protected paths
+  set. File targets get exact-match protection; directory targets get
+  subtree-prefix protection. In incremental mode, protected paths are
+  filtered from `deletedRelPaths`. In full mode, any protected path
+  forces `hasUncertainty=true` (abort the full to preserve the graph).
+
+R153 also completes the warning propagation work started in R152:
+
+- **All return paths** now include `warnings` (dry-run, partial discovery,
+  full uncertainty, no-op, deletion-only, main).
+- **All warning codes** now carry a root-relative path (ENOENT_LSTAT,
+  ENOENT_STAT, ENOENT_IDENTITY, ENOENT_REALPATH_DIR added).
+- **Typed `outcome` field** in `IndexResult`: `SUCCESS` |
+  `SUCCESS_WITH_WARNINGS` | `STALE` | `PARTIAL` | `FAILED`. The CLI prints
+  warnings BEFORE the outcome banner, and the banner text reflects the
+  outcome.
+- **Dry-run shows warnings** (R152 gated them with `!opts.dryRun`).
+- **Exact sample count**: `count - samplePaths.length` instead of `count - 5`.
+
+### Known limitations (R153)
+
+- **Alias history cold start**: a v8 DB upgraded to R153 has an empty
+  `alias_history` until the next successful run populates it. The first
+  R153 run with a broken alias won't protect any target (no history yet).
+  This is acceptable — the alias_history is populated on the first
+  successful run and protects subsequent runs.
+- **No cross-process alias_history lock**: concurrent indexers on the same
+  project could race on the alias_history table. This is the same race
+  window as the rest of the SQLite write path (mitigated by `busy_timeout`).
+- **Full publication non-atomic** (carryover P1): a crash after
+  `clearProjectData` but before extraction completes leaves a partial graph.
+  Future round will implement `project.db.next` + atomic rename.
+- **DB dialect divergence** (carryover P1): V1 uses `rel_path`/`sha256`,
+  V2 uses `file_path`/`content_hash`. The README's "shared V1-compatible
+  schema" claim is partially true — `CodeGraphReader` reads both, but a
+  V1 DB cannot be migrated to V2 in-place. Future round will add
+  `GraphDbDialect` detection.
 
 ## Current versions
 

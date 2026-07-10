@@ -6,16 +6,32 @@ V2 is not just a storage layer — it's **proactive and graph-aware**. The agent
 
 ### Graph Freshness Detection
 
-V2 knows if the code graph is stale. It uses two signals:
+V2 knows if the code graph is stale. It uses multiple signals (R143+):
 
-1. **DB file mtime** — the SQLite DB file modification time serves as a proxy for "last indexed" (V1 writes the DB on each index run).
-2. **Git log** — `git log --name-only --since="@<unix_ts>"` finds source files changed since the last index.
+1. **DB state** (authoritative, R143+): `cross_file_calls_stale` column in
+   the `projects` table. If `1`, the graph is STALE regardless of age or git.
+   Also tracks `extractor_semantics_version` (currently 8) — a mismatch with
+   `CURRENT_EXTRACTOR_SEMANTICS_VERSION` forces a full reindex.
+2. **Last successful index** (R144+): `last_successful_index_at` column,
+   separate from `indexed_at` (which updates on any write, including failed
+   attempts). `last_index_attempt_at` and `last_index_error` track failures.
+3. **WAL fingerprint** (R145+): the cache key includes `.db` + `.db-wal` +
+   `.db-shm` mtimeNs+size, so cross-process coherence is maintained when
+   SQLite is in WAL mode.
+4. **DB file mtime** — the SQLite DB file modification time (legacy signal).
+5. **Git log** — `git log --name-only --since="@<unix_ts>"` finds source
+   files changed since the last index.
+
+**DB state dominates age/git heuristics.** A graph marked stale=1 in the DB
+is STALE even if the file mtime is recent and git shows no changes.
 
 The freshness score (0.0 to 1.0) is computed from:
 
 | Condition | Score |
 |---|---|
 | Graph unavailable or empty | 0.0 |
+| DB stale=1 (R143+) | 0.0 |
+| Semantics version mismatch (R126+) | 0.0 |
 | >50 stale files | 0.2 |
 | >10 stale files | 0.4 |
 | >0 stale files | 0.6 |
@@ -24,6 +40,29 @@ The freshness score (0.0 to 1.0) is computed from:
 | Fresh | 1.0 |
 
 Labels: `FRESH` (≥0.9) → `RECENT` (≥0.7) → `STALE` (≥0.5) → `OLD` (≥0.3) → `CRITICAL` (<0.3).
+
+### Discovery warnings (R152+R153)
+
+The indexer surfaces non-blocking discovery issues as warnings in
+`IndexResult.warnings`:
+
+- **`ENOENT`** — broken symlink (target missing on `realpath`).
+- **`ELOOP`** — symlink loop.
+- **`ENOENT_LSTAT`** — file disappeared between `readdir` and `lstat` (TOCTOU).
+- **`ENOENT_STAT`** — target disappeared between `realpath` and `stat` (TOCTOU).
+- **`ENOENT_IDENTITY`** — file disappeared in `fileIdentityKey` (TOCTOU).
+- **`ENOENT_REALPATH_DIR`** — directory disappeared between `lstat` and `realpath` (TOCTOU).
+
+All warning samples carry root-relative paths (R152+R153). The CLI shows up
+to 5 samples per code with "and N more" using the exact hidden count (R153).
+
+### Alias history (R153)
+
+When a symlink alias was previously valid and is now broken, the old
+canonical target's data is preserved via the `alias_history` table. This
+prevents silent historical-target deletion. The protection applies in both
+incremental mode (filtered from `deletedRelPaths`) and full mode (forces
+`hasUncertainty=true`, aborts the full to preserve the graph).
 
 ### `prepare_edit_context` — The Flagship Tool
 
