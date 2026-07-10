@@ -1,5 +1,112 @@
 # Changelog — Codebase Memory V2
 
+## 0.54.9 — Round 132 (2026-07-10) External Star Fix + Default Occurrence Count
+
+**57th round (GPT 5.6 Sol audit R131).** 3 P1 bugs fixed + 1 false positive
+debunked + 2 P2 doc/quality fixes. This round fixes a false-negative regression
+(external stars invalidated), detects invisible default collisions (two direct
+defaults, identifier+binding), and verifies that TypeScript overloads are NOT
+affected (tree-sitter uses `function_signature` for type-only signatures).
+
+**Extractor semantics version bumped to 3.** DBs indexed by R131–R132 have
+default markers without the count field, so they must be re-parsed.
+
+### Bugs fixed (3 P1)
+
+80. **External/bare star specifiers falsely invalidated** (`cross-file-resolver.ts`)
+    — R131's star source preflight called `resolveModulePath()` which only
+    handles `./` and `../` paths. For `export * from 'node:path'` (valid ESM),
+    it returned null and marked the entire module invalid — 0 edges for local
+    exports. Fixed: the preflight now distinguishes relative paths (./ ../)
+    from bare/alias specifiers. Only unresolved RELATIVE paths mark the module
+    invalid. Bare specifiers (packages, node: builtins, tsconfig aliases) are
+    treated as `external_or_alias` — not verified, but not marked invalid.
+    (IDX-R132-05)
+
+81. **Two direct `export default` statements not detected** (`fast-walker.ts`,
+    `cross-file-resolver.ts`) — `extractDefaultExport()` returned the first
+    resolvable default and stopped. A second `export default function b(){}`
+    was invisible. ESM rejects with `SyntaxError: Duplicate export of 'default'`.
+    Fixed: `extractDefaultExport()` now counts ALL `export default` statements
+    and returns `{ qn, count }`. The count is stored in the marker's
+    `source_module` field. The resolver checks `count > 1` independently of
+    the exports table (a file with only `export default` has no exports rows).
+    (IDX-R132-06)
+
+82. **`export default identifier` + `export { foo as default }` not detected**
+    (`fast-walker.ts`, `cross-file-resolver.ts`) — `export default foo`
+    (identifier reference) returned `null` from `extractDefaultExport()`, so
+    no marker was created. The collision with `export { foo as default }`
+    (which creates a binding with `exportedName='default'`) was invisible.
+    Fixed: `extractDefaultExport()` now increments the count even for
+    identifier references (qn stays null, count > 0). The resolver checks
+    `count > 0 && fileExp.named.has('default')` → collision detected.
+    (IDX-R132-07)
+
+### False positive debunked (1 P1)
+
+- **IDX-R132-01 (TypeScript overloads)**: The audit claimed that R131's removed
+  dedup would produce duplicate export rows for TypeScript overload signatures
+  (`export function foo(x: string): string; export function foo(x: number): number;
+  export function foo(x) { return x; }`). **This is a FALSE POSITIVE.** Tree-sitter
+  uses `function_signature` for overload signatures (type-only, no body) and
+  `function_declaration` for the implementation (runtime, has body). The
+  extractor only searches for `function_declaration`, so only 1 row is created.
+  Verified with a test that checks `exportRows.c === 1` and `edges.length === 1`.
+
+### Quality/doc fixes (2 P2)
+
+- **QUAL-R132-02: Wrong comment about named re-exports** (`cross-file-resolver.ts`)
+  — R131's comment said "named re-export sources are NOT checked — ESM resolves
+  them lazily". The audit's Node.js oracle proved this is factually wrong:
+  `export function local() {}; export { missing } from './missing'` fails even
+  if only `local` is imported. Corrected the comment to explain that named
+  re-export source existence checking is deferred to a future round (R132B).
+
+- **DOC-R132-01: Schema comment updated** (`schema.ts`) — The SQL column comment
+  now lists all version numbers (0, 1, 2, 3) instead of just 0 and 1.
+
+### Architecture: `defaultExportByFile` with count
+
+R132 changes `defaultExportByFile` from `Map<string, string>` to
+`Map<string, { qn: string | null; count: number }>`. The count is stored in
+the marker's `source_module` field (previously empty string). The resolver
+uses the count for two checks:
+1. `count > 1` → `invalid_duplicate_export` (two direct defaults)
+2. `count > 0 && fileExp.named.has('default')` → `invalid_duplicate_export` (direct + binding)
+
+The check iterates `defaultExportByFile` independently of `exportsByFile`
+because a file with only `export default` has no rows in the exports table.
+
+### Tests (8 new + 2 updated)
+
+- **IDX-R132-01 debunk**: TypeScript overloads → 1 row, 1 edge (NOT duplicate)
+- **IDX-R132-05**: `export * from 'node:path'` → NOT invalidated, local resolves
+- **IDX-R132-05**: `export * from 'some-package'` → NOT invalidated
+- **IDX-R132-05 positive**: `export * from './missing'` → still invalidated
+- **IDX-R132-06**: two `export default` → 0 edges
+- **IDX-R132-07**: `export default foo` + `export { foo as default }` → 0 edges
+- **Positive control**: single `export default function` → 1 edge
+- **Semantics version**: full reindex sets version=3
+- **R112 test**: marker now exists with empty QN for identifier reference
+- **R131 test**: version check updated from 2 to 3
+
+### Not addressed (deferred per audit recommendation)
+
+- **SEC-CARRY-01** (P0 symlink escape) — separate round, highest priority
+- **DATA-CARRY-01** (full atomic publication) — staging tables / DB.next
+- **IDX-R132-02/03** (named re-export source preflight) — R132B
+- **IDX-R132-04** (transitive star validity) — R132B
+- **IDX-R132-08** (static import validation) — R132B
+- **IDX-CARRY-01/02** (arrow/function expression, multi-declarator) — R134
+- **IDX-CARRY-03** (`export * as default`) — R134
+- **IDX-CARRY-04** (`export default identifier` QN resolution) — R134
+- **PERF-R132-01/02/03/04** (Array per export, resolver cache, module path
+  cache, early stale detection) — R135
+- **QUAL-R132-01** (`invalid` vs `unknown` state model) — future round
+
+### Total: 82 bugs + 11 optimizations + 212 indexer tests across 57 rounds
+
 ## 0.54.8 — Round 131 (2026-07-10) Module Validity Lock + Extractor Semantics Bump
 
 **56th round (GPT 5.6 Sol audit R130).** 4 P1 bugs fixed + 1 P1 test fix. This

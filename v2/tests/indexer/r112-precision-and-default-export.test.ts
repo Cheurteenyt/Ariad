@@ -63,11 +63,15 @@ describe('R112: Precision + Default Export Scope', () => {
 
     const db = getDb();
 
-    // R112: default export marker should NOT exist for b.ts (Phase 1 limitation)
+    // R112/R132: default export marker exists for b.ts but with empty QN
+    // (identifier reference can't be resolved). R132 creates a marker with
+    // count > 0 even when qn is null, for collision detection.
     const marker = db.prepare(
       "SELECT imported_name FROM imports WHERE project = ? AND file_path = ? AND local_name = '__default_export__'"
     ).get(projectName, 'b.ts') as { imported_name: string } | undefined;
-    expect(marker).toBeUndefined();
+    // R132: marker exists but imported_name is empty (unresolved identifier)
+    expect(marker).toBeDefined();
+    expect(marker!.imported_name).toBe('');
 
     const edges = db.prepare(
       `SELECT t.qualified_name AS target_qn, e.properties_json
