@@ -595,19 +595,33 @@ function extractExports(rootNode: TSNode, filePath: string): ExportBinding[] {
     if (!declName) continue;
 
     const declLine = decl.startPosition.row + 1;
-    // Check if we already have this export (avoid duplicates with export { foo })
-    const alreadyExported = exports.some((e: ExportBinding) => e.exportedName === declName);
-    if (!alreadyExported) {
-      exports.push({
-        exportedName: declName,
-        localName: declName,
-        sourceModule: null,
-        importedName: null,
-        exportKind: 'local_named',
-        line: declLine,
-        filePath,
-      });
-    }
+    // R131: IDX-R131-02 — do NOT deduplicate with `alreadyExported`.
+    // Previously, `export function foo() {}` + `export { foo }` would be
+    // deduplicated to a single row, hiding the ESM SyntaxError (Duplicate
+    // export of 'foo'). Now we preserve ALL runtime export occurrences so
+    // the resolver can detect module-level invalidity. The resolver's
+    // fileInvalidReason check (R131) will catch >1 binding for the same
+    // exportedName and return invalid_duplicate_export.
+    //
+    // Note: TypeScript overload signatures are NOT separate exports at
+    // runtime — only the implementation declaration counts. But tree-sitter
+    // parses each `export function foo()` overload as a separate
+    // function_declaration under an export_statement. This could produce
+    // false positives for overload-heavy code. However:
+    //   1. Overloads are type-only (no runtime node), so the resolver's
+    //      fileSymbolIndex lookup would return the implementation's QN.
+    //   2. The duplicate detection only returns `unknown` (terminal, 0 edges),
+    //      which is safe (no false positive edge).
+    //   3. A future round can add overload-aware dedup if needed.
+    exports.push({
+      exportedName: declName,
+      localName: declName,
+      sourceModule: null,
+      importedName: null,
+      exportKind: 'local_named',
+      line: declLine,
+      filePath,
+    });
   }
 
   return exports;

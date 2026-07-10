@@ -1,5 +1,119 @@
 # Changelog — Codebase Memory V2
 
+## 0.54.8 — Round 131 (2026-07-10) Module Validity Lock + Extractor Semantics Bump
+
+**56th round (GPT 5.6 Sol audit R130).** 4 P1 bugs fixed + 1 P1 test fix. This
+round upgrades the Duplicate Export Lock from per-name detection to full
+module-level validity: a duplicate export on ANY name, a default marker +
+default binding collision, or an unresolved star source now invalidates the
+ENTIRE module — 0 edges for ANY import from that module, matching ESM early
+SyntaxError semantics.
+
+**Extractor semantics version bumped to 2.** DBs indexed by R126–R130 have
+deduplicated export rows (the `alreadyExported` check hid duplicates). R131
+removes the dedup so all runtime export occurrences are preserved, enabling
+the resolver to detect module-level invalidity. Incremental mode on a v1 DB
+will detect the stale version and force `crossFileCallsStale=true`.
+
+### Bugs fixed (4 P1)
+
+76. **Duplicate on ANY name doesn't invalidate module** (`cross-file-resolver.ts`)
+    — R130 only checked the REQUESTED name for duplicates. A collision on `bar`
+    didn't prevent an import of `foo` from the same module, even though ESM
+    rejects the entire module with `SyntaxError: Duplicate export of 'bar'`.
+    Fixed: `FileExports` now has a `fileInvalidReason` field, computed during
+    the exports build loop. When ANY exportedName has >1 binding, the entire
+    file is marked invalid. `resolveExportedSymbol` checks `fileInvalidReason`
+    at the START, before any name lookup — a collision on `bar` invalidates
+    an import of `foo`. (IDX-R131-01)
+
+77. **Extractor deduplicates `export function foo() + export { foo }`**
+    (`fast-walker.ts`) — The `alreadyExported` check skipped the direct
+    declaration if `foo` was already in the exports list from an `export { foo }`
+    clause. This hid the ESM SyntaxError (Duplicate export of 'foo' — Node.js
+    confirmed). Fixed: removed the `alreadyExported` dedup. All runtime export
+    occurrences are now preserved. The resolver's `fileInvalidReason` detects
+    the duplicate. **Requires semantics version bump (v1→v2).** (IDX-R131-02)
+
+78. **Default marker + default binding collision not detected**
+    (`cross-file-resolver.ts`) — A direct `export default function foo()` creates
+    a marker in `defaultExportByFile` (stored in `imports`). An explicit
+    `export { foo as default }` or `export { default } from './b'` creates a
+    binding in `exports` with `exportedName='default'`. If both exist, ESM
+    rejects with `SyntaxError: Duplicate export of 'default'`. But the default
+    import path checked `defaultExportByFile.get()` first, returning the marker
+    without checking the exports table. Fixed: the exports build loop now
+    compares `defaultExportByFile.has(filePath)` with `fileExp.named.has('default')`
+    and sets `fileInvalidReason` if both are present. The default import path
+    also checks `fileInvalidReason` before consulting the marker. (IDX-R131-03)
+
+79. **Unresolved star source doesn't invalidate module** (`cross-file-resolver.ts`)
+    — `export { foo } from './good'; export * from './missing';` — ESM throws
+    `ERR_MODULE_NOT_FOUND` even though `foo` is available, because `export *`
+    must enumerate all exports at link time. But the resolver checked named
+    exports first, returned `foo` immediately, and never visited the star
+    source. Fixed: the exports build loop now does a star source preflight —
+    for each `export *`, it checks if the source module can be resolved. If
+    any can't, `fileInvalidReason` is set to `unresolved_reexport_module`.
+    Named re-export sources are NOT checked (ESM resolves them lazily).
+    (IDX-R131-04)
+
+### Test fix (1 P1)
+
+- **TEST-R131-01: Tautological direct declaration test** (`r130-duplicate-export-lock.test.ts`)
+  — The test for `export function foo() {}; export { foo }` incorrectly
+  claimed "ESM actually ALLOWS this" and used `>= 0` (always true). Node.js
+  confirms it's `SyntaxError: Duplicate export of 'foo'`. Fixed: tightened to
+  `expect(edges.length).toBe(0)` with corrected ESM semantics.
+
+### Architecture: `fileInvalidReason` — module-level validity
+
+R130's per-name duplicate check was insufficient because ESM early errors are
+module-level, not name-level. R131 introduces `fileInvalidReason` in
+`FileExports`, computed once during the exports build:
+
+```ts
+interface FileExports {
+  named: Map<string, NamedBinding[]>;
+  stars: Array<{ sourceModule: string }>;
+  fileInvalidReason: UnknownReason | null;  // R131
+}
+```
+
+Three checks set `fileInvalidReason`:
+1. **Duplicate explicit export**: >1 binding for ANY exportedName → `invalid_duplicate_export`
+2. **Default collision**: `defaultExportByFile.has(filePath) && fileExp.named.has('default')` → `invalid_duplicate_export`
+3. **Star source preflight**: any `export *` source unresolvable → `unresolved_reexport_module`
+
+`resolveExportedSymbol` checks `fileInvalidReason` before any name lookup,
+ensuring a module-level early error blocks ALL imports from that module.
+
+### Tests (9 new + 1 tightened)
+
+- **IDX-R131-01**: duplicate on `bar` → import of `foo` also 0 edges
+- **IDX-R131-02**: `export function foo() + export { foo }` → 0 edges
+- **IDX-R131-02 positive**: `export default function foo() + export { foo }` → 1 edge (valid)
+- **IDX-R131-03**: `export default function foo() + export { foo as default }` → 0 edges
+- **IDX-R131-03**: `export default function local() + export { default } from './b'` → 0 edges
+- **IDX-R131-04**: named export + `export * from './missing'` → 0 edges
+- **IDX-R131-04 positive**: named export + `export * from './other'` → 1 edge
+- **Positive control**: valid module → 1 edge
+- **Semantics version**: full reindex sets version=2
+- **R130 direct declaration test**: tightened from `>= 0` to `=== 0`
+
+### Not addressed (deferred per audit recommendation)
+
+- **SEC-CARRY-01** (P0 symlink escape) — separate round, highest priority
+- **DATA-CARRY-01** (full atomic publication) — staging tables / DB.next
+- **IDX-CARRY-01/02** (arrow/function expression, multi-declarator) — R132
+- **IDX-CARRY-03** (`export * as default`) — R132
+- **IDX-CARRY-04** (`export default identifier`) — R132
+- **PERF-R131-01/02/03** (Array per export, resolver cache, early stale) — R133
+- **QUAL-R131-01** (`invalid` vs `unknown` state model) — future round
+- **TEST-R131-05** (workers, .mjs) — R134
+
+### Total: 79 bugs + 11 optimizations + 204 indexer tests across 56 rounds
+
 ## 0.54.7 — Round 130 (2026-07-10) Duplicate Export Lock + Typing/Doc Fixes
 
 **55th round (GPT 5.6 Sol audit R129).** 1 P1 bug fixed + 1 P1 test fix + 2 P2

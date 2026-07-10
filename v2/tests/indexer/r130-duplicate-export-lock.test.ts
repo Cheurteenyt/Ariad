@@ -97,15 +97,14 @@ describe('R130: Duplicate Explicit Export Lock', () => {
     db.close();
   });
 
-  // ── IDX-R130-01: Direct declaration + export clause (same name) ─────────
-  // `export function foo() {}` creates a local_named binding.
-  // `export { foo }` creates ANOTHER local_named binding for the same name.
-  // ESM actually ALLOWS this specific case (declaration + clause is not a
-  // duplicate). But our extractor may or may not produce duplicate rows.
-  // This test documents the current behavior — if duplicates are produced,
-  // 0 edges is the safe choice.
+  // ── IDX-R131-02: Direct declaration + export clause (same name) ─────────
+  // `export function foo() {}` + `export { foo }` — ESM INVALID.
+  // Node.js rejects with SyntaxError: Duplicate export of 'foo'.
+  // R131: the extractor no longer deduplicates (IDX-R131-02 fix), so both
+  // occurrences are preserved. The resolver's fileInvalidReason detects
+  // the duplicate and returns 0 edges.
 
-  it('direct declaration + export clause → behavior documented', async () => {
+  it('direct declaration + export clause → 0 edges (ESM SyntaxError)', async () => {
     writeFileSync(join(projectDir, 'index.ts'),
       `export function foo() { return 1; }\n` +
       `export { foo };\n`
@@ -114,21 +113,10 @@ describe('R130: Duplicate Explicit Export Lock', () => {
     const r = await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     expect(r.errors.length).toBe(0);
     const db = getDb();
-    // Check how many export rows exist for 'foo' in index.ts
-    const exportRows = db.prepare(
-      "SELECT COUNT(*) AS c FROM exports WHERE project = ? AND file_path = ? AND exported_name = ?"
-    ).get(projectName, 'index.ts', 'foo') as { c: number };
-    // The extractor may produce 1 or 2 rows depending on whether
-    // `export function foo()` + `export { foo }` are deduplicated.
-    // If 2 rows → invalid_duplicate_export → 0 edges (safe).
-    // If 1 row → resolved → 1 edge.
-    // This test documents the behavior without asserting a specific outcome,
-    // since the ESM spec allows this pattern but our extractor may not.
-    if (exportRows.c > 1) {
-      expect(getEdges(db, 'foo').length).toBe(0);
-    } else {
-      expect(getEdges(db, 'foo').length).toBeGreaterThanOrEqual(0);
-    }
+    // R131: ESM rejects this as Duplicate export of 'foo'. The extractor
+    // now preserves both occurrences (no alreadyExported dedup). The
+    // resolver's fileInvalidReason detects the duplicate → 0 edges.
+    expect(getEdges(db, 'foo').length).toBe(0);
     db.close();
   });
 

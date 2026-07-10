@@ -10,7 +10,7 @@
 import type Database from 'better-sqlite3';
 
 /**
- * R126: Current extractor semantics version.
+ * R126/R131: Current extractor semantics version.
  *
  * Bumped whenever the extractor's semantic output changes in a way that
  * invalidates existing file_hashes. Incremental mode compares the project's
@@ -24,12 +24,20 @@ import type Database from 'better-sqlite3';
  *        DBs indexed by R122–R125A have valid file_hashes but missing
  *        star_re_export rows, so they must be re-parsed before the new
  *        resolution semantics can be trusted.
+ *   - 2: R131 — Module Validity Lock. The extractor no longer deduplicates
+ *        `export function foo() {}` + `export { foo }` (IDX-R131-02: ESM
+ *        rejects this as Duplicate export). All runtime export occurrences
+ *        are preserved so the resolver can detect module-level invalidity.
+ *        The resolver also now checks fileInvalidReason (global duplicate
+ *        detection, default marker vs binding, star source preflight) before
+ *        any name lookup (IDX-R131-01/03/04). DBs indexed by R126–R130 have
+ *        deduplicated export rows, so they must be re-parsed.
  *
  * When bumping this constant, also add a migration test that simulates an
  * upgrade from the previous version (delete the relevant rows, keep
  * file_hashes, run incremental, assert crossFileCallsStale=true).
  */
-export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 1;
+export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 2;
 
 /**
  * Tables created by the native indexer. Matches V1's schema so that
