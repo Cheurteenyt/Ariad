@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R153 (2026-07-11).
+> **Authoritative snapshot of the current product state.** Updated R154 (2026-07-11).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -46,13 +46,14 @@ R153 also completes the warning propagation work started in R152:
 - **Dry-run shows warnings** (R152 gated them with `!opts.dryRun`).
 - **Exact sample count**: `count - samplePaths.length` instead of `count - 5`.
 
-### Known limitations (R153)
+### Known limitations (R153, closed in R154)
 
-- **Alias history cold start**: a v8 DB upgraded to R153 has an empty
-  `alias_history` until the next successful run populates it. The first
-  R153 run with a broken alias won't protect any target (no history yet).
-  This is acceptable — the alias_history is populated on the first
-  successful run and protects subsequent runs.
+- ~~**Alias history cold start**~~: **CLOSED in R154**. The cold-start lock
+  now fires when `alias_history_initialized=0` OR
+  `discovery_policy_version < CURRENT_DISCOVERY_POLICY_VERSION` AND there
+  are broken aliases AND existing nodes. The lock blocks all deletions
+  (incremental) and forces hasUncertainty (full) until a successful run
+  populates the history and sets the version.
 - **No cross-process alias_history lock**: concurrent indexers on the same
   project could race on the alias_history table. This is the same race
   window as the rest of the SQLite write path (mitigated by `busy_timeout`).
@@ -65,12 +66,48 @@ R153 also completes the warning propagation work started in R152:
   V1 DB cannot be migrated to V2 in-place. Future round will add
   `GraphDbDialect` detection.
 
+## R154 — Bootstrap + Root Identity + Atomic State
+
+R154 (round 79) closes the cold-start, root-identity, contribution, visibility,
+and atomicity gaps identified in the R153 audit:
+
+- **Cold-start lock** (`MIG-R154-01`): added `alias_history_initialized` and
+  `discovery_policy_version` columns to the projects table. The indexer reads
+  the bootstrap state: if not initialized AND broken aliases AND existing nodes,
+  the cold-start lock fires (blocks all deletions, forces full-mode uncertainty).
+  After a successful run, both are set and normal protection applies.
+- **Root fingerprint** (`ALIAS-R154-01`): added `root_fingerprint` column
+  (`canonicalRoot:st_dev`). The UNIQUE constraint is now
+  `(project, root_fingerprint, alias_path)`. Reusing the same project name
+  with a different root does NOT inherit stale history.
+- **Contribution filter** (`ALIAS-R154-02`): only contributive aliases are
+  historized — file aliases require `detectLanguage !== null`; directory
+  aliases require at least one discovered file under the prefix. Non-contributive
+  aliases (txt, FIFO, empty dir) are still tracked as warnings but NOT persisted.
+- **Target visibility check** (`ALIAS-R154-03`): broken aliases with a still-visible
+  target (directly or via another alias) do NOT force stale. Only genuinely
+  absent targets are protected.
+- **Atomicity** (`TX-R154-01`, `TX-R154-02`): try/finally around persistAliasHistory
+  guarantees db.close() even on exception. The residual non-atomicity (graph fresh
+  before history persist) is documented; a full atomic transaction is deferred to R160.
+- **Run-id GC** (`PERF-R154-01`): replaced `NOT IN (?, ?, ...)` dynamic GC
+  with `last_observed_run_id` stamping + `DELETE WHERE run_id != current`.
+  O(1) SQL regardless of alias count.
+- **Outcome contract** (`OUTCOME-R154-01`): `--allow-partial` now ONLY masks
+  PARTIAL. FAILED is always exit 1, STALE is always exit 2.
+- **CHECK constraint** (`SCHEMA-R154-01`): `target_kind` has
+  `CHECK(target_kind IN ('file', 'directory'))`.
+
+`CURRENT_DISCOVERY_POLICY_VERSION = 1` (separate from extractor semantics v8 —
+tracks policy, not AST output).
+
 ## Current versions
 
 | Component | Version | Source of truth |
 |---|---|---|
 | Package | see `v2/package.json` | `v2/package.json` |
 | Extractor semantics | 8 | `v2/src/indexer/schema.ts` `CURRENT_EXTRACTOR_SEMANTICS_VERSION` |
+| Discovery policy | 1 | `v2/src/indexer/schema.ts` `CURRENT_DISCOVERY_POLICY_VERSION` |
 | Bugs fixed | see `v2/CHANGELOG.md` | `v2/CHANGELOG.md` |
 | Indexer tests | see `v2/CHANGELOG.md` | `v2/CHANGELOG.md` |
 | Project tests | see `v2/CHANGELOG.md` | `v2/CHANGELOG.md` |

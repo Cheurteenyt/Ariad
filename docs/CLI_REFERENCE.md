@@ -41,10 +41,11 @@ cbm-v2 index --project my-app --root /path/to/repo --allow-partial
 
 **Warning samples** (R152+R153): all warning codes (`ENOENT`, `ELOOP`, `ENOENT_LSTAT`, `ENOENT_STAT`, `ENOENT_IDENTITY`, `ENOENT_REALPATH_DIR`) carry root-relative paths. Samples are capped at 100. The CLI shows up to 5 samples per code and "and N more" using the exact hidden count.
 
-**Exit codes** (R147+R153):
+**Exit codes** (R147+R153+R154):
 - `0` — success (outcome `SUCCESS` or `SUCCESS_WITH_WARNINGS`)
-- `1` — extraction errors present (outcome `PARTIAL` or `FAILED`), unless `--allow-partial`
-- `2` — stale without errors (outcome `STALE`: semantics mismatch, uncertainty, historical alias broken)
+- `0` — partial extraction errors with `--allow-partial` (outcome `PARTIAL` only; R154: `--allow-partial` does NOT mask `FAILED` or `STALE`)
+- `1` — extraction errors present (outcome `PARTIAL` without `--allow-partial`, or `FAILED`)
+- `2` — stale without errors (outcome `STALE`: semantics mismatch, uncertainty, historical alias broken, cold-start lock)
 
 ### `cbm-v2 init`
 Initialize `.codebase-memory.json` configuration file.

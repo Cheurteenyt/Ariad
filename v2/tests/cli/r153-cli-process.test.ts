@@ -135,4 +135,16 @@ describe('R153: CLI process tests (TEST-R153-04)', () => {
     expect(enoentLine).toBeDefined();
     expect(enoentLine!).toContain('and 5 more');
   });
+
+  // ── R154 (OUTCOME-R154-01): --allow-partial does NOT mask FAILED ────
+
+  it('TEST-R154-01a: missing root + --allow-partial → exit 1 (FAILED not masked)', async () => {
+    const result = await runCli(
+      ['index', '--project', projectName, '--root', join(tmpDir, 'does-not-exist'), '--allow-partial'],
+      { XDG_CACHE_HOME: cacheDir },
+    );
+    // R154: --allow-partial only masks PARTIAL, not FAILED. Missing root = FAILED = exit 1.
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('Discovery root error');
+  });
 });

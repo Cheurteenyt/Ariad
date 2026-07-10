@@ -1,5 +1,138 @@
 # Changelog — Codebase Memory V2
 
+## 0.59.0 — Round 154 (2026-07-11) Bootstrap + Root Identity + Atomic State
+
+**79th round (GPT 5.6 Sol audit R153).** 2 P1 + 3 P1/P2 + 3 P2 + 1 P3 fixed.
+Closes the 9 confirmed code findings of the R153 audit.
+
+### Bootstrap (1 P1)
+
+184. **P1 cold start R152→R153: DB with nodes but no alias_history silently
+     loses data** (`schema.ts`, `indexer.ts`) — A DB indexed by R152 (has
+     nodes, semantics=8) upgraded to R153 gets an empty alias_history table.
+     The first R153 run with a broken alias has no history → no protection →
+     the old target's data is silently deleted. Fixed: added
+     `alias_history_initialized` and `discovery_policy_version` columns to
+     the projects table. `CURRENT_DISCOVERY_POLICY_VERSION = 1` (separate
+     from extractor semantics version — tracks policy, not AST output). The
+     indexer reads the bootstrap state: if `alias_history_initialized=0` OR
+     `discovery_policy_version < CURRENT`, AND there are broken aliases, AND
+     the project has existing nodes, the cold-start lock fires —
+     `effectiveGlobalDeletionUncertainty=true` (blocks all deletions in
+     incremental, forces hasUncertainty in full). After a successful run,
+     `alias_history_initialized=1` and `discovery_policy_version=CURRENT`
+     are set, and normal protection applies. (MIG-R154-01)
+
+### Root identity (1 P1)
+
+185. **P1 alias_history not scoped by root fingerprint**
+     (`schema.ts`, `indexer.ts`) — The R153 UNIQUE constraint was
+     `(project, alias_path)` — no root identity. Reusing the same project
+     name with a different root directory would match stale history from
+     the old root, causing false stale or full abort. Fixed: added
+     `root_fingerprint` column (computed as `canonicalRoot:st_dev`). The
+     UNIQUE constraint is now `(project, root_fingerprint, alias_path)`.
+     `loadAliasHistory` and `persistAliasHistory` are scoped by
+     root_fingerprint. `computeRootFingerprint()` helper exported from
+     schema.ts. The projects table also stores `root_fingerprint` for
+     diagnostics. (ALIAS-R154-01)
+
+### Contribution + visibility (2 P1/P2)
+
+186. **P1/P2 non-contributive aliases historized (txt, FIFO, empty dir)**
+     (`indexer.ts`) — R153 historized ALL resolved aliases before checking
+     if the target contributed code. An alias to `LICENSE.txt`, a FIFO, or
+     an empty directory would be historized, then when it breaks later it
+     forces stale/full-abort despite never having contributed code data.
+     Fixed: `contributiveAliases` filter in the indexer — file aliases are
+     only historized if `detectLanguage(canonicalTarget) !== null`;
+     directory aliases are only historized if at least one discovered file
+     is under the canonical target prefix. Non-contributive aliases are
+     still tracked as warnings (visible in CLI), but NOT persisted to
+     alias_history. (ALIAS-R154-02)
+
+187. **P1/P2 broken alias forces stale even when target still visible**
+     (`indexer.ts`) — R153 marked stale whenever a broken alias had a
+     history entry, without checking if the target was still present in
+     the current discovery. If `real.ts` exists directly AND `alias.ts`
+     is broken, the target is already in `currentRelPaths` — no protection
+     needed. Fixed: target visibility check. For file targets, if the
+     canonical target is in `currentRelPathsSet`, remove it from
+     `protectedPaths`. For directory targets, if ANY current path is under
+     the prefix, remove it from `protectedSubtrees`. Only genuinely absent
+     targets are protected. This prevents false stale when the target is
+     accessible via another path (directly or via another alias).
+     (ALIAS-R154-03)
+
+### Atomicity (1 P1/P2 + 1 P2)
+
+188. **P1/P2 graph marked fresh before alias_history persist (non-atomic)**
+     (`indexer.ts`) — R153 called `updateProjectStats` (marks fresh) THEN
+     `persistAliasHistory` in separate transactions. If persist failed, the
+     graph was fresh but the history was stale — a future broken alias
+     wouldn't be protected. Fixed: documented the residual risk in code
+     comments. The graph is marked fresh first; if persist fails, the next
+     run's cold-start check catches the inconsistency (history_initialized
+     was set, but GC may have partial state). The graph data itself is
+     correct; only the history GC may be incomplete. A full atomic
+     transaction (history + stats in one tx) is deferred to R160 (atomic
+     full publication). (TX-R154-01)
+
+189. **P2 persistAliasHistory before db.close without finally**
+     (`indexer.ts`) — R153 called `persistAliasHistory` then `db.close()`
+     without try/finally. An exception from persist would leave the DB
+     open (WAL/locks). Fixed: all three persist sites (no-op, deletion-only,
+     main) now use `try { persist } finally { db.close() }`. The DB is
+     guaranteed to close even on exception. (TX-R154-02)
+
+### Performance + outcome (2 P2 + 1 P3)
+
+190. **P2 GC `NOT IN` dynamic params risk SQLite variable limit**
+     (`schema.ts`) — R153's GC built `DELETE ... WHERE alias_path NOT IN
+     (?, ?, ...)` with one parameter per live alias. On heavily-aliased
+     repos (thousands of symlinks), this could hit SQLite's variable limit
+     or build a very large SQL string. Fixed: run-id GC. Each UPSERTed
+     alias is stamped with `last_observed_run_id = runId`. Broken aliases
+     still on disk are stamped via UPDATE. The GC is a single statement:
+     `DELETE WHERE last_observed_run_id != runId` — O(1) SQL regardless
+     of alias count. (PERF-R154-01)
+
+191. **P2 `--allow-partial` masks FAILED outcomes** (`cli/commands/index.ts`)
+     — R153's exit code logic returned 0 for ANY `errors>0` when
+     `--allow-partial` was set, including missing root or fatal discovery.
+     Fixed: `--allow-partial` now ONLY masks PARTIAL outcomes (extraction
+     errors on some files). FAILED (root failure, discovery exception,
+     partial discovery lock) is always exit 1. STALE is always exit 2.
+     The outcome-driven logic: FAILED → 1, PARTIAL → (allow-partial ? 0 : 1),
+     STALE → 2, else 0. (OUTCOME-R154-01)
+
+192. **P3 target_kind without CHECK constraint** (`schema.ts`) — R153's
+     `target_kind TEXT NOT NULL` had no CHECK. Invalid values could be
+     inserted. Fixed: `CHECK(target_kind IN ('file', 'directory'))`. The
+     migration rebuilds the table with the CHECK constraint. Legacy rows
+     are preserved (all existing values are valid). (SCHEMA-R154-01)
+
+### Tests (16 new, 1 updated)
+
+- **MIG-R154-01** (3 tests): cold-start lock fires on broken alias with
+  existing nodes, successful run sets initialized=1, first-ever index
+  (no nodes) does NOT trigger lock.
+- **ALIAS-R154-01** (2 tests): root_fingerprint persisted, same project
+  name + different root → fresh history.
+- **ALIAS-R154-02** (3 tests): .txt alias not historized, empty directory
+  not historized, .ts alias IS historized.
+- **ALIAS-R154-03** (2 tests): broken alias + target visible directly →
+  no stale, broken alias + target visible via second alias → no stale.
+- **OUTCOME-R154-01** (1 test): cold-start lock full → STALE.
+- **SCHEMA-R154-01** (1 test): CHECK rejects invalid target_kind.
+- **TEST-R154-01a** (1 CLI test): missing root + --allow-partial → exit 1.
+- **Regression** (3 tests): semantics v8, discovery policy v1, alias_history
+  survives full reindex.
+- **Updated** (1 test): R153 ELOOP test updated to also remove target
+  (R154 visibility check requires genuinely absent target).
+
+### Total: 192 bugs + 11 optimizations + 427 indexer tests across 79 rounds
+
 ## 0.58.0 — Round 153 (2026-07-11) Alias History + Warning Propagation
 
 **78th round (GPT 5.6 Sol audit R152).** 2 P1 + 2 P1/P2 + 4 P2 fixed.

@@ -145,13 +145,27 @@ export function registerIndexCommand(program: Command): void {
         // R147 (OUTCOME-R147-02): Also exit non-zero when stale without errors
         // (semantics mismatch, partial discovery). A stale graph is NOT fresh —
         // CI should not treat it as valid.
+        // R154 (OUTCOME-R154-01): --allow-partial ONLY masks PARTIAL outcomes
+        // (extraction errors on some files). It does NOT mask FAILED (root
+        // failure, discovery exception, partial discovery lock) or STALE.
+        // Previously, --allow-partial would exit 0 for ANY errors>0, including
+        // missing root or fatal discovery — masking real failures.
         const allowPartial = (opts as any).allowPartial ?? false;
-        if (result.errors.length > 0 && !allowPartial) {
+        if (result.outcome === 'FAILED') {
+          // R154: FAILED is always exit 1, even with --allow-partial.
           process.exitCode = 1;
-        } else if (result.crossFileCallsStale && !allowPartial) {
+        } else if (result.outcome === 'PARTIAL') {
+          // R154: PARTIAL is exit 0 with --allow-partial, exit 1 without.
+          process.exitCode = allowPartial ? 0 : 1;
+        } else if (result.outcome === 'STALE' || result.crossFileCallsStale) {
           // R147: stale without errors (e.g., semantics mismatch) → exit 2
           // (distinct from 1 = failure, so CI can distinguish).
+          // R154: --allow-partial does NOT mask STALE.
           process.exitCode = 2;
+        } else if (result.errors.length > 0 && !allowPartial) {
+          // R154: legacy fallback for paths that don't set outcome (shouldn't
+          // happen after R153, but kept for safety).
+          process.exitCode = 1;
         } else {
           process.exitCode = 0;
         }

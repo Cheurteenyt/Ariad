@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
 import { indexProjectWasm } from '../../src/indexer/indexer.js';
-import { CURRENT_EXTRACTOR_SEMANTICS_VERSION, loadAliasHistory } from '../../src/indexer/schema.js';
+import { CURRENT_EXTRACTOR_SEMANTICS_VERSION, loadAliasHistory, computeRootFingerprint } from '../../src/indexer/schema.js';
 import { defaultCodeDbPath } from '../../src/bridge/sqlite-ro.js';
 import { discoverSourceFilesStructured } from '../../src/indexer/wasm-extractor.js';
 
@@ -39,7 +39,7 @@ describe('R153: Alias History + Historical Target Safety', () => {
     // Verify alias_history was populated.
     const dbPath = defaultCodeDbPath(projectName);
     const db = new Database(dbPath, { readonly: true });
-    const history = loadAliasHistory(db, projectName);
+    const history = loadAliasHistory(db, projectName, computeRootFingerprint(projectDir));
     db.close();
     expect(history.size).toBe(1);
     const entry = history.get('alias.ts');
@@ -107,7 +107,7 @@ describe('R153: Alias History + Historical Target Safety', () => {
     // Verify alias_history has target_kind=directory.
     const dbPath = defaultCodeDbPath(projectName);
     const db = new Database(dbPath, { readonly: true });
-    const history = loadAliasHistory(db, projectName);
+    const history = loadAliasHistory(db, projectName, computeRootFingerprint(projectDir));
     db.close();
     const entry = history.get('aliasdir');
     expect(entry).toBeDefined();
@@ -135,11 +135,15 @@ describe('R153: Alias History + Historical Target Safety', () => {
     symlinkSync(join(projectDir, 'real.ts'), join(projectDir, 'alias.ts'));
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
 
-    // Run 2: replace alias with a loop.
+    // Run 2: replace alias with a loop AND remove the target.
+    // R154 (ALIAS-R154-03): if the target is still visible, no protection
+    // is needed. To test the historical protection, we must remove the target
+    // so it's genuinely absent from the current discovery.
+    unlinkSync(join(projectDir, 'real.ts'));
     unlinkSync(join(projectDir, 'alias.ts'));
     symlinkSync(join(projectDir, 'alias.ts'), join(projectDir, 'alias.ts')); // self-loop
     const r2 = await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: true, useWasm: true, workers: 0 });
-    // R153: ELOOP on a historically-valid alias → hasUncertainty → stale.
+    // R153+R154: ELOOP on a historically-valid alias, target absent → hasUncertainty → stale.
     expect(r2.crossFileCallsStale).toBe(true);
     expect(r2.errors.length).toBe(0);
 
@@ -285,7 +289,7 @@ describe('R153: Alias History + Historical Target Safety', () => {
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     const dbPath = defaultCodeDbPath(projectName);
     const db = new Database(dbPath, { readonly: true });
-    const history = loadAliasHistory(db, projectName);
+    const history = loadAliasHistory(db, projectName, computeRootFingerprint(projectDir));
     db.close();
     expect(history.size).toBe(1);
     expect(history.get('alias.ts')).toBeDefined();
@@ -300,7 +304,7 @@ describe('R153: Alias History + Historical Target Safety', () => {
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: true, useWasm: true, workers: 0 });
     const dbPath = defaultCodeDbPath(projectName);
     const db = new Database(dbPath, { readonly: true });
-    const history = loadAliasHistory(db, projectName);
+    const history = loadAliasHistory(db, projectName, computeRootFingerprint(projectDir));
     db.close();
     // The removed alias should be garbage-collected.
     expect(history.has('alias.ts')).toBe(false);
