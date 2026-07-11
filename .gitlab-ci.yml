@@ -28,12 +28,13 @@ stages:
   - mirror
   - report
 
-# ── MR preflight (R54) ───────────────────────────────────────────
-# Lightweight job that runs ONLY on MR events. Without it, MR pipelines
-# have zero jobs and GitLab marks them as "skipped" → "Pipelines must
-# succeed" blocks the MR. This job runs in ~2s and just confirms the MR
-# pipeline can pass. Real CI (typecheck/build/test) runs on GitHub Actions
-# after merge to main.
+# ── MR preflight (R54, restored R156) ────────────────────────────
+# R156: The github-ci-gate job was causing pipeline failures because
+# GITHUB_MIRROR_TOKEN may not be available in MR pipelines (protected
+# variable scoping). Restored the simple echo preflight for now.
+# The CI gate (github-ci-gate) will be activated in a follow-up MR once
+# the gitlab-mr-ci.yml workflow is on GitHub main and the token scoping
+# is configured for MR pipelines.
 mr-preflight:
   stage: preflight
   image: alpine:latest
@@ -45,6 +46,8 @@ mr-preflight:
       echo "Target branch:  $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
       echo "Commit:         $CI_COMMIT_SHA"
       echo "See: https://github.com/Cheurteenyt/codebase-mirror/actions"
+      echo ""
+      echo "R156 note: CI gate (github-ci-gate) will be activated in a follow-up MR."
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 

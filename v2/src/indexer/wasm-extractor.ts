@@ -731,6 +731,14 @@ export function discoverSourceFilesStructured(
         const relTarget = relative(realRoot, realTarget);
 
         if (realStat.isDirectory()) {
+          // R156 (ALIAS-R156-01): Record the directory alias BEFORE the
+          // visitedDirs.has duplicate check. R155 put the push AFTER the
+          // check, so if two aliases (aliasA, aliasB) pointed to the same
+          // directory, aliasB was skipped as duplicate and never historized.
+          // When aliasB later broke and the target disappeared, no history
+          // protected the old subtree. R156 records ALL aliases regardless
+          // of traversal dedup — history and traversal are separate concerns.
+          resolvedAliases.push({ aliasPath: relAlias, canonicalTarget: relTarget, targetKind: 'directory' });
           // R141 (IDX-R141-02): Push the CANONICAL realTarget, not fullPath.
           // This makes the alias transparent: the discovery proceeds from
           // the real path, so all descendant files are persisted with
@@ -741,10 +749,6 @@ export function discoverSourceFilesStructured(
           }
           visitedDirs.add(realTarget);
           stack.push(realTarget);
-          // R155 (ALIAS-R155-01): record directory alias AFTER confirming it's
-          // a real directory. The indexer's contribution filter will check if
-          // any files were discovered under it before persisting.
-          resolvedAliases.push({ aliasPath: relAlias, canonicalTarget: relTarget, targetKind: 'directory' });
         } else if (realStat.isFile()) {
           // R142 (SEC-R142-01): Only treat REGULAR files as candidates.
           // Previously the `else` branch of isDirectory() accepted ALL

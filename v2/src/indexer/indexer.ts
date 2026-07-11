@@ -175,6 +175,24 @@ export interface IndexResult {
    * user sees the outcome first, then the diagnostic detail).
    */
   outcome?: 'SUCCESS' | 'SUCCESS_WITH_WARNINGS' | 'STALE' | 'PARTIAL' | 'FAILED';
+  /**
+   * R156 (OBS-R156-01): Structured stale reason.
+   */
+  staleReason?: {
+    code:
+      | 'DISCOVERY_UNCERTAIN'
+      | 'HISTORICAL_ALIAS_BROKEN'
+      | 'COLD_START_LOCK'
+      | 'SEMANTICS_MISMATCH'
+      | 'PREVIOUSLY_STALE'
+      | 'PERSIST_FAILURE';
+    message: string;
+    paths: string[];
+  };
+  /**
+   * R156 (OBS-R156-01): Recovery recommendation.
+   */
+  recovery?: 'retry_incremental' | 'fix_filesystem' | 'full_reindex' | 'none';
 }
 
 /**
@@ -684,14 +702,29 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasEffectiveHistoricalBrokenAliases;
   if (!opts.incremental && hasUncertainty) {
     db.close();
-    const aliasPart = hasEffectiveHistoricalBrokenAliases
-      ? `, ${effectiveHistoricalBrokenAliases.length} historically-valid alias(es) now broken`
-      : '';
-    const coldStartPart = coldStartLock
-      ? `, cold-start lock (alias_history not yet initialized — run a successful full index first)`
-      : '';
-    const uncertainMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent${aliasPart}${coldStartPart}. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
-    markProjectStalePreservingGraph(dbPath, opts.project, uncertainMsg);
+    // R156 (OBS-R156-01 + AVAIL-R156-01): Build structured staleReason + recovery.
+    let staleCode: 'DISCOVERY_UNCERTAIN' | 'HISTORICAL_ALIAS_BROKEN' | 'COLD_START_LOCK';
+    let staleMsg: string;
+    let recovery: 'fix_filesystem' | 'retry_incremental';
+    const brokenPaths: string[] = [];
+    if (coldStartLock) {
+      staleCode = 'COLD_START_LOCK';
+      for (const a of discovery.brokenAliases) brokenPaths.push(a.aliasPath);
+      staleMsg = `Cold-start lock: alias_history not yet initialized and ${discovery.brokenAliases.length} broken alias(es) present. Fix or remove the broken symlinks (see paths below), then rerun. The full index is blocked until the broken aliases are resolved or the history is populated by a successful run without broken aliases.`;
+      recovery = 'fix_filesystem';
+    } else if (hasEffectiveHistoricalBrokenAliases) {
+      staleCode = 'HISTORICAL_ALIAS_BROKEN';
+      for (const a of effectiveHistoricalBrokenAliases) brokenPaths.push(a.aliasPath);
+      staleMsg = `${effectiveHistoricalBrokenAliases.length} historically-valid alias(es) now broken with target absent. Full index aborted to preserve existing graph. Fix or restore the broken alias targets, then rerun.`;
+      recovery = 'fix_filesystem';
+    } else {
+      staleCode = 'DISCOVERY_UNCERTAIN';
+      for (const p of discovery.uncertainPaths) brokenPaths.push(p);
+      for (const s of discovery.uncertainSubtrees) brokenPaths.push(s);
+      staleMsg = `Discovery uncertain: ${discovery.uncertainPaths.length} path(s), ${discovery.uncertainSubtrees.length} subtree(s) temporarily absent. Full index aborted to preserve existing graph. Retry when filesystem is stable.`;
+      recovery = 'retry_incremental';
+    }
+    markProjectStalePreservingGraph(dbPath, opts.project, staleMsg);
     return {
       dbPath,
       durationMs: Date.now() - start,
@@ -699,11 +732,6 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       edges: 0,
       files: 0,
       skipped: 0,
-      // R155 (OUTCOME-R155-01): STALE must NOT carry errors. The contract is
-      // errors>0 → FAILED. R154 put the uncertainty message in errors[] AND
-      // set outcome='STALE' — violating the contract. R155 uses errors=[]
-      // and outcome='STALE'. The human-readable reason is in crossFileCallsStale
-      // (true) + the DB's last_index_error (set by markProjectStalePreservingGraph).
       errors: [],
       languages: new Set(),
       parallel: false,
@@ -711,6 +739,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       crossFileCallsStale: true,
       warnings: discoveryWarnings,
       outcome: 'STALE',
+      staleReason: { code: staleCode, message: staleMsg, paths: brokenPaths },
+      recovery,
     };
   }
 
@@ -1105,6 +1135,23 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     };
   }
 
+  // R156 (TX-R156-01): Pre-mark stale=1 BEFORE extraction (the main path
+  // that actually mutates the graph). The no-op and deletion-only fast paths
+  // returned above — they don't need this. If the final atomic commit fails,
+  // the pre-marked stale=1 remains truthfully set: the graph IS stale
+  // (extraction committed in its own transaction, but the projects row can't
+  // rollback to stale=0). If the commit succeeds, it clears stale=0 atomically.
+  {
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE projects SET
+        cross_file_calls_stale = 1,
+        last_index_attempt_at = ?,
+        last_index_error = 'Index publication in progress'
+      WHERE name = ?
+    `).run(now, opts.project);
+  }
+
   if (!useParallel) {
     // Single-thread: main thread needs the grammars
     await preloadGrammars(allLangs);
@@ -1210,7 +1257,9 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // match the new file content on disk (the file may have been modified
   // during the atomic save). The graph must NOT be certified as fresh.
   // R148: reuse hasUncertainty computed earlier (before clearProjectData).
-  const crossFileStale = opts.incremental
+  // R156 (TX-R156-01): crossFileStale is now `let` — the catch block can
+  // override it to true if the final commit fails.
+  let crossFileStale = opts.incremental
     ? semanticsStale || incrementalHadErrors || hasUncertainty
         ? true
         : (result.crossFileCallsResolved ?? false)
@@ -1269,6 +1318,25 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         callSitesInitialized, semanticsVersion,
         rootFingerprint, runId, contributiveAliases, liveAliasPaths,
       );
+    } catch (commitError) {
+      // R156 (TX-R156-01): The atomic commit failed. The graph has already
+      // been mutated. The pre-marked stale=1 is still in the DB — the graph
+      // is truthfully stale. Best-effort persist the error message.
+      const errMsg = `Index publication failed: ${commitError instanceof Error ? commitError.message : String(commitError)}`;
+      try {
+        const now = new Date().toISOString();
+        db.prepare(`
+          UPDATE projects SET
+            cross_file_calls_stale = 1,
+            last_index_attempt_at = ?,
+            last_index_error = ?
+          WHERE name = ?
+        `).run(now, errMsg, opts.project);
+      } catch {
+        // Best-effort — if even this fails, the pre-marked stale=1 remains.
+      }
+      crossFileStale = true;
+      result.errors.push({ file: opts.rootPath, error: errMsg });
     } finally {
       try { db.close(); } catch { /* ignore close error */ }
     }
@@ -1284,6 +1352,12 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     crossFileCallsStale: crossFileStale,
     warnings: discoveryWarnings,
     outcome: computeOutcome(result.errors, crossFileStale, discoveryWarnings, false),
+    staleReason: crossFileStale && indexError !== null
+      ? { code: 'SEMANTICS_MISMATCH', message: indexError, paths: [] }
+      : undefined,
+    recovery: crossFileStale
+      ? (semanticsStale ? 'full_reindex' : 'retry_incremental')
+      : undefined,
   };
 }
 

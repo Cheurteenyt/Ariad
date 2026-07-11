@@ -1,0 +1,153 @@
+# R156 (CI-FLOW-R156-01): Sync graph-ui/* changes from GitHub to GitLab.
+#
+# This workflow is triggered AFTER a successful `ci.yml` run on a graph-ui
+# branch (branches matching `graph-ui/**`). It:
+#   1. Validates the source branch name (must start with `graph-ui/`).
+#   2. Pushes the branch to GitLab (under the same name).
+#   3. Creates or updates a GitLab MR from this branch → main.
+#
+# Security model:
+#   - This is a `workflow_run` trigger (NOT `pull_request`), so it runs in
+#     the context of the DEFAULT branch (main) with the repo's secrets. This
+#     is required because `pull_request` workflows don't have access to
+#     secrets that aren't explicitly exposed.
+#   - The workflow explicitly checks that the source branch is `graph-ui/**`
+#     before doing anything.
+#   - The `GITLAB_MIRROR_TOKEN` secret is a GitLab PAT with `api` scope,
+#     used to push branches and create MRs.
+#   - Concurrency: only the latest run per branch is kept (cancel-in-progress).
+name: Sync graph-ui to GitLab
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches:
+      - 'graph-ui/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-graph-ui-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # Only run if the upstream CI workflow succeeded.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate source branch
+        id: branch
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # R156 security: only graph-ui/** branches are allowed.
+          if [[ ! "$BRANCH" =~ ^graph-ui/ ]]; then
+            echo "Source branch '$BRANCH' is not a graph-ui/* branch. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Branch: $BRANCH"
+
+      - name: Checkout source SHA
+        if: steps.branch.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Configure git
+        if: steps.branch.outputs.skip != 'true'
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+        run: |
+          # R156: use http.extraHeader for auth (token never appears in URL).
+          git config --global http.extraHeader "Authorization: basic $(printf '%s' "oauth2:${GITLAB_TOKEN}" | base64 -w0)"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Push branch to GitLab
+        if: steps.branch.outputs.skip != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          GL_URL="https://gitlab.com/cheurteen1/codebase-memory-V2.git"
+          echo "Pushing $SHA to GitLab branch '$BRANCH'..."
+          git push "$GL_URL" "$SHA:refs/heads/$BRANCH" --force
+
+      - name: Create or update GitLab MR
+        if: steps.branch.outputs.skip != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+          GH_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          GL_API="https://gitlab.com/api/v4/projects/cheurteen1%2Fcodebase-memory-V2"
+
+          # Check if an MR already exists for this branch.
+          EXISTING_MR=$(
+            curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              "$GL_API/merge_requests?source_branch=$BRANCH&state=opened" \
+              | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          if isinstance(data, list) and len(data) > 0:
+              print(data[0]["iid"])
+          ' 2>/dev/null || true
+          )
+
+          BODY="GitHub PR sync for \`$BRANCH\` (SHA \`$SHA\`).
+
+          This MR was created automatically by the [sync-graph-ui-to-gitlab](https://github.com/Cheurteenyt/codebase-mirror/actions/workflows/sync-graph-ui-to-gitlab.yml) workflow after the upstream GitHub CI succeeded.
+
+          Source CI run: $GH_RUN_URL
+
+          ---
+
+          \`\`\`diff
+          + This branch was validated by GitHub CI before being synced.
+          \`\`\`"
+
+          if [ -n "$EXISTING_MR" ]; then
+            echo "MR ! $EXISTING_MR already exists for $BRANCH. Updating description..."
+            curl -s --fail-with-body --request PUT \
+              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$(python3 -c "import json,sys; print(json.dumps({'description': sys.argv[1]}))" "$BODY")" \
+              "$GL_API/merge_requests/$EXISTING_MR" > /dev/null
+            echo "Updated MR ! $EXISTING_MR"
+          else
+            echo "Creating new MR for $BRANCH..."
+            RESULT=$(
+              curl -s --fail-with-body --request POST \
+                --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+                --header "Content-Type: application/json" \
+                --data "$(python3 -c '
+          import json, sys
+          print(json.dumps({
+              "source_branch": sys.argv[1],
+              "target_branch": "main",
+              "title": "graph-ui: " + sys.argv[1].split("/", 1)[1] if "/" in sys.argv[1] else sys.argv[1],
+              "description": sys.argv[2],
+              "remove_source_branch": False,
+          }))
+          ' "$BRANCH" "$BODY")" \
+                "$GL_API/merge_requests"
+            )
+            MR_IID=$(printf '%s' "$RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("iid","?"))' 2>/dev/null || echo "?")
+            echo "Created MR ! $MR_IID"
+          fi
