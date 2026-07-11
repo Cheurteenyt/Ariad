@@ -269,6 +269,14 @@ describe('R158: Publication Orchestrator + Unified Classifier', () => {
     //   - recovery = 'full_reindex'
     //   - the user must run a full reindex under the new root
     //
+    // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): R161 set
+    // `semanticsStale=true` and continued the pipeline — the deletion-only
+    // cleanup transaction still ran, deleting root A's b.ts nodes/edges/
+    // hashes despite the run being STALE. R162 returns STALE IMMEDIATELY
+    // via an early return BEFORE any mutation. The deletion-only cleanup
+    // transaction does NOT run; the graph (including root A's b.ts data)
+    // is preserved.
+    //
     // Run 1: index from projectDir with two files.
     writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
     writeFileSync(join(projectDir, 'b.ts'), 'export function b() { return 1; }\n');
@@ -278,22 +286,31 @@ describe('R158: Publication Orchestrator + Unified Classifier', () => {
     renameSync(projectDir, newProjectDir);
     // Delete b.ts so the next run hits the deletion-only fast path.
     unlinkSync(join(newProjectDir, 'b.ts'));
-    // Run 2: incremental from new root + deletion → deletion-only path,
-    // but R161 refuses to publish fresh because the root fingerprint changed.
+    // Run 2: incremental from new root + deletion → R162's early return fires
+    // BEFORE the deletion-only path. No deletion transaction runs.
     const r = await indexProjectWasm({ project: projectName, rootPath: newProjectDir, incremental: true, useWasm: true, workers: 0 });
-    // R161 (ROOT-R161-01): crossFileCallsStale = true (was false in R158/R160).
+    // R161 (ROOT-R161-01) + R162 (DATA-R162-01): crossFileCallsStale = true.
     expect(r.crossFileCallsStale).toBe(true);
-    // R161 (ROOT-R161-01): staleReason is ROOT_CHANGED with full_reindex recovery.
+    // R161 (ROOT-R161-01) + R162 (DATA-R162-01): staleReason is ROOT_CHANGED
+    // with full_reindex recovery.
     expect(r.staleReason).toBeDefined();
     expect(r.staleReason!.code).toBe('ROOT_CHANGED');
     expect(r.recovery).toBe('full_reindex');
-    // R161 (ROOT-R161-01): the graph is NOT certified fresh, so
-    // commitAliasStateAtomically is NOT called. updateProjectStats updates
-    // root_path to the new attempted root path (the premark + updateProjectStats
-    // both write root_path via INSERT/UPDATE), but cross_file_calls_stale=1
-    // remains so the next run still sees the project as stale until a full
-    // reindex succeeds. (The graph nodes/edges are preserved from the old
-    // root because the deletion-only cleanup transaction still ran.)
+    // R162 (DATA-R162-01 + RES-R162-01): the graph is NOT certified fresh, so
+    // commitAliasStateAtomically is NOT called. The early return also means
+    // updateProjectStats is NOT called at all — root_path is preserved (the
+    // premark UPSERT in the main path doesn't run either, since the early
+    // return is BEFORE the premark). cross_file_calls_stale=1 remains so the
+    // next run still sees the project as stale until a full reindex succeeds.
+    // (The graph nodes/edges are FULLY preserved from the old root — the
+    // deletion-only cleanup transaction did NOT run, unlike R161 where it
+    // ran and deleted root A's b.ts data.)
+    const dbPath = defaultCodeDbPath(projectName);
+    const db = new Database(dbPath, { readonly: true });
+    const bNodes = db.prepare("SELECT COUNT(*) AS c FROM nodes WHERE project = ? AND file_path = 'b.ts'").get(projectName) as { c: number };
+    db.close();
+    // R162 (DATA-R162-01 + TEST-R162-01): root A's b.ts nodes are PRESERVED.
+    expect(bNodes.c).toBeGreaterThan(0);
   });
 
   // ── Regression: IndexResult type carries `failure?` field ────────────

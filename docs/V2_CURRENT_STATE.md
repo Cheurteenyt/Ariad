@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R161 (2026-07-11).
+> **Authoritative snapshot of the current product state.** Updated R162 (2026-07-11).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -414,6 +414,103 @@ publication failure (making programmatic triage impossible).
   three callers (no-op, deletion-only, main) now surface them — but the
   full-uncertainty return remains hand-rolled for the message/recovery
   differences. A future round may unify these.
+
+## R162 — Root Change Early Refusal + Legacy Lock
+
+R162 (round 87) closes the 6 confirmed code findings of the R161 audit:
+
+- **Root change EARLY REFUSAL** (`DATA-R162-01` + `RES-R162-01` +
+  `STATE-R162-02`, P1): R161's root snapshot identity lock set
+  `semanticsStale = rootChanged || existingSemanticsVersion !== CURRENT`
+  and continued the pipeline. This was supposed to prevent
+  `commitAliasStateAtomically` from being called (the success commit
+  would overwrite the old graph's `root_fingerprint`). But it had three
+  bugs:
+  - **No-op path**: `semanticsStale=true` made `clearCrossFileCallEdges`
+    run in the no-op transaction, silently deleting root A's cross-file
+    CALLS edges from the graph.
+  - **Deletion-only path**: `crossFileStale=true` prevented the success
+    commit, but the cleanup transaction still ran, deleting root A's
+    nodes/edges/hashes for the "deleted" files (which were root B's
+    deletions, not root A's).
+  - **Main path**: extraction ran against root B's files, inserting
+    root B nodes/edges into a graph that still had root A's other data.
+  - Additionally, the no-op path's `noOpError` picked the
+    `semanticsStale` branch, logging "Semantics version 8 ≠ current 8"
+    even though the REAL cause was a root change and the version
+    actually matched.
+  R162 replaces this with an EARLY RETURN: after computing `rootChanged`,
+  if true, immediately return STALE WITHOUT any mutation. The early return
+  is placed BEFORE the premark UPSERT, `clearProjectData`, the contribution
+  filter, `statSync` estimation, `deletedRelPaths` computation, the no-op
+  path, the deletion-only path, and the main path. The graph, root_path,
+  root_fingerprint, and all metadata are preserved. The early return calls
+  `db.close()` + `markProjectStalePreservingGraph` (best-effort persist
+  `cross_file_calls_stale=1` + `last_index_error`), then returns STALE
+  with `staleReason.code = 'ROOT_CHANGED'`, `recovery: 'full_reindex'`,
+  `paths: []`, `totalPaths: 0`, `pathsTruncated: false`. `rootChanged`
+  is removed from the `semanticsStale` computation (the early return means
+  it's never true here). The classifier's `if (params.rootChanged)`
+  branch is REMOVED (dead code — the early return handles ROOT_CHANGED
+  directly). The `rootChanged` param is retained on the classifier
+  signature for backward compatibility (callers still pass it, always
+  false in practice).
+- **Legacy root bootstrap lock** (`ROOT-R162-01`, P1): R161 treated NULL
+  `root_fingerprint` as "no published snapshot to compare against" →
+  `rootChanged=false`, preserving the R154 cold-start behavior for legacy
+  DBs. But a legacy DB (pre-R154, upgraded to R161+) with existing graph
+  data and NULL `root_fingerprint` cannot be trusted for cross-root
+  incremental — a root change with preserved metadata would fast-skip all
+  files and certify the old graph as fresh. R162 adds a new
+  `rootIdentityUnknown = opts.incremental && publishedRootFingerprint
+  === null && hasExistingGraphData` check after the `rootChanged` early
+  return. When true, returns STALE with `staleReason.code =
+  'ROOT_IDENTITY_UNKNOWN'`, `recovery: 'full_reindex'`. The check is
+  conservative — it fires for ANY incremental with NULL fingerprint +
+  existing graph data, including a same-root incremental. Without a
+  published fingerprint, we cannot verify the root identity, so we cannot
+  trust the existing graph for incremental mode. The user must run a full
+  reindex to establish the `root_fingerprint` baseline. `hasExistingGraphData`
+  is the hoisted EXISTS check (`EXISTS(SELECT 1 FROM nodes) ||
+  EXISTS(SELECT 1 FROM file_hashes)`) — previously a local variable inside
+  the cold-start lock's conditional, now computed unconditionally so the
+  R162 check can reuse it.
+- **Preserve root_path on stale runs** (`STATE-R162-01`, P1): R161's
+  `updateProjectStats` UPSERT's `ON CONFLICT DO UPDATE SET root_path =
+  excluded.root_path` unconditionally. This meant a stale run would
+  overwrite the published `root_path` with the attempted root, creating
+  a contradiction (`root_path=B` while `root_fingerprint=A`). R162
+  changes the clause to `root_path = CASE WHEN
+  excluded.last_successful_index_at IS NOT NULL THEN excluded.root_path
+  ELSE root_path END`. The CASE preserves the published `root_path` when
+  `last_successful_index_at` is NULL (i.e., the run is stale/failed). On
+  success, `root_path` is updated to the new value.
+  `commitAliasStateAtomically` (the success-only path) is unchanged.
+- **Test coverage** (`TEST-R162-01`, P1): R161's tests verified that
+  `crossFileCallsStale=true` and `staleReason.code='ROOT_CHANGED'` but
+  did NOT verify that the graph itself was unchanged. R162 adds
+  `tests/indexer/r162-root-early-refusal.test.ts` (21 tests) covering
+  no-op preservation, deletion-only preservation, main preservation,
+  legacy NULL cross-root, legacy NULL same-root (conservative), legacy
+  NULL with no existing data (not refused), full reindex from new root,
+  stale no-op preserves root_path, plus 12 source-inspection regression
+  guards.
+
+### Correction to the R161 narrative
+
+R161's documentation (CHANGELOG, V2_CURRENT_STATE.md) claimed that the
+root snapshot identity lock "refuses incremental" when the root
+fingerprint changes. This was inaccurate — R161 did NOT actually refuse
+incremental. It set `semanticsStale=true` and continued the pipeline,
+which prevented the success commit but allowed mutations:
+- No-op path cleared cross-file CALLS edges.
+- Deletion-only path deleted root A's data for "deleted" files.
+- Main path inserted root B data into root A's graph.
+
+R162 is the first round that ACTUALLY refuses incremental via an early
+return. The R161 section above has been left as-is for historical
+context; the R162 section is the authoritative description of the
+current behavior.
 
 ## R161 — Root Snapshot Identity Lock
 
