@@ -1,9 +1,9 @@
-# GitHub ↔ GitLab Branch Bridge (R156)
+# GitHub ↔ GitLab Branch Bridge (R156 + R157 + R158)
 
 ## Overview
 
 The Codebase Memory V2 project is **mirrored** between GitLab (canonical home)
-and GitHub (where CI runs). R156 introduces a **bidirectional branch bridge**
+and GitHub (where CI runs). R156 introduced a **bidirectional branch bridge**
 so that:
 
 1. **MR-driven CI** runs on GitHub Actions for every GitLab MR (instead of
@@ -12,7 +12,10 @@ so that:
    and are automatically synced to GitLab MRs after CI passes.
 
 This document describes the architecture, security model, and operational
-procedures for both bridges.
+procedures for both bridges. R157 hardened the graph-ui sync workflow with
+fork/path guards and `--force-with-lease`. R158 closed the remaining gaps:
+shallow-fetch merge-base failure, missing `remove_source_branch` on PUT,
+and silent take-first on duplicate MRs.
 
 ## Repositories
 
@@ -115,43 +118,93 @@ The new `.github/workflows/sync-graph-ui-to-gitlab.yml` workflow:
 they're explicitly exposed via `pull_request_target` (which is dangerous
 because it runs with the base branch's permissions). `workflow_run` runs
 in the context of the default branch and has access to all secrets, so it
-can push to GitLab using `GITLAB_MIRROR_TOKEN`.
+can push to GitLab using a dedicated SSH deploy key or API token.
 
 The trade-off: `workflow_run` only fires AFTER the upstream workflow
 completes, so it doesn't run on every push — only on completed CI runs.
 This is exactly what we want: only sync branches whose CI passed.
 
-### Required secrets
+### Required secrets (R157+R158)
 
-| Secret                  | Where          | Scope                                          |
-|-------------------------|----------------|------------------------------------------------|
-| `GITLAB_MIRROR_TOKEN`   | GitHub Actions | GitLab PAT with `api` scope (push + MR create) |
+| Secret                                | Where          | Scope                                                                  |
+|---------------------------------------|----------------|------------------------------------------------------------------------|
+| `GITLAB_GRAPH_UI_SSH_PRIVATE_KEY`     | GitHub Actions | Ed25519 SSH private key for `git push` to GitLab (deploy key)          |
+| `GITLAB_GRAPH_UI_API_TOKEN`           | GitHub Actions | GitLab PAT with `api` scope (MR create/update + `remove_source_branch`)|
+| `GITLAB_KNOWN_HOSTS` (variable)       | GitHub Actions | `gitlab.com` SSH known_hosts entry (TOFU prevention)                   |
+| `GITLAB_REPOSITORY_SSH_URL` (variable)| GitHub Actions | `git@gitlab.com:cheurteen1/codebase-memory-V2.git`                     |
+| `GITLAB_PROJECT_ID` (variable)        | GitHub Actions | URL-encoded project path (`cheurteen1%2Fcodebase-memory-V2`)            |
 
-The token is used for:
-- `git push` to GitLab branches.
-- `curl` to the GitLab API (MR create/update).
+The SSH key is used for `git push` (writes). The API token is used for
+the MR create/update API calls. R157 split these into two credentials so
+that compromise of the API token doesn't grant push access (and vice
+versa). The SSH key is removed from the runner in an `if: always()` step.
 
-## Security model
+## Security model (R157+R158)
 
-### Token minimization
+### Fork guard (R157 — SEC-R157-01)
 
-- The GitHub PAT (`GITHUB_MIRROR_TOKEN`) is used by GitLab CI only. It
-  needs `repo` scope to push branches and trigger `repository_dispatch`.
-- The GitLab PAT (`GITLAB_MIRROR_TOKEN`) is used by GitHub Actions only.
-  It needs `api` scope to push branches and create MRs.
-- Neither token is ever written to logs, URLs, or commit messages. Both
-  bridges use `http.extraHeader` for git auth and `Authorization` headers
-  for API calls.
+The workflow's `if:` condition checks
+`github.event.workflow_run.head_repository.full_name == github.repository`.
+A fork PR with a `graph-ui/*` head branch would have a different
+`head_repository.full_name`, so the workflow refuses to run. This
+prevents a forked contributor from triggering a sync to the canonical
+GitLab repo.
 
-### Branch allowlist
+### Path guard (R157 — SEC-R157-02, R158 — SYNC-R158-01)
 
-The graph-ui sync workflow ONLY syncs branches matching `graph-ui/**`.
-This prevents a malicious PR from a non-`graph-ui` branch from triggering
-a sync to GitLab. The check is performed twice (in the `workflow_run`
-trigger filter AND in the `Validate source branch` step) for defense in
-depth.
+After checkout, the workflow runs:
 
-### `workflow_run` trust boundary
+```bash
+git fetch origin main
+git diff --name-only origin/main...HEAD |
+  grep -E '^(\.github/workflows/|\.gitlab-ci\.yml$)' && exit 1
+```
+
+If the branch modifies any privileged CI file (`.github/workflows/*` or
+`.gitlab-ci.yml`), the workflow exits with an error and refuses to sync.
+This prevents a `graph-ui/*` branch from smuggling in a malicious CI
+change that would be auto-merged into `main`.
+
+R158 fixed a bug in this guard: R157 used `git fetch origin main
+--depth=1`, which can fail with "no merge base" if `main` has advanced
+since the branch was created. R158 uses a full fetch (`git fetch origin
+main`).
+
+### `--force-with-lease` (R157 — SYNC-R157-01)
+
+The push to GitLab uses `--force-with-lease="refs/heads/$BRANCH:$REMOTE_SHA"`
+instead of `--force`. The `REMOTE_SHA` is fetched via `git ls-remote`
+immediately before the push. If someone else (or another workflow run)
+pushed to the same GitLab branch between the `ls-remote` and the `push`,
+the `--force-with-lease` check fails — preventing silent overwrite of
+unrelated work.
+
+### `remove_source_branch=true` on POST and PUT (R157 + R158 — SYNC-R158-02)
+
+Both the POST (create MR) and PUT (update MR) calls include
+`--data-urlencode "remove_source_branch=true"`. This tells GitLab to
+delete the source branch when the MR is merged. R157 only set it on
+POST, so MRs created before R157 (or MRs that were updated before
+merge) didn't have the flag — the source branch lingered after merge.
+R158 added it to PUT.
+
+### `MR_COUNT > 1` failure (R158 — SYNC-R158-03)
+
+If the GitLab API returns more than one open MR for the same source
+branch, the workflow fails loudly with a diagnostic message and the
+JSON list of duplicates. R157 silently took `MRs[0]`, masking the
+duplication. Duplicate MRs usually indicate a manual mistake or a stale
+duplicate that should be closed manually before re-running the sync.
+
+### SSH key cleanup (R157)
+
+The `Remove private key` step runs with `if: always()` so the key is
+removed from the runner even if a previous step failed. This is a
+defense-in-depth measure — GitHub Actions runners are ephemeral, but
+removing the key reduces the window during which a compromised
+subsequent step could read it.
+
+### `workflow_run` trust boundary (R156)
 
 `workflow_run` events use the **default branch**'s workflow file, not the
 PR's. This means a PR cannot modify the sync workflow to bypass the
@@ -160,7 +213,7 @@ from `main`.
 
 ## Operational procedures
 
-### Initial deployment (R156)
+### Initial deployment (R156 + R157 + R158)
 
 1. Merge the R156 MR to GitLab `main`.
 2. The `mirror-to-github` GitLab CI job mirrors `main` (including
@@ -172,9 +225,18 @@ from `main`.
      -H "Authorization: Bearer $GITHUB_MIRROR_TOKEN" \
      "https://api.github.com/repos/Cheurteenyt/codebase-mirror/contents/.github/workflows/gitlab-mr-ci.yml?ref=main"
    ```
-4. Add the `GITLAB_MIRROR_TOKEN` secret to the GitHub repo (Settings →
-   Secrets and variables → Actions → New repository secret).
-5. (Follow-up commit) Remove `allow_failure: true` from the
+4. Add the R157+R158 secrets and variables to the GitHub repo (Settings →
+   Secrets and variables → Actions):
+   - **Secrets**: `GITLAB_GRAPH_UI_SSH_PRIVATE_KEY` (Ed25519 private key),
+     `GITLAB_GRAPH_UI_API_TOKEN` (GitLab PAT with `api` scope).
+   - **Variables**: `GITLAB_KNOWN_HOSTS` (`gitlab.com` SSH known_hosts),
+     `GITLAB_REPOSITORY_SSH_URL` (`git@gitlab.com:...`),
+     `GITLAB_PROJECT_ID` (URL-encoded project path).
+5. Create the `gitlab-graph-ui-sync` environment (Settings →
+   Environments → New environment) and attach the secrets/variables to
+   it. The workflow's `environment: gitlab-graph-ui-sync` declaration
+   restricts secret exposure to that environment only.
+6. (Follow-up commit) Remove `allow_failure: true` from the
    `github-ci-gate` job in `.gitlab-ci.yml`.
 
 ### Opening a graph-ui PR (after deployment)
@@ -185,8 +247,26 @@ from `main`.
 4. When CI succeeds, the `Sync graph-ui to GitLab` workflow runs
    automatically.
 5. The workflow pushes the branch to GitLab and creates/updates a GitLab
-   MR.
-6. Review and merge the GitLab MR.
+   MR. If the MR already exists, it's updated with the new SHA, title,
+   description, and `remove_source_branch=true`.
+6. Review and merge the GitLab MR. The source branch is auto-deleted on
+   merge (R157+R158).
+
+### Debugging a failed sync
+
+If the `Sync graph-ui to GitLab` workflow fails:
+
+1. **`Refusing unexpected branch`** — the head branch doesn't match
+   `graph-ui/**`. Rename the branch or fix the trigger.
+2. **`Graph UI branch modifies privileged CI files`** — the branch
+   touches `.github/workflows/` or `.gitlab-ci.yml`. Split those
+   changes into a separate infrastructure MR.
+3. **`no merge base`** — R158 should have fixed this. If it still
+   happens, ensure the workflow file on `main` is the R158 version
+   (full fetch).
+4. **`Found N open MRs for source branch` (N > 1)** — duplicate MRs
+   exist on GitLab. Close all but one manually, then re-run the
+   workflow.
 
 ### Debugging a failed CI gate
 
@@ -201,17 +281,21 @@ If the gate times out (15 minutes), check whether the GitHub workflow is
 stuck in `queued` (GitHub Actions overload). Re-run the GitLab pipeline
 to re-trigger the gate.
 
-## Limitations (R156)
+## Limitations (R156 + R157 + R158)
 
 - The `github-ci-gate` job uses `allow_failure: true` until the follow-up
   commit removes it. During this window, MRs can merge even if the gate
   would have failed.
 - The graph-ui sync workflow only triggers after CI succeeds. If CI is
   skipped (e.g., path filters), no sync happens.
-- The GitLab MR created by the sync workflow uses `--force` to push the
-  branch. If a developer manually pushes to the same GitLab branch, the
-  sync will overwrite their changes. The branch name `graph-ui/<feature>`
+- The GitLab MR created by the sync workflow uses `--force-with-lease`
+  (R157) to push the branch. If a developer manually pushes to the same
+  GitLab branch, the next sync will fail (lease check) until the
+  developer's SHA is fetched. The branch name `graph-ui/<feature>`
   should be considered owned by the sync workflow.
 - The sync workflow doesn't transfer PR review state or comments from
   GitHub to GitLab. The GitLab MR description links to the GitHub PR for
   reference.
+- The `MR_COUNT > 1` failure (R158) is a guard, not auto-recovery.
+  Operators must manually close the duplicate MRs on GitLab before
+  re-running the sync.

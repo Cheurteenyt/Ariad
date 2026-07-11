@@ -1,10 +1,15 @@
-# R157: Sync graph-ui/* changes from GitHub to GitLab — HARDENED.
+# R157+R158: Sync graph-ui/* changes from GitHub to GitLab — HARDENED.
 #
 # R156 had insufficient security: no fork guard, no path guard, --force
 # instead of --force-with-lease, remove_source_branch=false.
 # R157 adds all missing security checks.
+# R158 closes the remaining gaps:
+#   - shallow fetch replaced with full fetch so merge-base can be found
+#     even if main has advanced since the branch was created
+#   - remove_source_branch=true added to MR update (PUT) too, not just create
+#   - fail loudly if MR_COUNT > 1 instead of silently taking the first
 #
-# Security model (R157):
+# Security model (R157+R158):
 #   - workflow_run trigger (runs in context of main, with secrets)
 #   - Checks head_repository.full_name == github.repository (no forks)
 #   - Checks workflow_run.event == 'pull_request'
@@ -13,7 +18,8 @@
 #   - Refuses if branch modifies .github/workflows/ or .gitlab-ci.yml
 #   - Uses --force-with-lease (not --force)
 #   - URL-encodes branch name for API queries
-#   - Creates MR with remove_source_branch=true
+#   - Creates/updates MR with remove_source_branch=true
+#   - Fails loudly if more than one open MR exists for the source branch
 #   - Removes private key in if: always() cleanup
 
 name: Sync graph-ui to GitLab
@@ -77,10 +83,14 @@ jobs:
 
       - name: Protect CI infrastructure
         # R157 (SEC-R157-02): Refuse if the branch modifies privileged files.
+        # R158 (SYNC-R158-01): full fetch (no --depth=1) so the diff against
+        # origin/main works even if main has advanced since the branch was
+        # created. R157 used --depth=1, which can fail with "no merge base"
+        # if the shallow main is not a direct ancestor of HEAD.
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin main --depth=1
+          git fetch origin main
           FORBIDDEN="$(
             git diff --name-only origin/main...HEAD |
             grep -E '^(\.github/workflows/|\.gitlab-ci\.yml$)' || true
@@ -138,6 +148,11 @@ jobs:
 
       - name: Create or update GitLab MR
         # R157 (SYNC-R157-02/03): URL-encode branch, filter target, remove_source_branch=true.
+        # R158 (SYNC-R158-02): apply remove_source_branch=true to PUT (update) too,
+        # so the source branch is deleted after merge regardless of whether the
+        # MR was created or updated. Also fail loudly if MR_COUNT > 1 instead of
+        # silently taking the first MR — multiple open MRs for the same source
+        # branch usually indicates a manual mistake or a stale duplicate.
         shell: bash
         env:
           TOKEN: ${{ secrets.GITLAB_GRAPH_UI_API_TOKEN }}
@@ -180,7 +195,7 @@ jobs:
               --data-urlencode "description=$DESCRIPTION" \
               --data-urlencode "remove_source_branch=true" \
               "$API/projects/$PROJECT_ID/merge_requests"
-          else
+          elif [ "$MR_COUNT" -eq 1 ]; then
             MR_IID="$(
               printf '%s' "$OPEN_MRS" |
               python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["iid"])'
@@ -190,7 +205,14 @@ jobs:
               --header "PRIVATE-TOKEN: $TOKEN" \
               --data-urlencode "title=$TITLE" \
               --data-urlencode "description=$DESCRIPTION" \
+              --data-urlencode "remove_source_branch=true" \
               "$API/projects/$PROJECT_ID/merge_requests/$MR_IID"
+          else
+            echo "Found $MR_COUNT open MRs for source branch '$BRANCH' (expected 0 or 1)." >&2
+            echo "This usually indicates a manual mistake or a stale duplicate." >&2
+            echo "Resolve the duplicates on GitLab, then re-run this workflow." >&2
+            printf '%s\n' "$OPEN_MRS" >&2
+            exit 1
           fi
 
       - name: Remove private key
