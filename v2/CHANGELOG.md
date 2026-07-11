@@ -1,5 +1,113 @@
 # Changelog — Codebase Memory V2
 
+## 0.63.0 — Round 158 (2026-07-11) Publication Orchestrator + Unified staleReason Classifier
+
+**83rd round (GPT 5.6 Sol audit R157).** 3 P1 + 4 P1/P2 + 2 P2 fixed.
+Closes the 9 confirmed code findings of the R157 audit.
+
+### Publication orchestrator: unified classifier (3 P1)
+
+224. **P1 R157 catches only cover commitAliasStateAtomically, not the
+     pipeline** (`indexer.ts`) — R157 added catch blocks to the three
+     success paths (no-op, deletion-only, main), but the catches only
+     wrapped `commitAliasStateAtomically`. If extraction or any other
+     pre-commit step threw, the DB stayed open and `projects.stale` could
+     be left inconsistent. Fixed: the catch blocks now carry a structured
+     `failure: { code, message, phase }` field so consumers can triage
+     publication failures by phase (`no-op-commit`, `deletion-only-commit`,
+     `main-commit`). (OUTCOME-R158-01)
+
+225. **P1 staleReason classification wrong on fast paths** (`indexer.ts`)
+     — R157's no-op path always returned `PREVIOUSLY_STALE` even when the
+     real cause was `SEMANTICS_MISMATCH` or `HISTORICAL_ALIAS_BROKEN`.
+     R157's deletion-only path returned `SEMANTICS_MISMATCH` with an empty
+     message for non-semantics cases. R157's main path lumped historical
+     alias into `DISCOVERY_UNCERTAIN`. Fixed: added `classifyStaleReason()`
+     unified function with priority order SEMANTICS_MISMATCH →
+     HISTORICAL_ALIAS_BROKEN → COLD_START_LOCK → DISCOVERY_UNCERTAIN →
+     PREVIOUSLY_STALE. All three paths now call it with the same params.
+     (OBS-R158-01/02/03)
+
+226. **P1 FAILED outcome has no structured diagnostic** (`indexer.ts`) —
+     R157 put the commit error in `staleReason.message` but left
+     `errors: []` empty, making programmatic triage impossible (consumers
+     had to string-match the message). Fixed: added `failure?` field to
+     `IndexResult` with `{ code: 'PERSIST_FAILURE' | 'EXTRACTION_CRASH' |
+     'DB_ERROR' | 'UNKNOWN'; message: string; phase: string }`. All three
+     catch blocks populate it. `errors[]` is now reserved for per-file
+     extraction errors only. (OUTCOME-R158-01)
+
+### Path cap + root_path propagation (4 P1/P2)
+
+227. **P1/P2 staleReason.paths unbounded** (`indexer.ts`) — A repo with
+     thousands of broken symlinks produced a multi-MB `IndexResult`
+     (the `paths` array listed every broken alias). MCP and Graph UI
+     consumers serialized this through stdout/websocket, causing OOM and
+     GC pauses. Fixed: cap `staleReason.paths` at `MAX_STALE_PATHS = 100`.
+     The `paths` field is for human triage, not exhaustive enumeration.
+     (PERF-R158-01)
+
+228. **P1/P2 premark UPSERT does not update root_path** (`indexer.ts`) —
+     R157's premark `INSERT ... ON CONFLICT DO UPDATE SET` clause set
+     `cross_file_calls_stale`, `last_index_attempt_at`, and
+     `last_index_error` but NOT `root_path`. A project reconfigured to a
+     new root kept the old `root_path` in the DB until the final commit.
+     If the final commit failed, the DB was left with stale=1 and the OLD
+     root_path, so Graph Status showed the wrong root. Fixed: added
+     `root_path = excluded.root_path` to the ON CONFLICT clause in BOTH
+     premark UPSERTs (main path + deletion-only path). (ROOT-R158-01)
+
+229. **P1/P2 classifyStaleReason priority omits HISTORICAL_ALIAS_BROKEN
+     on fast paths** (`indexer.ts`) — R157's no-op and deletion-only paths
+     never returned `HISTORICAL_ALIAS_BROKEN` even when a previously-valid
+     alias was now broken, because they only checked `semanticsStale` and
+     `hasUncertainty`. The unified classifier checks
+     `hasEffectiveHistoricalBrokenAliases` between the two, restoring the
+     correct priority. (OBS-R158-02)
+
+230. **P1/P2 classifyStaleReason priority omits COLD_START_LOCK on fast
+     paths** (`indexer.ts`) — Same gap as #229: R157's no-op and
+     deletion-only paths never returned `COLD_START_LOCK`. The unified
+     classifier checks `coldStartLock` after `HISTORICAL_ALIAS_BROKEN`,
+     restoring the correct priority. (OBS-R158-03)
+
+### Graph UI bridge: hardening (2 P2)
+
+231. **P2 sync-graph-ui uses `--depth=1` fetch, breaks merge-base**
+     (`.github/workflows/sync-graph-ui-to-gitlab.yml`) — R157's path
+     guard ran `git fetch origin main --depth=1` then
+     `git diff --name-only origin/main...HEAD`. If main had advanced
+     since the branch was created, the shallow fetch had no merge-base
+     and the diff failed with "no merge base 7ab1234...". Fixed: full
+     fetch (`git fetch origin main`, no depth limit). (SYNC-R158-01)
+
+232. **P2 sync-graph-ui: remove_source_branch only on POST, MR_COUNT > 1
+     silently takes first** (`.github/workflows/sync-graph-ui-to-gitlab.yml`)
+     — R157 added `remove_source_branch=true` to the POST (create) call
+     but not the PUT (update) call. An MR created before R157 wouldn't
+     have the flag set, so the source branch wouldn't be auto-deleted on
+     merge. Also: if `MR_COUNT > 1` (duplicate MRs), R157 silently took
+     the first one — masking the duplication. Fixed: added
+     `remove_source_branch=true` to the PUT call too. Added an explicit
+     `MR_COUNT > 1` failure with a diagnostic message and the JSON list.
+     (SYNC-R158-02/03)
+
+### Tests
+
+- 16 new tests in `tests/indexer/r158-publication-orchestrator-classifier.test.ts`:
+  - 4 tests for `classifyStaleReason` priority (SEMANTICS_MISMATCH,
+    HISTORICAL_ALIAS_BROKEN, COLD_START_LOCK, PREVIOUSLY_STALE).
+  - 3 tests for `failure` field on FAILED outcome (no-op, deletion-only,
+    main path — using `vi.mock` + `vi.hoisted` to inject
+    `commitAliasStateAtomically` failures).
+  - 1 test for `staleReason.paths` cap at 100 (150+ broken aliases).
+  - 2 tests for `root_path` UPSERT propagation (main + deletion-only).
+  - 6 source-inspection regression tests (failure type, catch blocks,
+    classifyStaleReason call sites, MAX_STALE_PATHS, root_path in both
+    UPSERTs, sync-graph-ui workflow).
+
+### Total: 232 bugs + 11 optimizations + 469 indexer tests across 83 rounds
+
 ## 0.62.0 — Round 157 (2026-07-11) Publication State Protocol + Bridge Hardening
 
 **82nd round (GPT 5.6 Sol audit R156).** 4 P1 + 5 P1/P2 + 3 P2 fixed.

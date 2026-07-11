@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R157 (2026-07-11).
+> **Authoritative snapshot of the current product state.** Updated R158 (2026-07-11).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -201,6 +201,100 @@ GitHub ↔ GitLab branch bridge for graph-ui contributions:
   it with `commitAliasStateAtomically` for all success paths. Kept as a
   stable API for external callers (MCP tools).
 
+## R158 — Publication Orchestrator + Unified staleReason Classifier
+
+R158 (round 83) closes the residual publication-state and classifier gaps
+that R157 left in place. R157 added catch blocks to the three success
+paths (no-op, deletion-only, main), but the catches only wrapped
+`commitAliasStateAtomically`, used hand-rolled `staleCode` builders with
+inconsistent priority, and left the `errors[]` array empty on
+publication failure (making programmatic triage impossible).
+
+### Publication orchestrator + unified classifier (`indexer.ts`)
+
+- **Unified `classifyStaleReason()` function** (`OBS-R158-01/02/03`):
+  a single function with priority order
+  SEMANTICS_MISMATCH → HISTORICAL_ALIAS_BROKEN → COLD_START_LOCK →
+  DISCOVERY_UNCERTAIN → PREVIOUSLY_STALE. All three stale return paths
+  (no-op, deletion-only, main) now call it with the same params. R157's
+  no-op path always returned `PREVIOUSLY_STALE` (even when the real
+  cause was semantics mismatch or historical alias), and its
+  deletion-only path returned `SEMANTICS_MISMATCH` with an empty
+  message for non-semantics cases. The classifier also adds
+  HISTORICAL_ALIAS_BROKEN and COLD_START_LOCK to the fast paths (R157
+  only emitted them on the full-uncertainty path).
+- **Structured `failure` field on `IndexResult`** (`OUTCOME-R158-01`):
+  `failure?: { code: 'PERSIST_FAILURE' | 'EXTRACTION_CRASH' | 'DB_ERROR'
+  | 'UNKNOWN'; message: string; phase: string }`. All three catch blocks
+  (no-op-commit, deletion-only-commit, main-commit) populate it.
+  `errors[]` is now reserved for per-file extraction errors only —
+  R157's `errors: []` on publication failure made programmatic triage
+  impossible (consumers had to string-match `staleReason.message`).
+- **`staleReason.paths` capped at 100** (`PERF-R158-01`): a repo with
+  thousands of broken symlinks used to produce a multi-MB `IndexResult`
+  that MCP and Graph UI serialized through stdout/websocket, causing OOM
+  and GC pauses. Now capped at `MAX_STALE_PATHS = 100` — the field is
+  for human triage, not exhaustive enumeration.
+- **Premark UPSERT updates `root_path`** (`ROOT-R158-01`): R157's
+  premark `INSERT ... ON CONFLICT DO UPDATE SET` clause set
+  `cross_file_calls_stale`, `last_index_attempt_at`, and
+  `last_index_error` but NOT `root_path`. A project reconfigured to a
+  new root kept the old `root_path` until the final commit. If the
+  final commit failed, the DB was left with stale=1 and the OLD
+  root_path, so Graph Status showed the wrong root. R158 adds
+  `root_path = excluded.root_path` to the ON CONFLICT clause in BOTH
+  premark UPSERTs (main path + deletion-only path).
+
+### Graph UI bridge hardening (`.github/workflows/sync-graph-ui-to-gitlab.yml`)
+
+- **Full fetch instead of `--depth=1`** (`SYNC-R158-01`): R157's path
+  guard ran `git fetch origin main --depth=1` then
+  `git diff --name-only origin/main...HEAD`. If main had advanced since
+  the branch was created, the shallow fetch had no merge-base and the
+  diff failed. R158 uses a full fetch (`git fetch origin main`).
+- **`remove_source_branch=true` on PUT too** (`SYNC-R158-02`): R157
+  added the flag to the POST (create) call but not the PUT (update)
+  call. An MR created before R157 wouldn't have the flag set, so the
+  source branch wouldn't be auto-deleted on merge. R158 adds it to PUT.
+- **Fail loudly if `MR_COUNT > 1`** (`SYNC-R158-03`): R157 silently
+  took the first MR when duplicates existed — masking the duplication.
+  R158 fails the workflow with a diagnostic message and the JSON list.
+
+### Tests
+
+16 new tests in
+`tests/indexer/r158-publication-orchestrator-classifier.test.ts`:
+
+- 4 tests for `classifyStaleReason` priority (SEMANTICS_MISMATCH,
+  HISTORICAL_ALIAS_BROKEN, COLD_START_LOCK, PREVIOUSLY_STALE) — each
+  triggered indirectly via `indexProjectWasm` to verify the runtime
+  code path.
+- 3 tests for `failure` field on FAILED outcome (no-op, deletion-only,
+  main path) — using `vi.mock` + `vi.hoisted` to inject
+  `commitAliasStateAtomically` failures.
+- 1 test for `staleReason.paths` cap at 100 (150+ broken aliases →
+  exactly 100 paths).
+- 2 tests for `root_path` UPSERT propagation (main + deletion-only
+  path).
+- 6 source-inspection regression tests guarding against accidental
+  removal of the `failure` type, the three catch-block `failure:`
+  assignments, the `classifyStaleReason` call sites, `MAX_STALE_PATHS`,
+  `root_path = excluded.root_path` in both UPSERTs, and the
+  sync-graph-ui workflow changes.
+
+### Known limitations (R158)
+
+- **`failure.code = 'EXTRACTION_CRASH' | 'DB_ERROR' | 'UNKNOWN'` not yet
+  emitted** (carryover): only `PERSIST_FAILURE` is emitted today. The
+  other codes are reserved for future use (extraction crashes that
+  bypass the worker pool, raw DB errors not from publication, etc.).
+- **`classifyStaleReason` is a private helper** (design choice): not
+  exported. Tested indirectly via `IndexResult.staleReason.code`. If
+  MCP/UI consumers need to call it directly, export it in a follow-up.
+- **`staleReason.paths` cap is silent** (UX): the cap doesn't add a
+  `truncated: true` flag. A future round may add it so consumers can
+  display "(showing 100 of N)".
+
 ## Current versions
 
 | Component | Version | Source of truth |
@@ -291,4 +385,4 @@ See [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) for the full workflow.
 
 ## Validation date
 
-This document was validated at R143 (2026-07-11). Always cross-check with `v2/CHANGELOG.md` for the latest state.
+This document was validated at R158 (2026-07-11). Always cross-check with `v2/CHANGELOG.md` for the latest state.
