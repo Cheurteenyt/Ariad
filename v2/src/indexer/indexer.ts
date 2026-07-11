@@ -206,6 +206,23 @@ export interface IndexResult {
    * and certify the old graph as fresh. ROOT_CHANGED is checked FIRST by
    * the classifier (before cold-start lock) because it is a hard blocker
    * that only a full reindex can resolve.
+   *
+   * R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): ROOT_CHANGED is now
+   * emitted by an EARLY RETURN in the indexer (before any mutation), NOT by
+   * the classifier. R161 set `semanticsStale=true` and continued the pipeline
+   * — this allowed the no-op path to clear cross-file edges, the deletion-only
+   * path to delete data, and the main path to mix root A/B data. R162 returns
+   * STALE immediately WITHOUT any mutation; the graph, root_path,
+   * root_fingerprint, and all metadata are preserved.
+   *
+   * R162 (ROOT-R162-01): Added `ROOT_IDENTITY_UNKNOWN` code. A DB with
+   * existing graph data but NULL root_fingerprint (pre-R154 DB upgraded to
+   * R161+) cannot be trusted for cross-root incremental. R161 set
+   * `rootChanged=false` for NULL, leaving legacy DBs vulnerable to the
+   * cross-root fast-skip. R162 refuses the incremental and requires a full
+   * baseline to establish root identity. Emitted by the same early-return
+   * site as ROOT_CHANGED (after `hasExistingGraphData` is computed but
+   * before the cold-start lock check uses it).
    */
   staleReason?: {
     code:
@@ -215,7 +232,8 @@ export interface IndexResult {
       | 'SEMANTICS_MISMATCH'
       | 'PREVIOUSLY_STALE'
       | 'PERSIST_FAILURE'
-      | 'ROOT_CHANGED';
+      | 'ROOT_CHANGED'
+      | 'ROOT_IDENTITY_UNKNOWN';
     message: string;
     paths: string[];
     /** R159: total broken paths before capping. Undefined when not applicable. */
@@ -394,9 +412,17 @@ function classifyStaleReason(params: {
   existingStale: boolean;
   hasExtractionErrors: boolean;
   callSitesInitialized: boolean;
-  // R161 (ROOT-R161-01): root fingerprint changed — hard blocker, checked
-  // first (before cold-start lock). When true, the classifier returns
-  // ROOT_CHANGED with recovery=full_reindex and empty paths.
+  // R161 (ROOT-R161-01): root fingerprint changed — was checked first
+  // (before cold-start lock) and returned ROOT_CHANGED with
+  // recovery=full_reindex and empty paths.
+  //
+  // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): DEPRECATED. The
+  // ROOT_CHANGED branch has been removed from the classifier — the indexer
+  // now emits ROOT_CHANGED via an EARLY RETURN before any mutation, so the
+  // classifier is never called with `rootChanged=true`. The param is retained
+  // for backward compatibility (callers still pass it, always false in
+  // practice). The ROOT_CHANGED code remains in the staleReason.code union —
+  // the early return uses it directly.
   rootChanged?: boolean;
   // R160 (OBS-R160-01): brokenAliasPaths is used for COLD_START_LOCK —
   // every broken alias is suspect when history is uninitialized.
@@ -426,19 +452,28 @@ function classifyStaleReason(params: {
     };
   }
 
-  // R161 (ROOT-R161-01): ROOT_CHANGED first — hard blocker. The published
-  // graph belongs to a different physical root; fast-skip would otherwise
-  // certify the old graph as fresh. Checked before cold-start lock because
-  // a root change makes every other diagnosis moot — the user must run a
-  // full reindex under the new root before any other state can be trusted.
-  if (params.rootChanged) {
-    return {
-      code: 'ROOT_CHANGED',
-      message: `Root fingerprint changed — the published graph belongs to a different root. Full reindex required.`,
-      recovery: 'full_reindex',
-      paths: [],
-    };
-  }
+  // R161 (ROOT-R161-01): ROOT_CHANGED was originally checked FIRST here as a
+  // hard blocker. The published graph belongs to a different physical root;
+  // fast-skip would otherwise certify the old graph as fresh.
+  //
+  // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): The `rootChanged`
+  // branch has been REMOVED from the classifier. ROOT_CHANGED is now emitted
+  // by an EARLY RETURN in the indexer (before any mutation), NOT by the
+  // classifier. R161 set `semanticsStale=true` and continued the pipeline —
+  // this allowed the no-op path to clear cross-file edges, the deletion-only
+  // path to delete data, and the main path to mix root A/B data. R162 returns
+  // STALE immediately WITHOUT any mutation; the graph, root_path,
+  // root_fingerprint, and all metadata are preserved. The `rootChanged` param
+  // is retained on the classifier signature for backward compatibility but
+  // is now always false (the early return prevents rootChanged=true from
+  // reaching the classifier). The ROOT_CHANGED code remains in the
+  // staleReason.code union (the early return uses it).
+  //
+  // R162 (ROOT-R162-01): ROOT_IDENTITY_UNKNOWN is also emitted by an early
+  // return (NULL root_fingerprint + existing graph data). It is NOT handled
+  // by the classifier for the same reason — the early return guarantees no
+  // mutation. The code is in the staleReason.code union (the early return
+  // uses it). The classifier never sees either ROOT_* condition.
   // R159 (OUTCOME-R159-01): COLD_START_LOCK — filesystem blocker.
   // If we recommend full_reindex here, the full will be blocked by the
   // cold-start lock on the next run. Fix the filesystem first.
@@ -994,15 +1029,22 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // check — COUNT(*) scans all matching rows while EXISTS short-circuits at
   // the first match. Also check file_hashes/call_sites to catch partial DBs
   // that have hashes but no nodes (pre-R79 full mode).
+  //
+  // R162 (ROOT-R162-01): Hoisted `hasExistingGraphData` to be computed
+  // UNCONDITIONALLY (was inside the `if (!bootstrapComplete && brokenAliases
+  // > 0)` block). The R162 legacy root bootstrap lock reuses this EXISTS
+  // check to determine whether a NULL root_fingerprint should refuse
+  // incremental. Computing it unconditionally is cheap (two EXISTS queries
+  // that short-circuit at the first match) and avoids recomputing it later.
+  const hasExistingGraphData = (db.prepare(
+    'SELECT EXISTS(SELECT 1 FROM nodes WHERE project = ? LIMIT 1) AS e'
+  ).get(opts.project) as { e: number }).e === 1
+    || (db.prepare(
+      'SELECT EXISTS(SELECT 1 FROM file_hashes WHERE project = ? LIMIT 1) AS e'
+    ).get(opts.project) as { e: number }).e === 1;
   let coldStartLock = false;
   if (!bootstrapComplete && discovery.brokenAliases.length > 0) {
-    const hasExistingData = (db.prepare(
-      'SELECT EXISTS(SELECT 1 FROM nodes WHERE project = ? LIMIT 1) AS e'
-    ).get(opts.project) as { e: number }).e === 1
-      || (db.prepare(
-        'SELECT EXISTS(SELECT 1 FROM file_hashes WHERE project = ? LIMIT 1) AS e'
-      ).get(opts.project) as { e: number }).e === 1;
-    if (hasExistingData) {
+    if (hasExistingGraphData) {
       coldStartLock = true;
     }
   }
@@ -1099,6 +1141,10 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // all files and certify the old graph as fresh. R160's projectState only
   // read stale/initialized/version; the root fingerprint comparison was
   // missing entirely.
+  //
+  // R162 (DATA-R162-01 + ROOT-R162-01): The root_fingerprint read drives
+  // TWO early returns (ROOT_CHANGED + ROOT_IDENTITY_UNKNOWN) which fire
+  // BEFORE any mutation. See the R162 block below.
   const projectState = opts.incremental
     ? (db.prepare(
         'SELECT cross_file_calls_stale AS stale, call_sites_initialized AS initialized, extractor_semantics_version AS version, root_fingerprint AS rootFingerprint FROM projects WHERE name = ?'
@@ -1116,19 +1162,131 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // NULL rootFingerprint (pre-R154 DB, or first incremental after upgrade)
   // is treated as "no published snapshot to compare against" → rootChanged
   // is false (preserves R154 cold-start behavior for legacy DBs).
+  //
+  // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): Root change EARLY
+  // REFUSAL. R161 set `semanticsStale=true` and continued the pipeline —
+  // this allowed the no-op path to clear cross-file edges, the deletion-only
+  // path to delete data, and the main path to mix root A/B data. R162 returns
+  // STALE immediately WITHOUT any mutation. The graph, root_path,
+  // root_fingerprint, and all metadata are preserved.
   const publishedRootFingerprint = projectState?.rootFingerprint ?? null;
   const rootChanged = opts.incremental && publishedRootFingerprint !== null && publishedRootFingerprint !== rootFingerprint;
-  // R161 (ROOT-R161-01): when rootChanged is true, force semanticsStale=true.
-  // This makes the no-op path's `noOpStale = existingStale || semanticsStale
-  // || hasUncertainty` true, the deletion-only path's `crossFileStale` true,
-  // and the main path's `crossFileStale` true — preventing
-  // commitAliasStateAtomically from being called (the success commit would
-  // otherwise overwrite the old graph's root_fingerprint with the new root,
-  // silently rebinding the graph). The classifier surfaces ROOT_CHANGED as
-  // the staleReason (checked first, before cold-start lock), so consumers
-  // see "Root fingerprint changed" + recovery=full_reindex.
+
+  // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): Root change early refusal.
+  // R161 set semanticsStale=true and continued the pipeline — this allowed
+  // no-op to clear cross-file edges, deletion-only to delete data, and main
+  // to mix root A/B data. R162 returns STALE immediately WITHOUT any mutation.
+  // The graph, root_path, root_fingerprint, and all metadata are preserved.
+  //
+  // This return is placed BEFORE:
+  //   - the premark UPSERT (no `cross_file_calls_stale=1` write)
+  //   - clearProjectData (no nodes/edges/files deletion)
+  //   - the contribution filter
+  //   - statSync estimation
+  //   - deletedRelPaths computation
+  //   - the no-op path (no cross-file edge clearCrossFileCallEdges)
+  //   - the deletion-only path (no per-file DELETE)
+  //   - the main path (no root A/B data mixing)
+  //
+  // And AFTER:
+  //   - projectState read (which reads root_fingerprint)
+  //   - rootFingerprint computation (computeRootFingerprint(canonicalRoot))
+  //   - discovery (needed for warnings: buildDiscoveryWarnings(discovery))
+  if (rootChanged) {
+    db.close();
+    const rootMsg = `Root fingerprint changed — the published graph belongs to a different root. Full reindex required.`;
+    markProjectStalePreservingGraph(dbPath, opts.project, rootMsg);
+    return {
+      dbPath,
+      durationMs: Date.now() - start,
+      nodes: 0, edges: 0, files: 0, skipped: 0,
+      errors: [],
+      languages: new Set(),
+      parallel: false, workerCount: 0,
+      crossFileCallsStale: true,
+      warnings: buildDiscoveryWarnings(discovery),
+      outcome: 'STALE',
+      staleReason: {
+        code: 'ROOT_CHANGED',
+        message: rootMsg,
+        paths: [],
+        totalPaths: 0,
+        pathsTruncated: false,
+      },
+      recovery: 'full_reindex',
+    };
+  }
+
+  // R162 (ROOT-R162-01): Legacy root bootstrap lock.
+  // A DB with existing graph data but NULL root_fingerprint (pre-R154 DB
+  // upgraded to R161+) cannot be trusted for cross-root incremental.
+  // R161 set rootChanged=false for NULL, leaving legacy DBs vulnerable to
+  // the cross-root fast-skip (a root change with preserved metadata would
+  // fast-skip all files and certify the old graph as fresh). R162 refuses
+  // the incremental and requires a full baseline to establish root identity.
+  // `hasExistingGraphData` is the hoisted EXISTS check (nodes ∪ file_hashes).
+  //
+  // Note: this fires for ANY incremental with NULL fingerprint + existing
+  // graph data — including a same-root incremental. The conservative stance
+  // is intentional: without a published fingerprint, we cannot verify the
+  // root identity, so we cannot trust the existing graph for incremental
+  // mode. The user must run a full reindex to establish the root_fingerprint
+  // baseline. Subsequent incrementals then work normally.
+  const rootIdentityUnknown = opts.incremental
+    && publishedRootFingerprint === null
+    && hasExistingGraphData;
+
+  if (rootIdentityUnknown) {
+    db.close();
+    const rootMsg = `Root identity unknown — the published graph predates root fingerprint tracking. Full reindex required to establish root identity.`;
+    markProjectStalePreservingGraph(dbPath, opts.project, rootMsg);
+    return {
+      dbPath,
+      durationMs: Date.now() - start,
+      nodes: 0, edges: 0, files: 0, skipped: 0,
+      errors: [],
+      languages: new Set(),
+      parallel: false, workerCount: 0,
+      crossFileCallsStale: true,
+      warnings: buildDiscoveryWarnings(discovery),
+      outcome: 'STALE',
+      staleReason: {
+        code: 'ROOT_IDENTITY_UNKNOWN',
+        message: rootMsg,
+        paths: [],
+        totalPaths: 0,
+        pathsTruncated: false,
+      },
+      recovery: 'full_reindex',
+    };
+  }
+
+  // R127: Centralized semantic-state read. `semanticsStale` is true iff
+  // the stored version ≠ CURRENT_EXTRACTOR_SEMANTICS_VERSION (incremental
+  // mode only; full mode always produces fresh data).
+  //
+  // R161 (ROOT-R161-01): originally, `rootChanged` was ORed into
+  // `semanticsStale` to force `commitAliasStateAtomically` to be skipped in
+  // all three paths (no-op, deletion-only, main). This worked but had three
+  // bugs that R162 closes (see DATA-R162-01 + RES-R162-01 + STATE-R162-02):
+  //   1. No-op path: `semanticsStale=true` made `clearCrossFileCallEdges`
+  //      run, silently deleting cross-file CALLS edges from root A's graph.
+  //   2. Deletion-only path: `crossFileStale=true` prevented
+  //      `commitAliasStateAtomically` but the cleanup transaction still ran,
+  //      deleting root A's nodes/edges/hashes for the "deleted" files.
+  //   3. Main path: extraction ran against root B's files, inserting root B
+  //      nodes/edges into a graph that still had root A's other data.
+  //   Additionally, the message "Semantics version 8 ≠ current 8" was
+  //   falsely logged when the real cause was a root change.
+  //
+  // R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): `rootChanged` removed
+  // from the `semanticsStale` computation. The R162 early return (above)
+  // means `rootChanged=true` never reaches this line — if rootChanged were
+  // true we would have already returned STALE with ROOT_CHANGED. The
+  // classifier also no longer handles ROOT_CHANGED — the early return uses
+  // the ROOT_CHANGED code directly.
   const semanticsStale = opts.incremental
-    ? (rootChanged || existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION)
+    ? existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION
     : false;
 
   // R157 (DATA-R157-01 + STATE-R157-03): Premark stale BEFORE clearProjectData

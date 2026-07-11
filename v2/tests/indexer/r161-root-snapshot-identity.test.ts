@@ -191,11 +191,23 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     expect(r.staleReason).toBeUndefined();
   });
 
-  it('ROOT-R161-01f: NULL root_fingerprint (pre-R154 DB) → rootChanged=false (cold-start preserved)', async () => {
-    // Legacy DBs (pre-R154) have NULL root_fingerprint. R161 treats NULL as
-    // "no published snapshot to compare against" → rootChanged=false, so the
-    // R154 cold-start behavior is preserved (the project is upgraded by the
-    // next successful full index, not by an incremental ROOT_CHANGED refusal).
+  it('ROOT-R161-01f (R162 override): NULL root_fingerprint + existing graph → ROOT_IDENTITY_UNKNOWN (was: rootChanged=false, cold-start preserved)', async () => {
+    // R161 originally treated NULL root_fingerprint as "no published snapshot
+    // to compare against" → rootChanged=false, so the R154 cold-start behavior
+    // was preserved (the project was upgraded by the next successful full
+    // index, not by an incremental ROOT_CHANGED refusal). The R161 test
+    // asserted that the no-op succeeded (crossFileCallsStale=false).
+    //
+    // R162 (ROOT-R162-01): this is no longer the behavior. A DB with existing
+    // graph data but NULL root_fingerprint (pre-R154 DB upgraded to R161+)
+    // cannot be trusted for cross-root incremental. R161 set rootChanged=false
+    // for NULL, leaving legacy DBs vulnerable to the cross-root fast-skip
+    // (a root change with preserved metadata would fast-skip all files and
+    // certify the old graph as fresh). R162 refuses the incremental and
+    // requires a full baseline to establish root identity.
+    //
+    // This test now asserts the R162 behavior: NULL + existing graph data
+    // → ROOT_IDENTITY_UNKNOWN + full_reindex. The no-op no longer succeeds.
     writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     // Simulate a pre-R154 DB: set root_fingerprint=NULL.
@@ -203,16 +215,19 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     const db = new Database(dbPath);
     db.prepare('UPDATE projects SET root_fingerprint = NULL WHERE name = ?').run(projectName);
     db.close();
-    // Run 2: incremental from the SAME root. rootChanged should be false
-    // (publishedRootFingerprint is null). The no-op succeeds.
+    // Run 2: incremental from the SAME root.
     const r = await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: true, useWasm: true, workers: 0 });
-    // R161 (ROOT-R161-01): no ROOT_CHANGED — NULL root_fingerprint is treated
-    // as "no published snapshot" → rootChanged=false.
-    if (r.staleReason) {
-      expect(r.staleReason.code).not.toBe('ROOT_CHANGED');
-    }
-    // The no-op succeeds (rootChanged=false, semanticsStale=false, no uncertainty).
-    expect(r.crossFileCallsStale).toBe(false);
+    // R162 (ROOT-R162-01): outcome = STALE (NOT SUCCESS — R162 conservatively
+    // refuses ALL incremental when NULL fingerprint + existing graph data,
+    // regardless of whether the root is the same).
+    expect(r.outcome).toBe('STALE');
+    // R162 (ROOT-R162-01): staleReason.code = ROOT_IDENTITY_UNKNOWN (not ROOT_CHANGED).
+    expect(r.staleReason).toBeDefined();
+    expect(r.staleReason!.code).toBe('ROOT_IDENTITY_UNKNOWN');
+    expect(r.staleReason!.message).toContain('Root identity unknown');
+    // R162 (ROOT-R162-01): recovery = full_reindex.
+    expect(r.recovery).toBe('full_reindex');
+    expect(r.crossFileCallsStale).toBe(true);
   });
 
   it('ROOT-R161-01g: rootChanged takes precedence over cold-start lock in classifier', async () => {
@@ -360,9 +375,21 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     }
   });
 
-  it('OBS-R161-01c: ROOT_CHANGED staleReason has empty paths + undefined totalPaths/pathsTruncated', async () => {
-    // ROOT_CHANGED returns paths=[] and totalPaths/pathsTruncated undefined
-    // (no specific paths to surface for a fingerprint mismatch).
+  it('OBS-R161-01c (R162 override): ROOT_CHANGED staleReason has empty paths + totalPaths=0/pathsTruncated=false (was: undefined)', async () => {
+    // R161 originally returned ROOT_CHANGED via the classifier with paths=[],
+    // totalPaths=undefined, pathsTruncated=undefined (the classifier omitted
+    // these fields for ROOT_CHANGED because they weren't applicable to a
+    // fingerprint mismatch).
+    //
+    // R162 (DATA-R162-01 + RES-R162-01): ROOT_CHANGED is now emitted by an
+    // EARLY RETURN in the indexer (not the classifier). The early return
+    // sets paths=[], totalPaths=0, pathsTruncated=false explicitly. The
+    // fields are 0/false rather than undefined because the early return
+    // uses an object literal that includes all fields (matching the shape
+    // of other early returns like the full-uncertainty return). Consumers
+    // can still distinguish ROOT_CHANGED from path-surfacing staleReasons
+    // by code (ROOT_CHANGED never has paths) — the 0/false values are
+    // semantically equivalent to undefined for this code.
     writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     const newProjectDir = join(tmpDir, 'project-moved-meta');
@@ -370,12 +397,12 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     const r = await indexProjectWasm({ project: projectName, rootPath: newProjectDir, incremental: true, useWasm: true, workers: 0 });
     expect(r.staleReason).toBeDefined();
     expect(r.staleReason!.code).toBe('ROOT_CHANGED');
-    // R161 (ROOT-R161-01): paths is empty.
+    // R162 (DATA-R162-01): paths is empty.
     expect(r.staleReason!.paths).toEqual([]);
-    // R161 (OBS-R161-01): totalPaths/pathsTruncated are undefined (not
-    // applicable to a fingerprint mismatch).
-    expect(r.staleReason!.totalPaths).toBeUndefined();
-    expect(r.staleReason!.pathsTruncated).toBeUndefined();
+    // R162 (DATA-R162-01): totalPaths=0 + pathsTruncated=false (R162 early
+    // return sets these explicitly).
+    expect(r.staleReason!.totalPaths).toBe(0);
+    expect(r.staleReason!.pathsTruncated).toBe(false);
   });
 
   // ── Source-inspection regression guards ──────────────────────────────
@@ -388,13 +415,19 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     expect(src).toContain('root_fingerprint AS rootFingerprint FROM projects WHERE name = ?');
   });
 
-  it('regression: rootChanged computed + semanticsStale forced when rootChanged', () => {
+  it('regression (R162 override): rootChanged computed + early return + semanticsStale NO LONGER includes rootChanged', () => {
     const src = readFileSync(join(__dirname, '..', '..', 'src', 'indexer', 'indexer.ts'), 'utf8');
-    // R161 (ROOT-R161-01): rootChanged is computed.
+    // R161 (ROOT-R161-01): rootChanged is computed (still present in R162).
     expect(src).toContain('const publishedRootFingerprint = projectState?.rootFingerprint ?? null;');
     expect(src).toContain('const rootChanged = opts.incremental && publishedRootFingerprint !== null && publishedRootFingerprint !== rootFingerprint;');
-    // R161 (ROOT-R161-01): semanticsStale is forced when rootChanged.
-    expect(src).toContain('(rootChanged || existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION)');
+    // R162 (DATA-R162-01 + RES-R162-01): the rootChanged EARLY RETURN is
+    // present (returns STALE with ROOT_CHANGED before any mutation).
+    expect(src).toContain("code: 'ROOT_CHANGED',");
+    // R162 (STATE-R162-02): semanticsStale NO LONGER includes rootChanged.
+    // The old OR-with-rootChanged line is GONE.
+    expect(src).not.toContain('(rootChanged || existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION)');
+    // R162 (STATE-R162-02): the new semanticsStale line uses only the version check.
+    expect(src).toContain('const semanticsStale = opts.incremental\n    ? existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION\n    : false;');
   });
 
   it('regression: staleReason.code union includes ROOT_CHANGED', () => {
@@ -402,14 +435,20 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     expect(src).toContain("| 'ROOT_CHANGED'");
   });
 
-  it('regression: classifier checks rootChanged FIRST (before cold-start lock)', () => {
+  it('regression (R162 override): classifier NO LONGER has the ROOT_CHANGED branch (early return handles it)', () => {
     const src = readFileSync(join(__dirname, '..', '..', 'src', 'indexer', 'indexer.ts'), 'utf8');
-    // R161 (ROOT-R161-01): the rootChanged check is BEFORE the coldStartLock check.
-    const rootChangedIdx = src.indexOf('if (params.rootChanged)');
-    const coldStartLockIdx = src.indexOf('if (coldStartLock)');
-    expect(rootChangedIdx).toBeGreaterThan(-1);
-    expect(coldStartLockIdx).toBeGreaterThan(-1);
-    expect(rootChangedIdx).toBeLessThan(coldStartLockIdx);
+    // R161 (ROOT-R161-01): the classifier had `if (params.rootChanged)` BEFORE
+    // the coldStartLock check.
+    // R162 (STATE-R162-02): the classifier's `if (params.rootChanged)` branch
+    // has been REMOVED. ROOT_CHANGED is now emitted by an EARLY RETURN in the
+    // indexer, BEFORE the classifier is ever called. The classifier's
+    // `rootChanged` param is retained for backward compatibility but is
+    // always false in practice.
+    expect(src).not.toContain('if (params.rootChanged)');
+    // R162 (STATE-R162-02): the coldStartLock check is still present.
+    expect(src).toContain('if (coldStartLock)');
+    // R162 (STATE-R162-02): the rootChanged param is retained (deprecated).
+    expect(src).toContain('rootChanged?: boolean;');
   });
 
   it('regression: classifier accepts historicalBrokenAliasPaths + uses it for HISTORICAL_ALIAS_BROKEN', () => {
@@ -443,8 +482,8 @@ describe('R161: Root Snapshot Identity Lock + Path Precision', () => {
     expect(src).toContain('paths: string[]; totalPaths?: number; pathsTruncated?: boolean } | undefined');
   });
 
-  it('regression: package.json version is 0.66.0', () => {
+  it('regression (R162 override): package.json version is 0.67.0', () => {
     const pkg = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
-    expect(pkg).toContain('"version": "0.66.0"');
+    expect(pkg).toContain('"version": "0.67.0"');
   });
 });

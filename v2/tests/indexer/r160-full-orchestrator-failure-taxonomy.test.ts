@@ -697,14 +697,22 @@ describe('R160: Full Orchestrator Failure Taxonomy', () => {
     expect(src).toContain('paths: cappedPaths');
   });
 
-  it('regression: ROOT_CHANGED code added to staleReason.code union (R161 ROOT-R161-01)', () => {
+  it('regression (R162 override): ROOT_CHANGED code in staleReason.code union + classifier no longer has the ROOT_CHANGED branch', () => {
     const src = readFileSync(join(__dirname, '..', '..', 'src', 'indexer', 'indexer.ts'), 'utf8');
     // R161 (ROOT-R161-01): the staleReason.code union now includes ROOT_CHANGED.
+    // R162 (DATA-R162-01 + RES-R162-01): ROOT_CHANGED is still in the union
+    // (the early return uses it).
     expect(src).toContain("| 'ROOT_CHANGED'");
-    // R161 (ROOT-R161-01): the classifier checks rootChanged FIRST.
-    expect(src).toContain('if (params.rootChanged)');
-    expect(src).toContain("code: 'ROOT_CHANGED'");
+    // R162 (STATE-R162-02): the classifier NO LONGER has the ROOT_CHANGED branch.
+    // The early return in the indexer handles ROOT_CHANGED — the classifier
+    // is never called with rootChanged=true.
+    expect(src).not.toContain('if (params.rootChanged)');
+    // R162 (DATA-R162-01 + RES-R162-01): the early return sets code: ROOT_CHANGED.
+    expect(src).toContain("code: 'ROOT_CHANGED',");
     expect(src).toContain("recovery: 'full_reindex',");
+    // R162 (ROOT-R162-01): ROOT_IDENTITY_UNKNOWN code added to the union.
+    expect(src).toContain("| 'ROOT_IDENTITY_UNKNOWN'");
+    expect(src).toContain("code: 'ROOT_IDENTITY_UNKNOWN',");
   });
 
   it('regression: MAX_STALE_PATHS is a single module-level constant (R161 OBS-R161-03)', () => {
@@ -731,8 +739,8 @@ describe('R160: Full Orchestrator Failure Taxonomy', () => {
     expect(src).toContain("recovery: dryRunOutcome === 'FAILED' ? 'fix_filesystem' : undefined");
   });
 
-  it('regression: package.json version is 0.66.0 (R161 bump)', () => {
+  it('regression (R162 override): package.json version is 0.67.0 (R162 bump)', () => {
     const pkg = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
-    expect(pkg).toContain('"version": "0.66.0"');
+    expect(pkg).toContain('"version": "0.67.0"');
   });
 });

@@ -1,5 +1,306 @@
 # Changelog — Codebase Memory V2
 
+## 0.67.0 — Round 162 (2026-07-11) Root Change Early Refusal + Legacy Lock
+
+**87th round (GPT 5.6 Sol audit R161).** 5 P1 + 1 P2 fixed.
+Closes the 6 confirmed code findings of the R161 audit.
+
+### Root change EARLY REFUSAL (1 P1 + 1 P1/P2)
+
+251. **P1 DATA-R162-01 + RES-R162-01 + STATE-R162-02 ROOT_CHANGED doesn't
+     return early — sets semanticsStale=true and continues the pipeline**
+     (`indexer.ts`) — R161's root snapshot identity lock set
+     `semanticsStale = rootChanged || existingSemanticsVersion !== CURRENT`
+     and continued the pipeline. This was supposed to prevent
+     `commitAliasStateAtomically` from being called (the success commit
+     would overwrite the old graph's `root_fingerprint`). But it had three
+     bugs:
+     - **No-op path**: `semanticsStale=true` made `clearCrossFileCallEdges`
+       run in the no-op transaction, silently deleting root A's cross-file
+       CALLS edges from the graph.
+     - **Deletion-only path**: `crossFileStale=true` prevented the success
+       commit, but the cleanup transaction still ran, deleting root A's
+       nodes/edges/hashes for the "deleted" files (which were root B's
+       deletions, not root A's).
+     - **Main path**: extraction ran against root B's files, inserting
+       root B nodes/edges into a graph that still had root A's other data.
+     - Additionally, the no-op path's `noOpError` picked the
+       `semanticsStale` branch, logging "Semantics version 8 ≠ current 8"
+       even though the REAL cause was a root change and the version
+       actually matched.
+     Fixed: after computing `rootChanged`, R162 returns STALE immediately
+     WITHOUT any mutation. The early return is placed BEFORE:
+       - the premark UPSERT (no `cross_file_calls_stale=1` write)
+       - `clearProjectData` (no nodes/edges/files deletion)
+       - the contribution filter
+       - `statSync` estimation
+       - `deletedRelPaths` computation
+       - the no-op path (no `clearCrossFileCallEdges`)
+       - the deletion-only path (no per-file DELETE)
+       - the main path (no root A/B data mixing)
+     And AFTER:
+       - `projectState` read (which reads `root_fingerprint`)
+       - `rootFingerprint` computation (`computeRootFingerprint(canonicalRoot)`)
+       - `discovery` (needed for warnings: `buildDiscoveryWarnings(discovery)`)
+     The early return calls `db.close()` + `markProjectStalePreservingGraph`
+     (best-effort persist `cross_file_calls_stale=1` + `last_index_error`),
+     then returns STALE with `staleReason.code = 'ROOT_CHANGED'`,
+     `recovery: 'full_reindex'`, `paths: []`, `totalPaths: 0`,
+     `pathsTruncated: false`. The graph, root_path, root_fingerprint, and
+     all metadata are preserved.
+     - `rootChanged` removed from the `semanticsStale` computation. R162's
+       early return means `rootChanged=true` never reaches the
+       `semanticsStale` line — keeping `rootChanged` in the OR would be
+       dead code AND would falsely log the semantics-mismatch message.
+     - The classifier's `if (params.rootChanged)` branch is REMOVED
+       (dead code — the early return handles ROOT_CHANGED directly). The
+       `rootChanged` param is retained on the classifier signature for
+       backward compatibility (callers still pass it, always false in
+       practice). The `ROOT_CHANGED` code remains in the
+       `staleReason.code` union (the early return uses it).
+
+### Legacy root bootstrap lock (1 P1)
+
+252. **P1 ROOT-R162-01 Legacy DBs with root_fingerprint=NULL get
+     rootChanged=false, leaving them vulnerable to cross-root fast-skip**
+     (`indexer.ts`) — R161 treated NULL `root_fingerprint` as "no
+     published snapshot to compare against" → `rootChanged=false`,
+     preserving the R154 cold-start behavior for legacy DBs. But a legacy
+     DB (pre-R154, upgraded to R161+) with existing graph data and NULL
+     `root_fingerprint` cannot be trusted for cross-root incremental — a
+     root change with preserved metadata (same relative paths, mtime_ns,
+     size) would fast-skip all files and certify the old graph as fresh.
+     Fixed: after the `rootChanged` early return, R162 adds a new
+     `rootIdentityUnknown = opts.incremental && publishedRootFingerprint
+     === null && hasExistingGraphData` check. When true, R162 returns
+     STALE immediately with `staleReason.code = 'ROOT_IDENTITY_UNKNOWN'`,
+     `recovery: 'full_reindex'`. The check is conservative — it fires
+     for ANY incremental with NULL fingerprint + existing graph data,
+     including a same-root incremental. Without a published fingerprint,
+     we cannot verify the root identity, so we cannot trust the existing
+     graph for incremental mode. The user must run a full reindex to
+     establish the `root_fingerprint` baseline. Subsequent incrementals
+     then work normally.
+     - `hasExistingGraphData` is the hoisted EXISTS check
+       (`EXISTS(SELECT 1 FROM nodes ...) || EXISTS(SELECT 1 FROM file_hashes ...)`)
+       — previously a local variable inside the cold-start lock's
+       conditional, now computed unconditionally so the R162 check can
+       reuse it. Computing it unconditionally is cheap (two EXISTS
+       queries that short-circuit at the first match).
+     - `ROOT_IDENTITY_UNKNOWN` added to the `staleReason.code` union.
+     - Edge case: a project that has NEVER been indexed (no nodes, no
+       hashes) has `hasExistingGraphData=false`. The R162 check does NOT
+       fire — the first incremental is allowed (and effectively becomes a
+       no-op since there's no graph to compare against).
+
+### Preserve root_path on stale runs (1 P1)
+
+253. **P1 STATE-R162-01 updateProjectStats() always sets
+     root_path = excluded.root_path, even on stale runs**
+     (`schema.ts`) — R161's `updateProjectStats` UPSERT's
+     `ON CONFLICT(name) DO UPDATE SET root_path = excluded.root_path`
+     unconditionally. This meant a stale run (semantics mismatch,
+     uncertainty, or R162's `ROOT_CHANGED`/`ROOT_IDENTITY_UNKNOWN` early
+     return that uses `markProjectStalePreservingGraph` + the
+     no-op/deletion-only stale path) would overwrite the published
+     `root_path` with the attempted root. If the attempted root was
+     different from the published root, the DB would record
+     `root_path=B` while `root_fingerprint=A` — a contradiction that
+     could mislead Graph Status and the next run's `root_fingerprint`
+     computation.
+     Fixed: `root_path = CASE WHEN excluded.last_successful_index_at IS
+     NOT NULL THEN excluded.root_path ELSE root_path END`. The CASE
+     preserves the published `root_path` when `last_successful_index_at`
+     is NULL (i.e., the run is stale/failed). On success
+     (`last_successful_index_at` is NOT NULL), `root_path` is updated
+     to the new value. `commitAliasStateAtomically` (the success-only
+     path) is unchanged — it still uses `root_path = excluded.root_path`
+     unconditionally, which is correct (it only runs on success).
+
+### Test coverage (1 P1)
+
+254. **P1 TEST-R162-01 No test verifies graph is unchanged after
+     ROOT_CHANGED** (`tests/indexer/r162-root-early-refusal.test.ts`,
+     new) — R161's tests verified that `crossFileCallsStale=true` and
+     `staleReason.code='ROOT_CHANGED'` but did NOT verify that the graph
+     itself (nodes, edges, file_hashes, root_path, root_fingerprint) was
+     unchanged. R161's semanticsStale approach allowed mutations:
+     - No-op path cleared cross-file CALLS edges.
+     - Deletion-only path deleted nodes/edges/hashes for "deleted" files.
+     - Main path inserted root B nodes/edges into root A's graph.
+     Fixed: R162 adds 21 tests covering:
+     - **DATA-R162-01a**: root change no-op preservation — nodes/edges/
+       file_hashes/root_path/root_fingerprint UNCHANGED.
+     - **DATA-R162-01b**: root change deletion-only preservation — no
+       rows deleted (the cleanup transaction does NOT run).
+     - **DATA-R162-01c**: root change main preservation — no root B data
+       inserted (extraction does NOT run; verified by querying for the
+       bNew function name).
+     - **ROOT-R162-01a**: legacy NULL cross-root → STALE +
+       ROOT_IDENTITY_UNKNOWN + nodes UNCHANGED.
+     - **ROOT-R162-01b**: legacy NULL same-root → STALE +
+       ROOT_IDENTITY_UNKNOWN (conservative — see test comment).
+     - **ROOT-R162-01c**: legacy NULL same-root with no existing data →
+       not refused (hasExistingGraphData=false).
+     - **ROOT-R162-01d**: full reindex from new root → SUCCESS +
+       root_fingerprint + root_path updated.
+     - **STATE-R162-01a**: stale no-op (semantics mismatch) preserves
+       root_path.
+     - **STATE-R162-01b**: source-inspection — updateProjectStats uses
+       the CASE WHEN clause; commitAliasStateAtomically still uses
+       `root_path = excluded.root_path` (the success path).
+     - 12 source-inspection regression guards (ROOT_IDENTITY_UNKNOWN in
+       union, hasExistingGraphData hoisted, early returns placed before
+       premark+clearProjectData, rootIdentityUnknown check uses
+       publishedRootFingerprint + hasExistingGraphData, both early
+       returns call markProjectStalePreservingGraph + db.close(),
+       ROOT_CHANGED staleReason includes totalPaths=0 +
+       pathsTruncated=false, classifier rootChanged param marked
+       DEPRECATED, package.json version 0.67.0).
+
+### Files changed
+
+- `v2/src/indexer/indexer.ts`:
+  - Added `| 'ROOT_IDENTITY_UNKNOWN'` to `staleReason.code` union in
+    `IndexResult`. Updated the docstring to explain R162's early return
+    approach.
+  - Hoisted `hasExistingGraphData` (was `hasExistingData`, local to the
+    cold-start lock's `if (!bootstrapComplete && brokenAliases > 0)`
+    block) to be computed UNCONDITIONALLY before the cold-start lock
+    check. The R162 legacy root bootstrap lock reuses this EXISTS check.
+  - After `rootChanged` is computed (line ~1165), added the R162 root
+    change EARLY RETURN: `db.close()` +
+    `markProjectStalePreservingGraph(dbPath, opts.project, rootMsg)` +
+    return STALE with `staleReason.code = 'ROOT_CHANGED'`,
+    `recovery: 'full_reindex'`, `paths: []`, `totalPaths: 0`,
+    `pathsTruncated: false`. Placed BEFORE the premark UPSERT,
+    `clearProjectData`, the contribution filter, `statSync` estimation,
+    `deletedRelPaths` computation, the no-op path, the deletion-only
+    path, and the main path. Placed AFTER the `projectState` read,
+    `rootFingerprint` computation, and `discovery` (needed for
+    `buildDiscoveryWarnings`).
+  - After the `rootChanged` early return, added the R162 legacy root
+    bootstrap lock: `rootIdentityUnknown = opts.incremental &&
+    publishedRootFingerprint === null && hasExistingGraphData`. When
+    true, returns STALE with `staleReason.code = 'ROOT_IDENTITY_UNKNOWN'`,
+    `recovery: 'full_reindex'`, `paths: []`, `totalPaths: 0`,
+    `pathsTruncated: false`.
+  - Removed `rootChanged` from the `semanticsStale` computation. R162's
+    early return means `rootChanged=true` never reaches this line.
+    Old: `semanticsStale = opts.incremental ? (rootChanged ||
+    existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION)
+    : false`. New: `semanticsStale = opts.incremental ?
+    existingSemanticsVersion !== CURRENT_EXTRACTOR_SEMANTICS_VERSION
+    : false`.
+  - Removed the `if (params.rootChanged) { return { code: 'ROOT_CHANGED',
+    ... } }` branch from `classifyStaleReason`. ROOT_CHANGED is now
+    emitted by the early return, not the classifier. The `rootChanged`
+    param is retained on the classifier signature for backward
+    compatibility (marked DEPRECATED in the comment).
+- `v2/src/indexer/schema.ts`:
+  - `updateProjectStats` UPSERT's `ON CONFLICT DO UPDATE SET` clause:
+    changed `root_path = excluded.root_path` to
+    `root_path = CASE WHEN excluded.last_successful_index_at IS NOT NULL
+    THEN excluded.root_path ELSE root_path END`. The CASE preserves the
+    published `root_path` on stale/failed runs (when
+    `last_successful_index_at` is NULL). Updated the function's docstring
+    to document the R162 change.
+    - `commitAliasStateAtomically` is UNCHANGED — it still uses
+      `root_path = excluded.root_path` (it only runs on success, so the
+      unconditional update is correct).
+- `v2/tests/indexer/r162-root-early-refusal.test.ts` (new): 21 tests.
+- `v2/tests/indexer/r161-root-snapshot-identity.test.ts`:
+  - Updated `ROOT-R161-01f` to expect R162's `ROOT_IDENTITY_UNKNOWN`
+    behavior (was: NULL fingerprint → rootChanged=false → no-op succeeds;
+    now: NULL fingerprint + existing data → ROOT_IDENTITY_UNKNOWN +
+    full_reindex).
+  - Updated `OBS-R161-01c` to expect R162's `totalPaths=0` +
+    `pathsTruncated=false` (was: `undefined`; the R162 early return
+    sets these explicitly).
+  - Updated regression guards: `rootChanged computed + semanticsStale
+    forced when rootChanged` → `rootChanged computed + early return +
+    semanticsStale NO LONGER includes rootChanged`. `classifier checks
+    rootChanged FIRST` → `classifier NO LONGER has the ROOT_CHANGED
+    branch`. `package.json version is 0.66.0` → `0.67.0`.
+- `v2/tests/indexer/r160-full-orchestrator-failure-taxonomy.test.ts`:
+  - Updated `ROOT_CHANGED code added to staleReason.code union` to
+    verify ROOT_CHANGED is still in the union AND the classifier's
+    `if (params.rootChanged)` branch is GONE. Added ROOT_IDENTITY_UNKNOWN
+    assertions.
+  - Updated `package.json version is 0.66.0` → `0.67.0`.
+- `v2/tests/indexer/r158-publication-orchestrator-classifier.test.ts`:
+  - Updated `ROOT-R158-01b` to assert R162's preservation: the
+    deletion-only cleanup transaction does NOT run (was: "still ran"
+    in R161). Added assertion that root A's b.ts nodes are PRESERVED
+    (R161 would have deleted them).
+- `v2/package.json`: bumped 0.66.0 → 0.67.0.
+- `v2/CHANGELOG.md`: added R162 entry with all 6 findings.
+- `docs/V2_CURRENT_STATE.md`: updated header + validation date to R162;
+  added full R162 section; corrected the R161 "refuse incremental" claim
+  (R161 didn't actually refuse — it set semanticsStale=true and
+  continued; R162 is the first round that actually refuses via early
+  return).
+
+### Tests added (21 in r162-root-early-refusal.test.ts)
+
+- 3 DATA-R162-01 + TEST-R162-01 preservation tests:
+  - 01a: root change no-op preservation — graph UNCHANGED (nodes, edges,
+    file_hashes, root_path, root_fingerprint).
+  - 01b: root change deletion-only preservation — no rows deleted.
+  - 01c: root change main preservation — no root B data inserted
+    (verified by querying for the bNew function name).
+- 4 ROOT-R162-01 tests:
+  - 01a: legacy NULL cross-root → STALE + ROOT_IDENTITY_UNKNOWN + nodes
+    UNCHANGED.
+  - 01b: legacy NULL same-root → STALE + ROOT_IDENTITY_UNKNOWN
+    (conservative — see test comment for deviation from spec).
+  - 01c: legacy NULL same-root with no existing data → not refused
+    (hasExistingGraphData=false).
+  - 01d: full reindex from new root → SUCCESS + root_fingerprint +
+    root_path updated.
+- 2 STATE-R162-01 tests:
+  - 01a: stale no-op (semantics mismatch) preserves root_path.
+  - 01b: source-inspection — updateProjectStats uses CASE WHEN;
+    commitAliasStateAtomically still uses root_path = excluded.root_path.
+- 3 STATE-R162-02 tests:
+  - 02a: rootChanged no longer injected into semanticsStale.
+  - 02b: classifier no longer has the ROOT_CHANGED branch.
+  - 02c: classifier never returns ROOT_CHANGED (early return handles it).
+- 9 source-inspection regression guards (ROOT_IDENTITY_UNKNOWN in union,
+  hasExistingGraphData hoisted, early returns placed before
+  premark+clearProjectData, rootIdentityUnknown check uses
+  publishedRootFingerprint + hasExistingGraphData, both early returns
+  call markProjectStalePreservingGraph + db.close(), ROOT_CHANGED
+  staleReason includes totalPaths=0 + pathsTruncated=false, classifier
+  rootChanged param marked DEPRECATED, package.json version 0.67.0).
+
+### Validation
+
+- `cd v2 && npx tsc -p tsconfig.json --noEmit` — PASS (0 errors)
+- `cd v2 && npm run build` — PASS (0 errors, dist/ regenerated)
+- `cd v2 && npx vitest run` — PASS (93 files, 927 tests, 0 regressions)
+- `cd v2 && npx vitest run tests/indexer/` — PASS (60 files, 564 tests;
+  +1 file +21 tests vs R161's 59/543)
+
+### Total bugs fixed across all rounds: 254 + 11 optimizations + 564 indexer tests across 87 rounds
+
+### Known carryovers (open)
+
+- `failure.code = 'RESOLVER_ERROR' | 'UNKNOWN'` not yet emitted (declared
+  in R160 taxonomy, still not emitted).
+- `classifyStaleReason` is still a private helper (design choice; tested
+  indirectly via IndexResult.staleReason.code).
+- The R162 `rootIdentityUnknown` check is conservative — it refuses ALL
+  incremental with NULL fingerprint + existing graph data, including
+  same-root incrementals. A future round could relax this by comparing
+  the published `root_path` column with the current root path (if they
+  match, the root identity is verified even without a fingerprint). For
+  now, the conservative stance is intentional — NULL fingerprint means
+  we cannot verify root identity, so we cannot trust the existing graph.
+- Outer catch loses partial `result` info when extraction partially
+  succeeds then deleteTx crashes (intentional — catastrophic failure
+  takes priority; premark ensures stale=1 in DB).
+
 ## 0.66.0 — Round 161 (2026-07-11) Root Snapshot Identity Lock
 
 **86th round (GPT 5.6 Sol audit R160).** 4 P1/P2 fixed.

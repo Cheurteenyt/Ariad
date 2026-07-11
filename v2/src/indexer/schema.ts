@@ -1042,6 +1042,19 @@ export function clearProjectData(db: Database.Database, project: string): void {
  *   discovery_policy_version, and root_fingerprint. These are only updated on
  *   success (indexError === null) — a failed run does not upgrade the policy
  *   version or mark the history as initialized.
+ * R162 (STATE-R162-01): root_path is now preserved on stale/failed runs.
+ *   Previously, the ON CONFLICT DO UPDATE clause unconditionally set
+ *   `root_path = excluded.root_path`, which meant a stale run (semantics
+ *   mismatch, uncertainty, or R162's ROOT_CHANGED/ROOT_IDENTITY_UNKNOWN early
+ *   return that uses markProjectStalePreservingGraph + the no-op/deletion-only
+ *   stale path) would overwrite the published root_path with the attempted
+ *   root. If the attempted root was different from the published root, the
+ *   DB would record root_path=B while root_fingerprint=A — a contradiction
+ *   that could mislead Graph Status and the next run's root_fingerprint
+ *   computation. Now root_path is only updated when last_successful_index_at
+ *   is NOT NULL (i.e., the run succeeded). On stale/failed runs, root_path
+ *   is preserved (CASE WHEN excluded.last_successful_index_at IS NOT NULL
+ *   THEN excluded.root_path ELSE root_path END).
  */
 export function updateProjectStats(
   db: Database.Database,
@@ -1072,7 +1085,7 @@ export function updateProjectStats(
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
-      root_path = excluded.root_path,
+      root_path = CASE WHEN excluded.last_successful_index_at IS NOT NULL THEN excluded.root_path ELSE root_path END,
       indexed_at = excluded.indexed_at,
       node_count = excluded.node_count,
       edge_count = excluded.edge_count,
