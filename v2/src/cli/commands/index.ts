@@ -121,11 +121,31 @@ export function registerIndexCommand(program: Command): void {
           console.log(`  Run "cbm-v2 stats --project ${project}" to see the graph.`);
         } else if (result.outcome === 'STALE') {
           console.log();
-          if (result.errors.length > 0) {
-            console.log(`⚠ Project "${project}" indexed with ${result.errors.length} error(s).`);
+          // R156 (OBS-R156-01): show structured staleReason + recovery.
+          if (result.staleReason) {
+            console.log(`⚠ Project "${project}" graph is stale: ${result.staleReason.message}`);
+            if (result.staleReason.paths.length > 0) {
+              console.log(`  Affected paths:`);
+              for (const p of result.staleReason.paths.slice(0, 10)) {
+                console.log(`    - ${p}`);
+              }
+              if (result.staleReason.paths.length > 10) {
+                console.log(`    ... and ${result.staleReason.paths.length - 10} more`);
+              }
+            }
+          } else {
+            console.log(`⚠ Cross-file CALLS may be stale.`);
           }
-          console.log(`⚠ Cross-file CALLS may be stale.`);
-          console.log(`  Run "cbm-v2 index --project ${project} --root ${rootPath}" (full reindex) to rebuild them.`);
+          // R156 (AVAIL-R156-01): recovery recommendation.
+          if (result.recovery === 'fix_filesystem') {
+            console.log(`  Recovery: fix or remove the broken symlinks listed above, then rerun.`);
+          } else if (result.recovery === 'retry_incremental') {
+            console.log(`  Recovery: retry when the filesystem is stable.`);
+          } else if (result.recovery === 'full_reindex') {
+            console.log(`  Run "cbm-v2 index --project ${project} --root ${rootPath}" (full reindex) to rebuild them.`);
+          } else {
+            console.log(`  Run "cbm-v2 index --project ${project} --root ${rootPath}" (full reindex) to rebuild them.`);
+          }
         } else if (result.outcome === 'PARTIAL' || result.outcome === 'FAILED') {
           console.log();
           console.log(`⚠ Project "${project}" indexed with ${result.errors.length} error(s).`);

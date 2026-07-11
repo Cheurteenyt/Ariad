@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R155 (2026-07-11).
+> **Authoritative snapshot of the current product state.** Updated R156 (2026-07-11).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -139,6 +139,67 @@ scalability gaps identified in the R154 audit:
 
 `CURRENT_DISCOVERY_POLICY_VERSION = 2` (bumped from 1 — fingerprint format
 change forces re-population of alias_history).
+
+## R156 — CI Hotfix + Truthful State + Directory Alias + Graph UI Bridge
+
+R156 (round 81) closes the CI blocker, the truthful-state gap, and the
+directory-alias duplicate identified in the R155 audit, plus adds the
+GitHub ↔ GitLab branch bridge for graph-ui contributions:
+
+- **CI blocker fix** (`CI-R156-01`): R155 imported `mkfifoSync` from
+  `node:fs`, which doesn't exist in Node.js. The TypeScript typecheck
+  failed, blocking ALL backend CI on every MR. Fixed by replacing
+  `mkfifoSync` with `spawnSync('mkfifo', ...)` wrapped in a `createFifo()`
+  helper that returns `false` on Windows/macOS.
+- **Truthful state on commit failure** (`TX-R156-01`): the indexer now
+  pre-marks `cross_file_calls_stale=1` BEFORE extraction (only on the
+  main path). If `commitAliasStateAtomically` fails, the pre-marked
+  stale=1 remains truthfully set — the graph IS stale (extraction
+  committed in its own transaction, but the projects row can't rollback
+  to stale=0). The catch block also best-effort persists the commit
+  error message. If the commit succeeds, it clears stale=0 atomically.
+- **Directory alias duplicate historization** (`ALIAS-R156-01`):
+  `resolvedAliases.push` is now BEFORE the `visitedDirs.has` dedup check.
+  Two aliases (aliasA, aliasB) to the same directory are BOTH historized
+  — history and traversal are separate concerns.
+- **Structured staleReason + recovery** (`OBS-R156-01`): `IndexResult`
+  now carries `staleReason?: { code, message, paths }` and
+  `recovery?: 'retry_incremental' | 'fix_filesystem' | 'full_reindex' |
+  'none'`. The full-uncertainty return builds a structured staleReason
+  with code in {DISCOVERY_UNCERTAIN, HISTORICAL_ALIAS_BROKEN,
+  COLD_START_LOCK}. The CLI displays the message, affected paths, and
+  recovery recommendation.
+- **Non-circular cold-start message** (`AVAIL-R156-01`): the cold-start
+  lock message now says "Fix or remove the broken symlinks (see paths
+  below), then rerun." instead of the circular "run a successful full
+  index first". The recovery field is `'fix_filesystem'`.
+- **GitLab MR CI gate** (`CI-FLOW-R156-01`): replaced the echo-only
+  `mr-preflight` job with a real `github-ci-gate` job that pushes the
+  MR's SHA to a temporary GitHub branch, triggers the `gitlab-mr-ci`
+  workflow via `repository_dispatch`, polls for the conclusion, and
+  fails the GitLab pipeline if GitHub CI failed. The new
+  `gitlab-mr-ci.yml` workflow runs backend + frontend typecheck/build/test
+  on the MR's SHA. Transitional: `allow_failure: true` until the
+  workflow is on GitHub main.
+- **graph-ui branch sync** (`CI-FLOW-R156-01`): new
+  `sync-graph-ui-to-gitlab.yml` workflow runs after the upstream `CI`
+  workflow succeeds on a `graph-ui/**` branch. It pushes the SHA to
+  GitLab under the same name and creates/updates a GitLab MR. Uses
+  `workflow_run` trigger to access repository secrets safely. See
+  [GITHUB_GITLAB_BRANCH_BRIDGE.md](GITHUB_GITLAB_BRANCH_BRIDGE.md) for
+  the architecture and security model.
+
+### Known limitations (R156)
+
+- **`github-ci-gate` is `allow_failure: true`** (transitional): until the
+  `gitlab-mr-ci.yml` workflow is on GitHub main (after this MR merges and
+  mirrors), the gate is non-blocking. A follow-up commit should remove
+  `allow_failure: true`.
+- **graph-ui sync only triggers on `graph-ui/**` branches**: other
+  branches don't get the GitHub PR → GitLab MR bridge.
+- **`persistAliasHistory` is dead code** (`QUAL-R156-01`): R155 replaced
+  it with `commitAliasStateAtomically` for all success paths. Kept as a
+  stable API for external callers (MCP tools).
 
 ## Current versions
 

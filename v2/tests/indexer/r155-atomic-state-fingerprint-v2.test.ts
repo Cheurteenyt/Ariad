@@ -1,13 +1,30 @@
 // v2/tests/indexer/r155-atomic-state-fingerprint-v2.test.ts
 // R155: Atomic Alias State + Root Fingerprint v2 + Special File Safety + Scalable GC
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, mkfifoSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
 import { indexProjectWasm } from '../../src/indexer/indexer.js';
 import { CURRENT_EXTRACTOR_SEMANTICS_VERSION, CURRENT_DISCOVERY_POLICY_VERSION, loadAliasHistory, computeRootFingerprint } from '../../src/indexer/schema.js';
 import { defaultCodeDbPath } from '../../src/bridge/sqlite-ro.js';
+
+/**
+ * R156 (CI-R156-01): Node.js does not provide fs.mkfifoSync. R155 imported it
+ * from node:fs, which broke the TypeScript typecheck and the backend CI.
+ * R156 replaces it with spawnSync('mkfifo', ...) on Linux, with an explicit
+ * skip on Windows/macOS where mkfifo is unavailable.
+ */
+function createFifo(path: string): boolean {
+  if (process.platform === 'win32') return false;
+  try {
+    const result = spawnSync('mkfifo', [path], { stdio: 'ignore' });
+    return result.error === undefined && result.status === 0;
+  } catch {
+    return false;
+  }
+}
 
 describe('R155: Atomic State + Fingerprint v2 + Special File Safety', () => {
   let tmpDir: string, projectDir: string, cacheDir: string, projectName: string;
@@ -96,20 +113,14 @@ describe('R155: Atomic State + Fingerprint v2 + Special File Safety', () => {
   // ── ALIAS-R155-01: Special file type safety ─────────────────────────
 
   it('ALIAS-R155-01a: FIFO with .ts extension is NOT historized', async () => {
-    // mkfifo requires a real filesystem (not tmpfs on some CI). Skip if it throws.
-    let fifoCreated = false;
-    try {
-      writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
-      mkfifoSync(join(projectDir, 'pipe.ts'));
-      fifoCreated = true;
-    } catch {
-      // mkfifo not available or not supported — skip this test.
-    }
-    if (!fifoCreated) {
+    // R156 (CI-R156-01): use spawnSync('mkfifo') instead of non-existent fs.mkfifoSync.
+    writeFileSync(join(projectDir, 'a.ts'), 'export function a() { return 1; }\n');
+    const fifoPath = join(projectDir, 'pipe.ts');
+    if (!createFifo(fifoPath)) {
       console.warn('ALIAS-R155-01a: skipped — mkfifo not available');
       return;
     }
-    symlinkSync(join(projectDir, 'pipe.ts'), join(projectDir, 'pipe-link.ts'));
+    symlinkSync(fifoPath, join(projectDir, 'pipe-link.ts'));
     await indexProjectWasm({ project: projectName, rootPath: projectDir, incremental: false, useWasm: true, workers: 0 });
     const dbPath = defaultCodeDbPath(projectName);
     const db = new Database(dbPath, { readonly: true });

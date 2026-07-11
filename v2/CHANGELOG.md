@@ -1,5 +1,136 @@
 # Changelog — Codebase Memory V2
 
+## 0.61.0 — Round 156 (2026-07-11) CI Hotfix + Truthful State + Directory Alias + Graph UI Bridge
+
+**81st round (GPT 5.6 Sol audit R155).** 2 P1 + 3 P1/P2 + 3 P2 fixed.
+Closes the 8 confirmed code findings of the R155 audit + adds the GitHub ↔
+GitLab branch bridge for graph-ui contributions.
+
+### CI blocker (1 P1)
+
+204. **P1 BLOCKER mkfifoSync doesn't exist in Node.js** (`tests/r155-atomic-
+     state-fingerprint-v2.test.ts`) — The R155 test imported `mkfifoSync`
+     from `node:fs`, which doesn't exist. The TypeScript typecheck failed,
+     which blocked ALL backend CI (typecheck, build, test) on every MR.
+     The test could never run. Fixed: replaced `mkfifoSync` with
+     `spawnSync('mkfifo', ...)`, wrapped in a `createFifo()` helper that
+     returns `false` on Windows/macOS where `mkfifo` is unavailable. The
+     FIFO test now skips cleanly instead of breaking the typecheck.
+     (CI-R156-01)
+
+### Truthful state (1 P1)
+
+205. **P1 graph writes commit before alias state — commit failure leaves
+     fresh graph** (`indexer.ts`) — R155's main path extracted nodes/edges
+     (committed in their own transaction) THEN called
+     `commitAliasStateAtomically` to flip stale=1→0. If the atomic commit
+     failed (disk full, SQLite corruption), the graph was mutated but
+     stale stayed at its previous value. For a previously-fresh project
+     (stale=0), the comment "graph stays stale" was FALSE — stale was
+     already 0, so a commit failure left the graph falsely fresh despite
+     being half-mutated. Fixed: pre-mark stale=1 BEFORE extraction (only
+     on the main path — no-op and deletion-only fast paths return early
+     and don't need it). If the commit succeeds, it clears stale=0
+     atomically. If the commit fails, the pre-marked stale=1 remains —
+     the graph IS truthfully stale. The catch block also best-effort
+     persists the commit error message to `last_index_error`.
+     (TX-R156-01)
+
+### Directory alias duplicate (1 P1)
+
+206. **P1 duplicate directory alias never historized** (`wasm-extractor.ts`)
+     — R155 put `resolvedAliases.push({ ..., targetKind: 'directory' })`
+     AFTER the `visitedDirs.has(realTarget)` dedup check. If two aliases
+     (aliasA, aliasB) pointed to the same directory, the first one pushed
+     to the stack and marked visitedDirs. The second hit the dedup check,
+     hit `continue`, and was never historized. When aliasB later broke
+     and the target disappeared, no history protected the old subtree —
+     the incremental index silently deleted the entire subtree. Fixed:
+     `resolvedAliases.push` is now BEFORE the `visitedDirs.has` check.
+     History and traversal are separate concerns: ALL aliases are
+     historized regardless of traversal dedup. (ALIAS-R156-01)
+
+### Observability + availability (2 P1/P2)
+
+207. **P1/P2 no staleReason field in IndexResult** (`indexer.ts`,
+     `cli/commands/index.ts`) — R155 returned `outcome: 'STALE'` with
+     `errors: []` (per OUTCOME-R155-01). The human-readable reason was
+     only in the DB's `last_index_error`, not on the `IndexResult`. CLI,
+     API, and MCP consumers couldn't programmatically access the reason.
+     Fixed: added `staleReason?: { code, message, paths }` and
+     `recovery?: 'retry_incremental' | 'fix_filesystem' | 'full_reindex' |
+     'none'` to `IndexResult`. The full-uncertainty return builds a
+     structured staleReason with code in {DISCOVERY_UNCERTAIN,
+     HISTORICAL_ALIAS_BROKEN, COLD_START_LOCK}. The main-path return
+     uses code=SEMANTICS_MISMATCH for semantics-version mismatches. The
+     CLI displays the staleReason message, the affected paths (up to 10),
+     and the recovery recommendation. (OBS-R156-01)
+
+208. **P1/P2 cold-start message circular** (`indexer.ts`) — R154's cold-
+     start lock message said "run a successful full index first". But
+     the cold-start lock fires precisely because the full index is
+     blocked (broken aliases present, history not initialized). The user
+     had no way out: the only suggested recovery was the action being
+     blocked. Fixed: the message now says "Fix or remove the broken
+     symlinks (see paths below), then rerun." The structured
+     staleReason includes the broken alias paths. The recovery field
+     is `'fix_filesystem'`, and the CLI displays a recovery hint.
+     (AVAIL-R156-01)
+
+### CI flow (1 P1 process + 2 P2)
+
+209. **P1 process GitLab mr-preflight is just echo** (`.gitlab-ci.yml`,
+     `.github/workflows/gitlab-mr-ci.yml`) — R54's `mr-preflight` job was
+     a 2-second `echo` that did nothing. Real CI only ran on GitHub
+     Actions after the MR merged to main. A broken MR could merge and
+     break main before anyone noticed. Fixed: replaced with a real
+     `github-ci-gate` job that pushes the MR's SHA to a temporary GitHub
+     branch, triggers the `gitlab-mr-ci` workflow via
+     `repository_dispatch`, polls for the conclusion (15-min timeout),
+     and fails the GitLab pipeline if GitHub CI failed. The new
+     `gitlab-mr-ci.yml` workflow runs the backend (typecheck + build +
+     test) and frontend (typecheck + build + test) on the MR's SHA.
+     Transitional: `allow_failure: true` until the workflow is on
+     GitHub main (after this MR merges and mirrors). A follow-up commit
+     should remove `allow_failure`. (CI-FLOW-R156-01)
+
+210. **P2 graph-ui branches don't flow to GitLab MRs**
+     (`.github/workflows/sync-graph-ui-to-gitlab.yml`,
+     `docs/GITHUB_GITLAB_BRANCH_BRIDGE.md`) — Frontend contributors had
+     no way to open a PR on GitHub (familiar flow, free CI) and have it
+     automatically mirrored to a GitLab MR. Fixed: new
+     `sync-graph-ui-to-gitlab.yml` workflow runs after the upstream `CI`
+     workflow succeeds on a `graph-ui/**` branch. It validates the
+     branch name, pushes the SHA to GitLab under the same name, and
+     creates or updates a GitLab MR. Uses `workflow_run` trigger (not
+     `pull_request`) to access repository secrets safely. Documented
+     the architecture, security model, and operational procedures in
+     `docs/GITHUB_GITLAB_BRANCH_BRIDGE.md`. (CI-FLOW-R156-01)
+
+211. **P2 dead persistAliasHistory duplicate** (`schema.ts`) — R155
+     added `commitAliasStateAtomically` (atomic history + stats) but
+     kept the old `persistAliasHistory` helper for the deletion-only
+     path. The deletion-only path was updated to use the atomic helper
+     in R155, so `persistAliasHistory` is now dead code. Documented;
+     kept for now as a stable API for external callers (MCP tools).
+     (QUAL-R156-01)
+
+### Tests (9 new)
+
+- **ALIAS-R156-01** (2 tests): two aliases to same dir → both historized,
+  second alias breaks → still protected.
+- **OBS-R156-01** (3 tests): STALE outcome carries staleReason with code,
+  recovery recommendation, paths array.
+- **AVAIL-R156-01** (2 tests): cold-start message says "Fix or remove"
+  (not "run a successful full first"), staleReason.code === COLD_START_LOCK.
+- **TX-R156-01** (2 tests): successful full/incremental index ends with
+  stale=0 (pre-mark overwritten by atomic commit).
+- **CI-R156-01** (2 tests): r155 test file no longer imports mkfifoSync,
+  createFifo helper returns false on unsupported platforms.
+- **Regression** (1 test): staleReason is undefined on SUCCESS outcome.
+
+### Total: 211 bugs + 11 optimizations + 453 indexer tests across 81 rounds
+
 ## 0.60.0 — Round 155 (2026-07-11) Atomic Alias State + Fingerprint v2 + Special File Safety
 
 **80th round (GPT 5.6 Sol audit R154).** 1 P1 + 3 P1/P2 + 5 P2 + 1 P3 fixed.
