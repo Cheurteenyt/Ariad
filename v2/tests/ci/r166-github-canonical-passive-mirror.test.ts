@@ -178,6 +178,305 @@ describe("R166 — documentation reflects GitHub-canonical workflow", () => {
   it("CONTRIBUTING.md mentions GitHub Pull Request workflow", () => {
     expect(contributing.toLowerCase()).toMatch(/pull request/);
   });
+
+  // R167 additions — stronger doc fidelity checks (TEST-R167-01)
+  it("CONTRIBUTING.md has exactly one '## CI/CD' heading (no duplicate stale block)", () => {
+    const matches = contributing.match(/^## CI\/CD$/gm) ?? [];
+    expect(matches.length).toBe(1);
+  });
+
+  it("CONTRIBUTING.md does not mention the old GitLab → GitHub mirror architecture", () => {
+    expect(contributing).not.toContain("GitLab → GitHub mirror");
+  });
+
+  it("CONTRIBUTING.md does not mention mirror-to-github", () => {
+    expect(contributing).not.toContain("mirror-to-github");
+  });
+
+  it("CONTRIBUTING.md does not mention mr-preflight", () => {
+    expect(contributing).not.toContain("mr-preflight");
+  });
+
+  it("CONTRIBUTING.md does not mention 'Push to a feature branch on GitLab'", () => {
+    expect(contributing).not.toContain("Push to a feature branch on GitLab");
+  });
+
+  it("CONTRIBUTING.md does not claim GitHub Actions has unlimited minutes", () => {
+    expect(contributing).not.toContain("GitHub Actions has unlimited");
+  });
+});
+
+// =============================================================================
+// R167 — Documentation Fidelity + Mirror Hardening regression tests
+// =============================================================================
+
+describe("R167 — MAINTAINERS_GUIDE.md doc fidelity", () => {
+  const guide = readRepoFile("MAINTAINERS_GUIDE.md");
+
+  it("MAINTAINERS_GUIDE.md does not mention --force-with-lease (forbidden since R166)", () => {
+    expect(guide).not.toContain("--force-with-lease");
+  });
+
+  it("MAINTAINERS_GUIDE.md does not contain stale version 0.12.2", () => {
+    expect(guide).not.toContain("0.12.2");
+  });
+
+  it("MAINTAINERS_GUIDE.md does not contain stale test count '376 tests'", () => {
+    expect(guide).not.toContain("376 tests");
+  });
+
+  it("MAINTAINERS_GUIDE.md does not contain stale test count '353 tests'", () => {
+    expect(guide).not.toContain("353 tests");
+  });
+
+  it("MAINTAINERS_GUIDE.md does not claim GITHUB_MIRROR_TOKEN has been removed (cannot observe external state)", () => {
+    expect(guide).not.toContain("GITHUB_MIRROR_TOKEN has been removed");
+  });
+
+  it("MAINTAINERS_GUIDE.md states the GITHUB_MIRROR_TOKEN invariant as MUST NOT exist", () => {
+    expect(guide).toContain("GITHUB_MIRROR_TOKEN");
+    // Match across newlines (the phrase spans 2 lines in the doc).
+    expect(guide).toMatch(/GITHUB_MIRROR_TOKEN[\s\S]*?MUST NOT exist/);
+  });
+
+  it("MAINTAINERS_GUIDE.md documents never-force invariant for the mirror", () => {
+    expect(guide.toLowerCase()).toMatch(/never\s*force/);
+  });
+
+  it("MAINTAINERS_GUIDE.md documents fail-closed divergence handling", () => {
+    expect(guide.toLowerCase()).toMatch(/fail[\s-]*closed/);
+  });
+});
+
+describe("R167 — bridge doc operational completeness", () => {
+  const bridge = readRepoFile("docs/GITHUB_GITLAB_BRANCH_BRIDGE.md");
+
+  it("bridge doc documents the host key verification failure incident", () => {
+    expect(bridge).toContain("Host key verification failed");
+  });
+
+  it("bridge doc documents protected branch authorization", () => {
+    expect(bridge).toContain("protected branch");
+  });
+
+  it("bridge doc documents the dry-run / pre-receive limitation", () => {
+    expect(bridge).toContain("git push --dry-run");
+    expect(bridge).toContain("pre-receive");
+  });
+
+  it("bridge doc names the GitHub environment", () => {
+    expect(bridge).toContain("gitlab-passive-mirror");
+  });
+
+  it("bridge doc names the SSH private key secret", () => {
+    expect(bridge).toContain("GITLAB_MIRROR_SSH_PRIVATE_KEY");
+  });
+
+  it("bridge doc names the 'Allowed to push and merge' GitLab concept", () => {
+    expect(bridge).toContain("Allowed to push and merge");
+  });
+});
+
+// =============================================================================
+// R167 — Mirror workflow hardening (split steps + fingerprint checks)
+// =============================================================================
+
+describe("R167 — mirror workflow split into diagnostic steps", () => {
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+
+  it("workflow has 9+ named steps (split from 1 monolithic in R166)", () => {
+    // Count the "- name:" entries in the steps section
+    const stepMatches = mirror.match(/^      - name: /gm) ?? [];
+    expect(stepMatches.length).toBeGreaterThanOrEqual(9);
+  });
+
+  it("workflow has a 'Validate event identity' step", () => {
+    expect(mirror).toContain("Validate event identity");
+  });
+
+  it("workflow has a 'Checkout exact CI-validated SHA' step", () => {
+    expect(mirror).toContain("Checkout exact CI-validated SHA");
+  });
+
+  it("workflow has a 'Materialize SSH key' step", () => {
+    expect(mirror).toMatch(/Materialize SSH key/);
+  });
+
+  it("workflow has a 'Verify client key fingerprint' step", () => {
+    expect(mirror).toContain("Verify client key fingerprint");
+  });
+
+  it("workflow has a 'Verify GitLab.com host key fingerprint' step", () => {
+    expect(mirror).toContain("Verify GitLab.com host key fingerprint");
+  });
+
+  it("workflow has a 'Read GitHub main and GitLab main' step", () => {
+    expect(mirror).toContain("Read GitHub main and GitLab main");
+  });
+
+  it("workflow has a 'Classify mirror state and fast-forward push' step", () => {
+    expect(mirror).toContain("Classify mirror state and fast-forward push");
+  });
+
+  it("workflow has a 'Post-push verification' step", () => {
+    expect(mirror).toContain("Post-push verification");
+  });
+
+  it("workflow has a 'Write mirror summary' step (if: always)", () => {
+    expect(mirror).toContain("Write mirror summary");
+  });
+
+  it("workflow has a 'Remove SSH material' step (if: always)", () => {
+    expect(mirror).toContain("Remove SSH material");
+  });
+});
+
+describe("R167 — fingerprint verification contract", () => {
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+
+  it("workflow reads GITLAB_MIRROR_KEY_FINGERPRINT variable", () => {
+    expect(mirror).toContain("GITLAB_MIRROR_KEY_FINGERPRINT");
+  });
+
+  it("workflow reads GITLAB_ED25519_HOST_FINGERPRINT variable", () => {
+    expect(mirror).toContain("GITLAB_ED25519_HOST_FINGERPRINT");
+  });
+
+  it("workflow verifies the client key fingerprint with ssh-keygen -y + -lf", () => {
+    expect(mirror).toContain("ssh-keygen -y");
+    expect(mirror).toContain("-lf");
+  });
+
+  it("workflow fails closed on client key fingerprint mismatch", () => {
+    expect(mirror).toContain("Client deploy key fingerprint mismatch");
+  });
+
+  it("workflow fails closed on host key fingerprint mismatch", () => {
+    expect(mirror).toContain("GitLab.com host key fingerprint mismatch");
+  });
+
+  it("workflow does NOT disable StrictHostKeyChecking", () => {
+    expect(mirror).not.toContain("StrictHostKeyChecking no");
+    expect(mirror).not.toContain("UserKnownHostsFile /dev/null");
+  });
+});
+
+describe("R167 — push error classifier", () => {
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+
+  it("workflow classifies HOST_KEY_MISMATCH errors", () => {
+    expect(mirror).toContain("HOST_KEY_MISMATCH");
+  });
+
+  it("workflow classifies SSH_PUBLICKEY_REJECTED errors", () => {
+    expect(mirror).toContain("SSH_PUBLICKEY_REJECTED");
+  });
+
+  it("workflow classifies PROTECTED_BRANCH_REJECTED errors", () => {
+    expect(mirror).toContain("PROTECTED_BRANCH_REJECTED");
+  });
+
+  it("workflow classifies NON_FAST_FORWARD errors", () => {
+    expect(mirror).toContain("NON_FAST_FORWARD");
+  });
+
+  it("workflow classifies REMOTE_UNREACHABLE errors", () => {
+    expect(mirror).toContain("REMOTE_UNREACHABLE");
+  });
+
+  it("workflow classifies UNKNOWN_GIT_ERROR errors", () => {
+    expect(mirror).toContain("UNKNOWN_GIT_ERROR");
+  });
+});
+
+describe("R167 — invariants preserved from R166", () => {
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+
+  it("workflow still uses -o ci.no_pipeline", () => {
+    expect(mirror).toContain("-o ci.no_pipeline");
+  });
+
+  it("workflow still uses contents:read only", () => {
+    expect(mirror).toMatch(/permissions:\s*\n\s*contents:\s*read/);
+  });
+
+  it("workflow still uses persist-credentials: false", () => {
+    expect(mirror).toContain("persist-credentials: false");
+  });
+
+  it("workflow still uses StrictHostKeyChecking yes", () => {
+    expect(mirror).toContain("StrictHostKeyChecking yes");
+  });
+
+  it("workflow still uses the gitlab-passive-mirror environment", () => {
+    expect(mirror).toContain("environment: gitlab-passive-mirror");
+  });
+
+  it("workflow still does NOT use --force on main push", () => {
+    expect(mirror).not.toMatch(/git\s+push\s+.*--force/);
+    expect(mirror).not.toMatch(/git\s+push\s+.*--force-with-lease/);
+  });
+
+  it("workflow still does NOT use --mirror", () => {
+    expect(mirror).not.toMatch(/git\s+push\s+.*--mirror/);
+  });
+
+  it("workflow still checks ancestry (fast-forward-only)", () => {
+    expect(mirror).toContain("git merge-base --is-ancestor");
+  });
+
+  it("workflow still has DIVERGENCE fail-closed", () => {
+    expect(mirror).toContain("DIVERGENCE");
+  });
+
+  it("workflow still has the same workflow_run trigger filter", () => {
+    expect(mirror).toContain("github.event.workflow_run.conclusion == 'success'");
+    expect(mirror).toContain("github.event.workflow_run.event == 'push'");
+    expect(mirror).toContain("github.event.workflow_run.head_branch == 'main'");
+    expect(mirror).toContain(
+      "github.event.workflow_run.head_repository.full_name == github.repository",
+    );
+  });
+
+  it("workflow still removes SSH material at the end (if: always)", () => {
+    expect(mirror).toMatch(/if:\s*always/);
+    expect(mirror).toContain("rm -f");
+    expect(mirror).toContain("gitlab_mirror_ed25519");
+  });
+});
+
+describe("R167 — CI_CONTINUITY.md exists", () => {
+  const continuity = readRepoFile("docs/CI_CONTINUITY.md");
+
+  it("CI_CONTINUITY.md exists and is non-empty", () => {
+    expect(continuity.length).toBeGreaterThan(1000);
+  });
+
+  it("CI_CONTINUITY.md documents Level 1 (delayed)", () => {
+    expect(continuity).toContain("Level 1");
+    expect(continuity.toLowerCase()).toContain("delayed");
+  });
+
+  it("CI_CONTINUITY.md documents Level 2 (unavailable extended)", () => {
+    expect(continuity).toContain("Level 2");
+  });
+
+  it("CI_CONTINUITY.md documents Level 3 (GitHub entirely unavailable)", () => {
+    expect(continuity).toContain("Level 3");
+  });
+
+  it("CI_CONTINUITY.md documents the quarterly exercise", () => {
+    expect(continuity.toLowerCase()).toMatch(/quarterly/);
+    expect(continuity).toContain("git fsck");
+  });
+
+  it("CI_CONTINUITY.md forbids reactivating GitLab CI as fallback", () => {
+    expect(continuity.toLowerCase()).toMatch(/reactivate.*gitlab.*runner/);
+  });
+
+  it("CI_CONTINUITY.md forbids promoting GitLab to canonical", () => {
+    expect(continuity.toLowerCase()).toMatch(/promote.*gitlab.*canonical/);
+  });
 });
 
 describe("R166 — package version bumped", () => {
@@ -185,8 +484,13 @@ describe("R166 — package version bumped", () => {
     version: string;
   };
 
-  it("v2/package.json version is 0.71.0", () => {
-    expect(pkg.version).toBe("0.71.0");
+  it("v2/package.json version is at least 0.71.0 (R166 bump, R167 = 0.72.0)", () => {
+    // R166 bumped to 0.71.0. R167 bumped to 0.72.0. Future rounds may bump
+    // further; this test asserts we never regress below the R166 floor.
+    const v = pkg.version;
+    const [major, minor] = v.split(".").map(Number);
+    expect(major).toBe(0);
+    expect(minor).toBeGreaterThanOrEqual(71);
   });
 });
 

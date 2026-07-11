@@ -219,3 +219,317 @@ After each mirror run, verify:
 
 These items remain important but are deferred to keep R166
 audit-able and reversible.
+
+## 11. Bootstrap incident record (R165/R166 postmortem)
+
+The current architecture is the result of an incident and a recovery
+sequence that must not be forgotten. This section documents what
+happened so future maintainers (human or AI) do not reintroduce the
+patterns that failed.
+
+### 11.1 Initial incident — GitLab shared runner quota
+
+```
+GitLab shared runner quota: 432 / 400 minutes
+Consequence: mirror-to-github job could not run
+Effect: GitLab main advanced to R165, GitHub main stayed at R164
+```
+
+The quota was exhausted by the old bidirectional architecture where
+GitLab was canonical and pushed to GitHub via a `mirror-to-github` CI
+job. This is what motivated the R166 cutover to GitHub-canonical.
+
+### 11.2 R165 recovery difficulties
+
+1. SSH wrapper (asyncssh/Paramiko) could not perform a duplex Git fetch
+   in the recovery environment — only SSH command exec worked.
+2. Retrieving files via the GitLab API was insufficient to prove the
+   Git commit identity (parents, tree, SHA).
+3. No GitHub API credential was available to create a Pull Request from
+   the recovery environment.
+4. GitHub repository policy blocked `GITHUB_TOKEN` from creating Pull
+   Requests (`Allow GitHub Actions to create and approve pull requests`
+   checkbox was unchecked).
+5. Unauthenticated GitHub REST API rate limit (60/hour, shared per IP)
+   was repeatedly exhausted while polling workflow runs.
+6. Final recovery: an exact fast-forward SSH push of the R165 commit to
+   `main` after a separate `automation/validate-r165` workflow ran the
+   full backend + frontend test suite on the exact SHA.
+
+Result:
+
+```
+R165 commit preserved exactly (SHA 26f19cd8...)
+GitHub main fast-forwarded
+GitHub Actions CI green
+No force-push used
+```
+
+### 11.3 R166 cutover — four mirror runs
+
+The `mirror-main-to-gitlab` workflow required four runs before success:
+
+| Run | Failure mode | Root cause | Fix |
+|-----|--------------|------------|-----|
+| 1 | `GITLAB_REPOSITORY_SSH_URL is empty` | GitHub environment not configured | Configure environment + secret + 2 variables |
+| 2 | `Host key verification failed` | `GITLAB_KNOWN_HOSTS` contained a stale ed25519 host key that did not match what GitLab.com actually presents | Capture live host key via paramiko handshake; compare fingerprint against `SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8` |
+| 3 | `GitLab: You are not allowed to push code to protected branches on this project` | Deploy key had write access but was not in the `Allowed to push and merge` list for the protected `main` branch | Add the deploy key to `Allowed to push and merge` for `main` in GitLab Settings → Repository → Protected branches |
+| 4 | success | — | — |
+
+### 11.4 Lessons mandatory for future rounds
+
+- A secret/variable being non-empty does not prove it is correct.
+- A green SSH configuration step does not prove authentication works.
+- `git push --dry-run` does not prove the pre-receive hook will accept
+  the real push on a protected branch (the hook does not run on
+  dry-run).
+- A deploy key with write access must ALSO be authorized by the
+  protected-branch rule on `main`.
+- A host key captured dynamically from the network must never be
+  accepted without comparison to an official pinned fingerprint.
+- A monolithic Git step turns multiple causes into an opaque `exit 128`.
+- The Job Summary must reflect the exact failing step and the real
+  diagnostic, not a generic "Process completed with exit code 128".
+
+## 12. Environment configuration contract
+
+The mirror workflow reads three values from the GitHub environment
+named `gitlab-passive-mirror`. All three are required and the workflow
+fails closed if any is missing or empty.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `GITLAB_MIRROR_SSH_PRIVATE_KEY` | secret | OpenSSH-format ed25519 private key (387 bytes, no passphrase) |
+| `GITLAB_REPOSITORY_SSH_URL` | variable | `git@gitlab.com:cheurteen1/codebase-memory-V2.git` |
+| `GITLAB_KNOWN_HOSTS` | variable | Pinned GitLab.com host keys (full file content, not a path) |
+
+The environment is restricted to the `main` branch. No required
+reviewers and no wait timer — otherwise every mirror would block on a
+human.
+
+Common configuration mistakes (each has caused a real failure during
+the R166 bootstrap):
+
+- Secret named `GITLAB_MIRROR_PRIVATE_KEY` (wrong name).
+- Variable named `GITLAB_REPOSITORY_URL` (wrong name).
+- Repository-level secret only (workflow reads environment-level).
+- Variable value set to the local filesystem path of `known_hosts`
+  instead of the file content.
+- Public key pasted into the secret instead of the private key.
+- PKCS8 (`*.pem`) format used instead of OpenSSH format.
+- Quote marks added around the private key.
+- Trailing whitespace or missing newline at end of `END OPENSSH PRIVATE
+  KEY` line.
+
+## 13. SSH identities and fingerprints
+
+Three distinct SSH keys are in scope. They must not be confused.
+
+### 13.1 Client deploy key (GitLab, project-scoped)
+
+```
+Public key : ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJKTdD3se4yH0BUPpZ1lnIwIpTZzD5UlD8gcjSP6/R9O
+Fingerprint: SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M
+Registered : GitLab project deploy key (write access + authorized on protected main)
+Private key : GitHub Actions secret GITLAB_MIRROR_SSH_PRIVATE_KEY
+```
+
+This is the key the mirror workflow uses to authenticate to GitLab as
+a client. It is **project-scoped** — never reuse it on another GitLab
+project.
+
+### 13.2 Server host key (GitLab.com ed25519)
+
+```
+Public key : ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf
+Fingerprint: SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8
+Pinned in  : GitHub Actions variable GITLAB_KNOWN_HOSTS
+```
+
+This is the key GitLab.com presents as an SSH server. It is **not
+secret** — anyone can probe it by connecting to `gitlab.com:22`. Its
+role is to let the client verify it is talking to the real GitLab.com
+and not a man-in-the-middle. If GitLab rotates this key, the mirror
+workflow will fail with `Host key verification failed` — this is the
+security working as intended; do not disable `StrictHostKeyChecking`.
+
+### 13.3 Difference between the two
+
+| Aspect | Client deploy key (13.1) | Server host key (13.2) |
+|--------|--------------------------|------------------------|
+| Belongs to | The client (GitHub Actions) | The server (GitLab.com) |
+| Purpose | Authenticate client to server | Authenticate server to client |
+| Secret? | Yes — private key never logged | No — public, probed by anyone |
+| Stored where | GitHub secret `GITLAB_MIRROR_SSH_PRIVATE_KEY` | GitHub variable `GITLAB_KNOWN_HOSTS` |
+| Rotation trigger | Suspected compromise | GitLab announces host key rotation |
+
+A future AI might confuse the two and try to "fix" a host key failure
+by rotating the client deploy key, or vice versa. They are independent
+and rotate on different schedules.
+
+## 14. Protected branch authorization
+
+GitLab protects `main` against direct pushes by default. A deploy key
+with project-level write access is **not** automatically authorized to
+push to `main` — it must also be added to the `Allowed to push and
+merge` list for `main`.
+
+Configuration path:
+
+```
+GitLab → cheurteen1/codebase-memory-V2 → Settings → Repository → Protected branches → main
+```
+
+Required state:
+
+```
+Branch                       : main
+Allowed to merge             : Maintainers
+Allowed to push and merge    : Maintainers + github-actions-passive-mirror (deploy key)
+Allowed to force push        : NO    (must remain disabled)
+```
+
+If the deploy key is removed from `Allowed to push and merge`, the
+mirror workflow will fail with:
+
+```
+remote: GitLab: You are not allowed to push code to protected branches on this project.
+! [remote rejected] <SHA> -> main (pre-receive hook declined)
+```
+
+Re-add the deploy key to the list — do **not** disable branch
+protection as a workaround.
+
+## 15. Diagnostic matrix
+
+When the mirror workflow fails, classify the error before re-running.
+Re-running blindly after a configuration problem is what caused Run 2
+and Run 3 during the R166 bootstrap.
+
+| Symptom in logs | Category | Fix |
+|-----------------|----------|-----|
+| `GITLAB_REPOSITORY_SSH_URL is empty` | ENV_MISSING | Create the `gitlab-passive-mirror` environment + add the variable |
+| `GITLAB_MIRROR_SSH_PRIVATE_KEY is empty` or `test -n` failed | SECRET_MISSING | Add the environment secret |
+| `Host key verification failed` / `REMOTE HOST IDENTIFICATION HAS CHANGED` | HOST_KEY_MISMATCH | Verify the live GitLab.com host key against an official source; update `GITLAB_KNOWN_HOSTS` |
+| `Permission denied (publickey)` | SSH_PUBLICKEY_REJECTED | Verify deploy key fingerprint on GitLab; verify the secret contains the matching private key |
+| `GitLab: You are not allowed to push code to protected branches` | PROTECTED_BRANCH_REJECTED | Add deploy key to `Allowed to push and merge` for `main` |
+| `! [remote rejected] (non-fast-forward)` | NON_FAST_FORWARD | Investigate divergence; do NOT force-push |
+| `DIVERGENCE: GitLab main contains history absent from GitHub main` | DIVERGENCE | Stop. Audit GitLab-only commits. Cherry-pick them to a GitHub PR if they should be preserved. |
+| `Could not read from remote repository` | REMOTE_UNREACHABLE | Retry; if persistent, check GitLab status |
+| `exit code 128` with no clear cause | UNKNOWN_GIT_ERROR | Re-run the workflow with step-by-step diagnostics (R167 splits the monolithic step) |
+
+## 16. Dry-run limitations
+
+`git push --dry-run` is a useful preflight but does **not** exercise
+the server-side `pre-receive` hook. This means:
+
+- A dry-run can succeed even if the real push will be rejected by a
+  protected-branch rule.
+- A dry-run can succeed even if the real push will be rejected by a
+  custom server-side hook.
+
+The mirror workflow uses dry-run only to verify the fast-forward
+eligibility and SSH authentication. The real push can still fail on
+server-side policies. This is why Run 3 of the R166 bootstrap failed
+even though the local dry-run (in the recovery environment) had
+succeeded.
+
+When diagnosing a mirror failure, do not assume "the dry-run worked
+locally" means "the push should work in CI". The CI runner and the
+local environment may have different network paths, different SSH
+client versions, and different GitLab server endpoints (load-balanced).
+
+## 17. GitHub Actions / API limitations encountered
+
+These limitations were encountered during R165/R166 and are documented
+here so future maintainers do not waste time rediscovering them.
+
+### 17.1 `GITHUB_TOKEN` cannot create Pull Requests by default
+
+Even with `permissions: pull-requests: write` in the workflow YAML,
+GitHub blocks `gh pr create` (and the equivalent REST API call) unless
+the repository setting **Allow GitHub Actions to create and approve
+pull requests** is enabled.
+
+Path: `Settings → Actions → General → Workflow permissions →
+Allow GitHub Actions to create and approve pull requests`.
+
+This is a repository-level policy, separate from the workflow YAML
+permissions. It cannot be toggled by the workflow itself.
+
+### 17.2 SSH key ≠ GitHub API credential
+
+A deploy key (SSH) authorizes Git transport (`git push`, `git fetch`).
+It does **not** authorize REST API calls (`gh pr create`,
+`gh api repos/...`). The R165 recovery tried to create a PR via the
+SSH-authenticated identity and failed with 403.
+
+To create PRs from GitHub Actions, you need either:
+
+- The repository setting above + the auto-provided `GITHUB_TOKEN`, OR
+- A GitHub App installation token with `Pull requests: write`, OR
+- A fine-grained PAT stored as a secret.
+
+### 17.3 Unauthenticated API rate limit
+
+The GitHub REST API allows 60 requests/hour per IP when unauthenticated.
+This is shared across all users behind the same NAT. The R165 recovery
+hit this limit multiple times while polling workflow runs.
+
+For polling Actions runs from outside GitHub Actions, prefer the public
+HTML pages (which include status badges) or wait for the rate limit to
+reset.
+
+## 18. Break-glass manual mirror runbook
+
+If the `mirror-main-to-gitlab` workflow is broken and you need to
+manually advance GitLab `main` to a known-good GitHub SHA, follow this
+runbook. This is a one-time administrator action, not a regular
+operation.
+
+### 18.1 Prerequisites
+
+- GitHub `main` is at the target SHA and CI is green.
+- GitLab `main` is at an ancestor of the target SHA (fast-forward
+  eligible).
+- You have SSH access to GitLab with a deploy key that is authorized
+  on protected `main`.
+
+### 18.2 Steps
+
+```bash
+set -euo pipefail
+
+# Use the dedicated mirror key (NOT the shared GLM key)
+KEY=/path/to/gitlab_mirror_ed25519
+GITLAB_URL=git@gitlab.com:cheurteen1/codebase-memory-V2.git
+
+# Use the current GitHub main SHA — do not hard-code an old SHA
+CURRENT_GITHUB_MAIN="$(git ls-remote https://github.com/Cheurteenyt/codebase-mirror.git refs/heads/main | awk '{print $1}')"
+
+# Verify GitLab main is an ancestor (fast-forward eligible)
+REMOTE_GITLAB_MAIN="$(git ls-remote "$GITLAB_URL" refs/heads/main | awk '{print $1}')"
+git merge-base --is-ancestor "$REMOTE_GITLAB_MAIN" "$CURRENT_GITHUB_MAIN"
+
+# Dry-run first (does NOT exercise pre-receive hook — see section 16)
+git push --dry-run -o ci.no_pipeline "$GITLAB_URL" "$CURRENT_GITHUB_MAIN:refs/heads/main"
+
+# Real fast-forward push
+git push -o ci.no_pipeline "$GITLAB_URL" "$CURRENT_GITHUB_MAIN:refs/heads/main"
+
+# Verify
+git ls-remote "$GITLAB_URL" refs/heads/main
+# Must equal $CURRENT_GITHUB_MAIN
+```
+
+### 18.3 What never to do
+
+- Do not use `--force`, `--force-with-lease`, or `--mirror`.
+- Do not push a SHA that has not passed CI on GitHub `main`.
+- Do not push a SHA that is not an ancestor of current GitHub `main`
+  (would roll back GitLab).
+- Do not disable branch protection as a workaround.
+- Do not re-enable GitLab CI pipelines as a workaround.
+- Do not promote GitLab to canonical, even temporarily.
+
+If any of these seems necessary, stop and declare an incident.

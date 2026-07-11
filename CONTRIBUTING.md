@@ -224,32 +224,22 @@ Currently requires editing 5 files (single source of truth not yet implemented):
 4. `src/obsidian/importer.ts` → `inferLabelFromFrontmatter` map
 5. `src/human/schema.ts` → `obsidianPathFor` switch
 
-## CI/CD
+## Required checks before merge
 
-The project uses a **GitLab → GitHub mirror** setup (GitHub Actions has unlimited
-minutes for public repos; GitLab free tier is limited).
+GitHub is the canonical repository since R166. See the `## CI/CD` section
+near the top of this document for the architecture. Standard GitHub-hosted
+runners are free for public repositories; larger runners and storage
+follow separate billing/limits.
 
-### Pipeline flow
-1. Push to a feature branch on GitLab → MR pipeline runs `mr-preflight` (R54)
-2. Merge to `main` on GitLab → `mirror-to-github` job pushes to GitHub
-3. GitHub Actions CI runs 3 jobs: `backend` (typecheck+build+test),
-   `frontend` (same), `quota-report` (schedule-only, R55 D5)
-
-### Install command
-The project uses `npm install --no-audit --no-fund` (not `npm ci`) because
-`package-lock.json` is gitignored (platform-specific lockfiles). See
-`.gitignore` for the rationale.
-
-### Required checks before merge
 ```bash
 cd v2 && npm run build && npx vitest run     # see v2/CHANGELOG.md for current test count
-cd ../graph-ui && npx tsc --noEmit && npx vitest run  # 23 frontend tests
+cd ../graph-ui && npx tsc --noEmit && npx vitest run
 ```
 All tests must pass with 0 regressions. A failed pipeline blocks merge.
-See `v2/CHANGELOG.md` for the current test count (R153: 418 indexer tests + 773 project tests).
+See `v2/CHANGELOG.md` for the current test count.
 
 See `MAINTAINERS_GUIDE.md` for the full workflow (SSH setup, deploy keys,
-branch protection, MR push options, etc.).
+branch protection, GitHub PR push options, etc.).
 
 ## Release Process
 

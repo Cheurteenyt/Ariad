@@ -20,8 +20,8 @@ The canonical workflow for every change (audit fix, new feature, bug fix):
    pass with 0 regressions before committing.
 4. **Docs** — update in parallel: CHANGELOG.md entry, package.json version,
    README/docs references, and any affected operational docs.
-5. **Commit** — one commit per round (e.g. R56). Message format:
-   `docs(v2): 0.12.3 R56 self-audit + MAINTAINERS_GUIDE (3 improvements)`
+5. **Commit** — one commit per round (e.g. R167). Message format:
+   `infra(v2): R167 Mirror Hardening + Docs Fidelity + Credential Rotation — 0.71.0 → 0.72.0`
 6. **Push** — `git push -u origin v2/r<n>-<short-name>` (GitHub is
    canonical since R166).
 7. **PR** — open a Pull Request on GitHub from `v2/r<n>-<short-name>`
@@ -83,15 +83,38 @@ billion-laughs DoS attacks.
 
 ## Anti-patterns (do NOT do these)
 
-### Mirror job — never `--force` without lease
-```bash
-# WRONG — silently overwrites GitHub-only commits (e.g. merged PRs)
-git push "$GH_URL" HEAD:main --force
+### Mirror main — never force, even with lease (R166+)
 
-# RIGHT — fails loudly if GitHub main diverged
-GH_MAIN=$(git ls-remote "$GH_URL" refs/heads/main | awk '{print $1}')
-git push "$GH_URL" HEAD:main --force-with-lease=main:"$GH_MAIN"
+Since R166 the architecture is GitHub canonical → GitLab passive mirror.
+The mirror workflow is **fast-forward only**. A divergence must fail
+closed and be audited manually, never auto-repaired.
+
+```bash
+# WRONG — destroys GitLab-only history, hides root cause
+git push --force             gitlab HEAD:main
+git push --mirror            gitlab
+# (any other force-push variant, with or without lease, is also forbidden)
+
+# RIGHT — read both SHAs, verify ancestry, fast-forward only
+GH_MAIN="$(git rev-parse origin/main)"
+GL_MAIN="$(git ls-remote gitlab refs/heads/main | awk '{print $1}')"
+git merge-base --is-ancestor "$GL_MAIN" "$GH_MAIN"   # fail-closed if not
+git push -o ci.no_pipeline gitlab "$GH_MAIN:refs/heads/main"
 ```
+
+All force-push variants (bare `--force`, lease-tracked, `--mirror`) are
+forbidden since R166. They were legitimate pre-R166 for the old GitLab →
+GitHub mirror recovery but are no longer acceptable for the GitLab
+passive mirror: any divergence must be audited, not overwritten. The
+mirror workflow enforces fast-forward-only semantics via ancestry checks
+before any push, and the regression test in
+`v2/tests/ci/r166-github-canonical-passive-mirror.test.ts` (extended in
+R167) rejects any future reintroduction of force-push flags.
+
+Force-push was sometimes legitimate in the old GitLab → GitHub mirror
+(pre-R166) for recovery scenarios. It is no longer legitimate for the
+GitLab passive mirror: any divergence is an incident to investigate,
+not a situation to overwrite.
 
 ### Token in URL — never embed
 ```bash
@@ -158,17 +181,20 @@ quota-report API call) must have their own job-level override.
   environment with `GITLAB_MIRROR_SSH_PRIVATE_KEY` secret and
   `GITLAB_REPOSITORY_SSH_URL` / `GITLAB_KNOWN_HOSTS` variables.
 - **GitLab CI** (`.gitlab-ci.yml`): passive sentinel since R166. No
-  pipelines, no MRs, no schedules, no runners. `GITHUB_MIRROR_TOKEN` has
-  been removed.
+  pipelines, no MRs, no schedules, no runners. The variable
+  `GITHUB_MIRROR_TOKEN` is obsolete and MUST NOT exist — verify its
+  absence during the post-mirror operational checklist (the doc cannot
+  observe external secrets, so it states the invariant, not the state).
 - **Branch protection**: `main` is protected. Push to feature branches →
   GitHub PR → CI green → merge → mirror auto → GitLab `main` (passive).
 
 ## Test infrastructure
 
-- **Backend** (`v2/tests/`): 32 test files, 353 tests, vitest.
-- **Frontend** (`graph-ui/src/`): 11 test files, 23 tests, vitest +
-  @testing-library/react + jsdom.
-- **Total**: 376 tests, all passing at time of writing (0.12.2).
+- **Backend** (`v2/tests/`): see `v2/CHANGELOG.md` for the current test
+  count. The number changes every round and is intentionally NOT
+  hard-coded here to avoid drift.
+- **Frontend** (`graph-ui/src/`): see `v2/CHANGELOG.md` for the current
+  test count.
 
 ### Test patterns
 - Each fix should have a test that would FAIL if the fix were reverted
@@ -337,7 +363,7 @@ These invariants MUST hold for every round. Violations are P1 bugs.
 | R52 | 0.12.1 | CI quality + security hardening |
 | R53 | 0.12.1 | Claude Sonnet R8 audit (D1/D2/B1-B3/Part C/Part E) |
 | R54 | 0.12.1 | CI pipeline fix (workflow:rules + block scalars + lease SHA) |
-| R55 | 0.12.2 | Claude Sonnet R9 audit (Part A + D3 + D4 + D5) |
+| R55 | (see CHANGELOG) | Claude Sonnet R9 audit (Part A + D3 + D4 + D5) |
 | R56 | 0.12.3 | self-audit + MAINTAINERS_GUIDE (symlink escape test, backup version clarify) |
 | R57 | 0.12.4 | doc cleanup + private maintainers notes (12 stale refs, pitfalls/checklist/lessons) |
 | R58 | 0.12.5 | code quality + type safety + perf (18 as any→row types, 3 hot-path prepared statements) |
@@ -399,14 +425,21 @@ R54b fixed this.
 **Prevention**: Always use block scalars (`|`) for multi-line scripts in YAML.
 Never put unquoted `: ` in a `- echo "..."` line.
 
-### 4. `--force-with-lease` fails on URL push without explicit SHA
-**Pattern**: `git push --force-with-lease "$URL" HEAD:main` fails with "stale
-info" on the 2nd+ run because git has no remote-tracking ref for a bare URL.
-R54c fixed this.
+### 4. Force-push is no longer legitimate for the GitLab passive mirror (R166+)
+**Historical pattern (pre-R166)**: the old GitLab → GitHub mirror
+recovery sometimes used force-push with lease SHA tracking. R54c
+documented the workaround for stale-info errors on URL push.
 
-**Prevention**: Always `ls-remote` first to get the expected SHA, then
-`--force-with-lease=main:<sha>`. For first-time mirror (empty ls-remote),
-fall back to `--force`.
+**R166 change**: the GitLab passive mirror is **fast-forward only**.
+`--force`, all force-push-with-lease variants, and `--mirror` are
+forbidden. A divergence between GitHub `main` and GitLab `main` must
+fail closed and be audited manually — never auto-repaired by a
+force-push. The mirror workflow enforces this via
+`git merge-base --is-ancestor` checks before any push.
+
+**Prevention**: do not reintroduce force-push for the mirror. If the
+mirror workflow reports `DIVERGENCE`, investigate the GitLab-only
+commits before doing anything else.
 
 ### 5. Workflow-level `permissions:` silently breaks job-specific API calls
 **Pattern**: Setting `permissions: contents: read` at workflow level makes
@@ -533,8 +566,8 @@ Workarounds:
 - Use `--depth=N` for shallow fetches when possible
 
 ### `sed -i` over-replaces version strings
-Using `sed -i 's/0.12.2/0.12.3/g'` across all docs also changes the R55
-entry in CHANGELOG.md. Always verify after sed:
+Using `sed` to bump a version across all docs also changes the
+historical round entries in CHANGELOG.md. Always verify after sed:
 `grep -rn "<new-version>" v2/CHANGELOG.md` and fix historical entries
 that shouldn't have been changed.
 

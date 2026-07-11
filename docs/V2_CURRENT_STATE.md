@@ -415,6 +415,102 @@ publication failure (making programmatic triage impossible).
   full-uncertainty return remains hand-rolled for the message/recovery
   differences. A future round may unify these.
 
+## R167 — Mirror Hardening + Documentation Fidelity + Credential Rotation
+
+R167 (round 92) is an infrastructure-hardening round. No code semantics
+change. Closes the operational memory gaps identified after R166 and
+hardens the mirror workflow against the four failure modes encountered
+during the R166 bootstrap.
+
+### Operational verdict (R166 + R167)
+
+```text
+GitHub main = 52983854231da9e79a80318ddef58cc8c5f9a83b  (R166, canonical)
+GitLab main = 52983854231da9e79a80318ddef58cc8c5f9a83b  (R166, mirrored)
+GitHub branches = main only
+GitLab branches = main only
+Mirror workflow = green
+CI on push/main = green (Backend + Frontend)
+No GitLab pipeline created for the mirrored SHA
+```
+
+### Documentation Fidelity (R167A)
+
+- **CONTRIBUTING.md**: removed the duplicate stale `## CI/CD` block that
+  still described the old GitLab → GitHub mirror architecture. Exactly
+  one `## CI/CD` heading remains.
+- **MAINTAINERS_GUIDE.md**: replaced `--force-with-lease` patterns with
+  `no-force, fast-forward-only, fail-closed` patterns. Removed stale
+  hardcoded test counts and version `0.12.2`. Replaced
+  `GITHUB_MIRROR_TOKEN has been removed` (claims to observe external
+  state) with `GITHUB_MIRROR_TOKEN is obsolete and MUST NOT exist`
+  (states an invariant).
+- **docs/GITHUB_GITLAB_BRANCH_BRIDGE.md**: extended with 8 new sections
+  (11–18) — bootstrap postmortem, environment configuration contract,
+  SSH identities and fingerprints, protected branch authorization,
+  diagnostic matrix, dry-run limitations, GitHub Actions/API
+  limitations, break-glass manual mirror runbook.
+- **docs/CI_CONTINUITY.md** (NEW): operational resilience plan with
+  three incident levels (delayed / unavailable / GitHub entirely down),
+  quarterly disaster-recovery exercise, and "what never to do" list.
+
+### Mirror Hardening (R167B)
+
+The monolithic mirror step in `mirror-main-to-gitlab.yml` was split
+into 9 diagnostic steps:
+
+1. Validate event identity
+2. Checkout exact CI-validated SHA
+3. Materialize SSH key + known_hosts
+4. **Verify client key fingerprint** (SEC-R167-01) — derives public key
+   from private key via `ssh-keygen -y`, computes SHA256 fingerprint,
+   compares against `GITLAB_MIRROR_KEY_FINGERPRINT` variable.
+5. **Verify GitLab.com host key fingerprint** (SEC-R167-02) — extracts
+   ed25519 entry from `GITLAB_KNOWN_HOSTS`, computes SHA256 fingerprint,
+   compares against `GITLAB_ED25519_HOST_FINGERPRINT` variable.
+6. Read GitHub main + GitLab main (divergence fail-closed)
+7. Classify mirror state and fast-forward push (with **error classifier**
+   — 6 categories: HOST_KEY_MISMATCH, SSH_PUBLICKEY_REJECTED,
+   PROTECTED_BRANCH_REJECTED, NON_FAST_FORWARD, REMOTE_UNREACHABLE,
+   UNKNOWN_GIT_ERROR)
+8. Post-push verification
+9. Write mirror summary + Remove SSH material (if: always)
+
+Two new GitHub environment variables required (non-secret):
+- `GITLAB_MIRROR_KEY_FINGERPRINT` = `SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M`
+- `GITLAB_ED25519_HOST_FINGERPRINT` = `SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8`
+
+All R166 invariants preserved: fast-forward-only, no force-push, no
+rollback, divergence fail-closed, `StrictHostKeyChecking yes`,
+`persist-credentials: false`, `permissions: contents: read`,
+`environment: gitlab-passive-mirror`, SSH material cleanup `if: always`.
+
+### Credential rotation (R167C, partial)
+
+- Dedicated GitLab mirror key (fingerprint `SHA256:p45GIFj/...`) is in
+  use since R166 and remains unchanged.
+- Shared GLM push key (fingerprint `SHA256:gHbdJorRq2z4czYAF180kA/...`)
+  is still active on GitHub + GitLab. Rotation to a GitHub-dedicated
+  key is deferred to R168.
+
+### Tests
+
+- `v2/tests/ci/r166-github-canonical-passive-mirror.test.ts` extended
+  from 31 tests (R166) to 92 tests (R167). New test groups cover doc
+  fidelity, fingerprint verification contract, push error classifier,
+  workflow step split, invariants preserved, CI_CONTINUITY.md content.
+- All 1011 backend tests pass. Typecheck clean.
+
+### Out of scope (R167)
+
+- Action version upgrade (`actions/checkout@v7`, `actions/setup-node@v6`)
+  — deferred to R168.
+- GitHub-dedicated GLM push key rotation — deferred to R168.
+- Recovery artifact cleanup — deferred to R168.
+- Atomic generation publication, project lease/fencing, DB dialect V1/V2,
+  dry-run parity, Graph trust protocol, lockfiles/npm ci, OS matrix, tag
+  mirroring, release automation.
+
 ## R166 — GitHub Canonical + GitLab Passive Mirror
 
 R166 (round 91) is an infrastructure migration. No code semantics change.
