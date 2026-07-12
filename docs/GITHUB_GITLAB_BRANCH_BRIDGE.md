@@ -535,3 +535,78 @@ git ls-remote "$GITLAB_URL" refs/heads/main
 - Do not promote GitLab to canonical, even temporarily.
 
 If any of these seems necessary, stop and declare an incident.
+
+## 19. GitHub signature verification gate (SIG-R169)
+
+### Purpose
+
+Before the mirror workflow materializes the GitLab SSH key or attempts
+any push to GitLab, it verifies that GitHub has cryptographically
+verified the commit at `TARGET_SHA`.
+
+### API endpoint
+
+```text
+GET /repos/{owner}/{repo}/commits/{TARGET_SHA}
+Authorization: Bearer ${{ github.token }}
+Accept: application/vnd.github+json
+X-GitHub-Api-Version: 2026-03-10
+```
+
+### Acceptance criteria
+
+```text
+response.sha == TARGET_SHA
+commit.verification.verified == true
+commit.verification.reason == "valid"
+commit.verification.verified_at is non-empty
+```
+
+All four conditions must be met. No partial acceptance.
+
+### Error categories
+
+| Category | Trigger | Retry? |
+|----------|---------|--------|
+| `GITHUB_SIGNATURE_CONFIG_ERROR` | Missing env vars | No |
+| `GITHUB_SIGNATURE_API_NETWORK_ERROR` | curl failure | Yes (3×) |
+| `GITHUB_SIGNATURE_API_HTTP_ERROR` | 401/404/other HTTP | No (429/5xx: yes) |
+| `GITHUB_SIGNATURE_API_MALFORMED_JSON` | Invalid JSON | Yes (3×) |
+| `GITHUB_SIGNATURE_API_SCHEMA_ERROR` | Missing verification object | No |
+| `GITHUB_SIGNATURE_SHA_MISMATCH` | API SHA != TARGET_SHA | No |
+| `GITHUB_SIGNATURE_UNSIGNED` | reason=unsigned | No |
+| `GITHUB_SIGNATURE_INVALID` | reason=invalid/malformed_signature | No |
+| `GITHUB_SIGNATURE_UNVERIFIED` | reason=unknown_key/expired_key/etc | No |
+| `GITHUB_SIGNATURE_TRANSIENT_VERIFIER_ERROR` | reason=gpgverify_error/unavailable | Yes (3×) |
+
+### Retry policy
+
+- Max 3 attempts
+- Backoff: 1s, 2s, 4s
+- Only retries: network errors, HTTP 429/5xx, gpgverify_error, gpgverify_unavailable
+- No retry for: unsigned, invalid, SHA mismatch, HTTP 401/404
+
+### Fail-closed behavior
+
+If the signature gate fails:
+- No GitLab SSH key is materialized
+- No GitLab fetch or push is attempted
+- GitLab remains at the last valid SHA
+- The workflow job is red
+- Manual re-run is possible after fixing the root cause
+
+### Expected GitLab UI badge
+
+GitLab may show "Unverified" for commits signed by GitHub's `web-flow`
+identity. This is expected and does not indicate corruption. The
+canonical proof is:
+
+```text
+GitHub API verified == true
++
+GitLab main SHA == GitHub main SHA (exact object parity)
+```
+
+### Script
+
+`scripts/ci/verify-github-commit-signature.sh`

@@ -277,3 +277,56 @@ After any modification to GitHub repository settings:
 - [CI_CONTINUITY.md](CI_CONTINUITY.md) — Operational resilience plan
 - [RELEASE_POLICY.md](RELEASE_POLICY.md) — Release governance
 - [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) — Development workflow and conventions
+
+## 16. Cross-host Signature Trust Boundary (SIG-R169)
+
+### Architecture
+
+GitHub is the **canonical authority** for commit signature verification.
+
+GitLab may display "Unverified" for commits signed by GitHub's `web-flow`
+identity because GitLab maintains its own trust registry and does not
+automatically reuse GitHub's verification results.
+
+This is **not** a corruption indicator — it means GitLab's local trust
+model doesn't recognize the GitHub signing key.
+
+### Trust contract
+
+The mirror workflow verifies, **before** materializing any GitLab SSH
+credential:
+
+```text
+GitHub API: commit.verification.verified == true
+GitHub API: commit.verification.reason == "valid"
+GitHub API: commit.verification.verified_at is non-empty
+GitHub API: response.sha == TARGET_SHA
+```
+
+If any of these checks fail, the mirror does not proceed. No GitLab
+SSH key is written to disk. No push is attempted. GitLab remains at
+the last successfully mirrored SHA.
+
+After successful mirror: `GitLab main SHA == TARGET_SHA` proves the
+exact Git object verified by GitHub is now present on GitLab.
+
+### What NOT to do
+
+- Do not add GitHub's `web-flow` GPG key to a GitLab user profile
+- Do not pin the GitHub key ID in code or secrets
+- Do not enable `Reject unsigned commits` on GitLab (would break mirror)
+- Do not rewrite or re-sign commits to get a green GitLab badge
+- Do not accept unsigned commits as a fallback
+
+### Break-glass requirement
+
+Break-glass direct pushes to `main` must use a signing identity that
+GitHub verifies. An unsigned break-glass push will pass CI but the
+mirror will refuse to replicate it to GitLab.
+
+### Script
+
+`scripts/ci/verify-github-commit-signature.sh` — called by the mirror
+workflow between checkout and SSH materialization. Uses `GITHUB_TOKEN`
+(no new secrets). Retries on transient errors (max 3, backoff 1/2/4s).
+Fails closed on all other errors.
