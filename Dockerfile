@@ -1,59 +1,39 @@
 # Dockerfile for Codebase Memory V2
 # Provides a containerized cbm-v2 CLI + MCP server + Graph UI.
-#
-# R168.2: fixed to build graph-ui and embed its assets in the package,
-# so the UI is served from the installed module, not from process.cwd().
 
 # ── Stage 1: Build graph-ui ────────────────────────────────────────
 FROM node:20-slim AS ui-builder
-
 WORKDIR /graph-ui
-
 COPY graph-ui/package.json graph-ui/package-lock.json ./
 RUN npm ci
-
 COPY graph-ui/ ./
 RUN npm run build
 
 # ── Stage 2: Build v2 backend ──────────────────────────────────────
-FROM node:20-slim AS builder
-
+# node:20 (full) includes build tools for native modules (better-sqlite3)
+FROM node:20 AS builder
 WORKDIR /app
-
 COPY v2/package.json v2/package-lock.json ./
 RUN npm ci
-
 COPY v2/ ./
 RUN npm run build
-
-# Copy graph-ui dist into v2/dist/ui so the runtime serves it from
-# the installed module location (import.meta.url resolution).
 COPY --from=ui-builder /graph-ui/dist ./dist/ui
+RUN npm prune --omit=dev && npm cache clean --force
 
-# ── Runtime image ──────────────────────────────────────────────────
+# ── Stage 3: Runtime ───────────────────────────────────────────────
 FROM node:20-slim AS runtime
-
 WORKDIR /app
-
-# Install only production dependencies
-COPY v2/package.json v2/package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
-# Copy built files from builder (includes dist/ui from graph-ui)
+COPY v2/package.json ./
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
-
-# Create non-root user and cache directory
-RUN useradd -m -u 1000 cbm \
- && mkdir -p /home/cbm/.cache/codebase-memory-mcp \
- && chown -R cbm:cbm /home/cbm/.cache
-USER cbm
-VOLUME ["/home/cbm/.cache/codebase-memory-mcp"]
-
-# Default entrypoint — can be overridden for MCP mode
+# node:20-slim already has a 'node' user with UID 1000 — use it
+# instead of creating a new user (useradd -u 1000 fails: UID already taken)
+RUN mkdir -p /home/node/.cache/codebase-memory-mcp \
+ && chown -R node:node /home/node/.cache
+USER node
+VOLUME ["/home/node/.cache/codebase-memory-mcp"]
 ENTRYPOINT ["node", "dist/cli/index.js"]
 CMD ["--help"]
-
-# Labels for metadata
 LABEL org.opencontainers.image.title="Codebase Memory V2"
 LABEL org.opencontainers.image.description="Codebase Memory V2 — hybrid code intelligence (native WASM indexer + human memory graph + Obsidian sync + Graph UI)"
 LABEL org.opencontainers.image.licenses="MIT"

@@ -21,6 +21,7 @@
 | [GITHUB_GITLAB_BRANCH_BRIDGE.md](GITHUB_GITLAB_BRANCH_BRIDGE.md) | GitHub canonical → GitLab passive mirror architecture, postmortem, diagnostic matrix |
 | [CI_CONTINUITY.md](CI_CONTINUITY.md) | Operational resilience plan (3 incident levels + quarterly DR exercise) |
 | [RELEASE_POLICY.md](RELEASE_POLICY.md) | Release governance: internal rounds, package versions, GitHub Releases |
+| [REPOSITORY_GOVERNANCE.md](REPOSITORY_GOVERNANCE.md) | GitHub settings: ruleset, environment, security, verification checklist |
 
 ## Historical Documentation
 

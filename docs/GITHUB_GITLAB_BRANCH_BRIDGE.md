@@ -293,15 +293,17 @@ The `mirror-main-to-gitlab` workflow required four runs before success:
 
 ## 12. Environment configuration contract
 
-The mirror workflow reads three values from the GitHub environment
-named `gitlab-passive-mirror`. All three are required and the workflow
-fails closed if any is missing or empty.
+The mirror workflow reads five values from the GitHub environment
+named `gitlab-passive-mirror`: 1 secret and 4 variables. All five are
+required and the workflow fails closed if any is missing or empty.
 
 | Name | Kind | Purpose |
 |------|------|---------|
 | `GITLAB_MIRROR_SSH_PRIVATE_KEY` | secret | OpenSSH-format ed25519 private key (387 bytes, no passphrase) |
 | `GITLAB_REPOSITORY_SSH_URL` | variable | `git@gitlab.com:cheurteen1/codebase-memory-V2.git` |
 | `GITLAB_KNOWN_HOSTS` | variable | Pinned GitLab.com host keys (full file content, not a path) |
+| `GITLAB_MIRROR_KEY_FINGERPRINT` | variable | `SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M` — expected client deploy key fingerprint |
+| `GITLAB_ED25519_HOST_FINGERPRINT` | variable | `SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8` — expected GitLab.com host key fingerprint |
 
 The environment is restricted to the `main` branch. No required
 reviewers and no wait timer — otherwise every mirror would block on a

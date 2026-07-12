@@ -1,6 +1,5 @@
 # R168.3a — Docker smoke test
-# Tests that docker build --no-cache produces a working image
-# with CLI, non-root user, and UI assets.
+# R169 final fix: use existing 'node' user (UID 1000), --entrypoint sh
 
 name: Docker Smoke
 
@@ -8,12 +7,33 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/docker-smoke.yml'
       - 'Dockerfile'
       - '.dockerignore'
       - 'v2/package.json'
       - 'v2/package-lock.json'
+      - 'v2/src/**'
+      - 'v2/tsconfig.json'
       - 'graph-ui/package.json'
       - 'graph-ui/package-lock.json'
+      - 'graph-ui/src/**'
+      - 'graph-ui/public/**'
+      - 'graph-ui/vite.config.*'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/docker-smoke.yml'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'v2/package.json'
+      - 'v2/package-lock.json'
+      - 'v2/src/**'
+      - 'v2/tsconfig.json'
+      - 'graph-ui/package.json'
+      - 'graph-ui/package-lock.json'
+      - 'graph-ui/src/**'
+      - 'graph-ui/public/**'
+      - 'graph-ui/vite.config.*'
   workflow_dispatch: {}
 
 permissions:
@@ -31,27 +51,24 @@ jobs:
           persist-credentials: false
 
       - name: Build Docker image (no cache)
-        run: |
-          docker build --no-cache -t cbm-v2:test .
+        run: docker build --no-cache -t cbm-v2:test .
 
       - name: CLI version
-        run: |
-          docker run --rm cbm-v2:test --version
+        run: docker run --rm cbm-v2:test --version
 
       - name: CLI help
-        run: |
-          docker run --rm cbm-v2:test --help
+        run: docker run --rm cbm-v2:test --help
 
       - name: Non-root user check
         run: |
-          UID=$(docker run --rm cbm-v2:test sh -c 'id -u')
-          echo "Container runs as UID: $UID"
-          test "$UID" = "1000"
+          CONTAINER_UID="$(docker run --rm --entrypoint sh cbm-v2:test -c 'id -u')"
+          echo "Container runs as UID: $CONTAINER_UID"
+          test "$CONTAINER_UID" = "1000"
 
       - name: Cache directory writable
         run: |
-          docker run --rm cbm-v2:test sh -c 'mkdir -p /home/cbm/.cache/codebase-memory-mcp && touch /home/cbm/.cache/codebase-memory-mcp/test && echo "Cache writable"'
+          docker run --rm --entrypoint sh cbm-v2:test -c 'mkdir -p /home/node/.cache/codebase-memory-mcp && touch /home/node/.cache/codebase-memory-mcp/test && echo "Cache writable"'
 
       - name: UI assets present
         run: |
-          docker run --rm cbm-v2:test sh -c 'test -f /app/dist/ui/index.html && echo "UI index.html present"'
+          docker run --rm --entrypoint sh cbm-v2:test -c 'test -f /app/dist/ui/index.html && echo "UI index.html present"'

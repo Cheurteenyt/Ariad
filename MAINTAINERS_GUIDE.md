@@ -169,7 +169,7 @@ Once any `permissions:` key is set at workflow level, every unlisted scope
 becomes `none`. Jobs that need extra scopes (e.g. `actions: read` for the
 quota-report API call) must have their own job-level override.
 
-## CI/CD setup (high-level — for secrets/keys, see local notes)
+## CI/CD setup (high-level — for secrets/keys, see [REPOSITORY_GOVERNANCE.md](docs/REPOSITORY_GOVERNANCE.md))
 
 - **GitHub Actions** (`.github/workflows/ci.yml`): canonical CI. Jobs:
   backend (typecheck + build + test + benchmark smoke), frontend (same,
