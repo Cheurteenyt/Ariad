@@ -149,6 +149,24 @@ else
   fi
 fi
 
+# ─── SIG-R3-RETRY-02: Validate SIGNATURE_RETRY_DELAY_SCALE ──────────────
+# Production: must be exactly 1 (real backoff delays).
+# Test mode (local only): may be 0 (no sleep) or 1.
+# Any other value is rejected to prevent disabling backoff in production.
+case "$SIGNATURE_RETRY_DELAY_SCALE" in
+  0|1) ;;
+  *)
+    echo "::error::SIGNATURE_RETRY_DELAY_SCALE must be 0 or 1, got: $SIGNATURE_RETRY_DELAY_SCALE" >&2
+    STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_CONFIG_ERROR"
+    exit 2
+    ;;
+esac
+if [ "$CBM_SIGNATURE_TEST_MODE" != "1" ] && [ "$SIGNATURE_RETRY_DELAY_SCALE" != "1" ]; then
+  echo "::error::SIGNATURE_RETRY_DELAY_SCALE != 1 not allowed in production" >&2
+  STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_CONFIG_ERROR"
+  exit 2
+fi
+
 echo "=== GitHub Commit Signature Verification ==="
 echo "Target SHA: $TARGET_SHA"
 echo "Repository: $GITHUB_REPOSITORY"
@@ -160,17 +178,13 @@ echo ""
 MAX_ATTEMPTS=3
 BACKOFF_DELAYS=(1 2)
 
-# Scaled sleep — allows tests to set SIGNATURE_RETRY_DELAY_SCALE=0 for speed
+# Scaled sleep — SIG-R3-RETRY-02: only 0 or 1 allowed, no awk needed
 maybe_sleep() {
   local delay="$1"
   if [ "$SIGNATURE_RETRY_DELAY_SCALE" = "0" ]; then
     return 0
   fi
-  local scaled
-  scaled=$(awk "BEGIN { printf \"%d\", $delay * $SIGNATURE_RETRY_DELAY_SCALE }" 2>/dev/null || echo "$delay")
-  if [ "$scaled" -gt 0 ] 2>/dev/null; then
-    sleep "$scaled"
-  fi
+  sleep "$delay"
 }
 
 for attempt in $(seq 1 $MAX_ATTEMPTS); do
@@ -178,11 +192,14 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
   echo "--- Attempt $attempt/$MAX_ATTEMPTS ---"
 
   # SIG-AUD-08: curl with connect-timeout and max-time
+  # SIG-R3-RATE-01: Capture response headers to detect 403 rate limits
+  HEADER_FILE=$(mktemp)
   HTTP_RESPONSE=$(curl \
     --connect-timeout 10 \
     --max-time 30 \
     --show-error \
     --silent \
+    --dump-header "$HEADER_FILE" \
     -w "\n%{http_code}" \
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" \
@@ -190,6 +207,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
     "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}" 2>&1) || {
     STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_API_NETWORK_ERROR"
     echo "::error::Network error" >&2
+    rm -f "$HEADER_FILE"
     if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
       echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
       maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
@@ -203,10 +221,27 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
   echo "  HTTP status: $HTTP_STATUS"
 
   if [ "$HTTP_STATUS" != "200" ]; then
-    # SIG-AUD-04: Test 429 before generic 5xx
-    if [ "$HTTP_STATUS" = "429" ]; then
+    # SIG-R3-RATE-01: GitHub can signal rate limits via 429 OR 403 + headers.
+    # Check x-ratelimit-remaining: 0 or secondary rate limit message.
+    # NOTE: grep returns exit 1 when no match — use || true to avoid
+    # set -e + pipefail killing the script on non-rate-limit responses.
+    RATE_LIMITED=false
+    if [ -f "$HEADER_FILE" ]; then
+      RL_REMAINING=$(grep -i '^x-ratelimit-remaining:' "$HEADER_FILE" 2>/dev/null | tr -d '\r' | awk '{print $2}' || true)
+      if [ "$HTTP_STATUS" = "403" ] && [ "$RL_REMAINING" = "0" ]; then
+        RATE_LIMITED=true
+      fi
+      # Secondary rate limits are 403 with a specific message in the body
+      if [ "$HTTP_STATUS" = "403" ] && echo "$HTTP_BODY" | grep -qi 'secondary rate limit' 2>/dev/null; then
+        RATE_LIMITED=true
+      fi
+    fi
+    rm -f "$HEADER_FILE"
+
+    # SIG-AUD-04 + SIG-R3-RATE-01: Test 429 and 403-rate-limited before generic 5xx
+    if [ "$HTTP_STATUS" = "429" ] || [ "$RATE_LIMITED" = "true" ]; then
       STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_API_RATE_LIMITED"
-      echo "::error::HTTP 429 — rate limited" >&2
+      echo "::error::HTTP $HTTP_STATUS — rate limited" >&2
       if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
         echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
         maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
@@ -237,6 +272,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
       exit 1
     fi
   fi
+  rm -f "$HEADER_FILE"
 
   # SIG-AUD-07 + SIG-R169-SCHEMA-01: Strict JSON parsing with ISO timestamp validation
   # Values are parsed in Python and returned as a pipe-delimited string.
@@ -269,24 +305,27 @@ verified_at = v.get('verified_at')
 if not isinstance(verified_at, str) or not verified_at:
     print('SCHEMA_ERROR|verified_at')
     sys.exit(0)
-# SIG-R169-SCHEMA-01: validate verified_at as ISO-8601 timestamp
-# Reject: 'foo', '2026', timestamps without timezone, etc.
+# SIG-R169-SCHEMA-01 + SIG-R3-TIME-01: validate verified_at as ISO-8601
+# timestamp WITH timezone. Reject:
+#   - 'foo', '2026' (not a timestamp)
+#   - '2026-07-13T10:00:00' (no timezone)
+#   - '2026-07-13' (date-only, no timezone)
 try:
-    datetime.fromisoformat(verified_at.replace('Z', '+00:00'))
+    dt = datetime.fromisoformat(verified_at.replace('Z', '+00:00'))
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        print('SCHEMA_ERROR|verified_at_timezone')
+        sys.exit(0)
 except Exception:
     print('SCHEMA_ERROR|verified_at_format')
     sys.exit(0)
 print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
 " 2>/dev/null)
 
+  # SIG-R3-RETRY-01: Malformed JSON is a contract violation, NOT a transient
+  # error. Fail immediately (no retry). Same for schema errors.
   if [ "$PARSE_RESULT" = "MALFORMED_JSON" ]; then
     STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_API_MALFORMED_JSON"
-    echo "::error::Malformed JSON" >&2
-    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-      echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-      maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
-      continue
-    fi
+    echo "::error::Malformed JSON (not retryable)" >&2
     exit 1
   fi
 

@@ -280,6 +280,17 @@ After any modification to GitHub repository settings:
 
 ## 16. Cross-host Signature Trust Boundary (SIG-R169)
 
+### Current state: Phase A (not yet activated)
+
+The signature gate is being deployed in a **2-phase bootstrap** to
+establish a non-circular trust root (SIG-R3-TRUST-01):
+
+- **Phase A (current):** The canonical verifier script, runtime tests,
+  and documentation are published. The mirror workflow does NOT yet
+  call the verifier.
+- **Phase B (next PR):** The mirror workflow checks out the verifier
+  at `ref: <Phase A squash SHA>` and calls it before target checkout.
+
 ### Architecture
 
 GitHub is the **canonical authority** for commit signature verification.
@@ -304,28 +315,29 @@ It does NOT prove:
 - Absence of malicious code in the commit
 - Sufficiency of human review
 - Immutability of the workflow itself
+- Absence of account compromise
 
-The verifier script is loaded from a signed commit on the default
-branch — no checked-out repository code is executed before the gate.
-The workflow and script can still be modified by a future signed+merged
-PR; this is an accepted residual risk.
+The verifier script (Phase B) is loaded from an immutable pinned SHA —
+no checked-out repository code is executed before the gate. The
+workflow itself remains protected by repository branch protection
+rules, not by the signature gate.
 
 ### Canonical source (SIG-R169-DIV-01)
 
-The verification logic lives in a **single canonical script**. The
-mirror workflow calls this script directly — no inline duplication.
+The verification logic lives in a **single canonical script**. Phase B
+will call this script directly from the workflow — no inline duplication.
 Runtime tests execute the same script against a local HTTP fixture
 server, proving the actual production code path.
 
-### Trust contract
+### Trust contract (Phase B)
 
-The mirror workflow verifies, **before** materializing any GitLab SSH
+The mirror workflow will verify, **before** materializing any GitLab SSH
 credential:
 
 ```text
 GitHub API: commit.verification.verified == true
 GitHub API: commit.verification.reason == "valid"
-GitHub API: commit.verification.verified_at is a valid ISO-8601 timestamp
+GitHub API: commit.verification.verified_at is a valid ISO-8601 timestamp WITH timezone
 GitHub API: response.sha == TARGET_SHA
 ```
 
@@ -352,10 +364,10 @@ mirror will refuse to replicate it to GitLab.
 
 ### Script
 
-`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier,
-called directly by the mirror workflow **before** checkout of
-`TARGET_SHA`. Uses `GITHUB_TOKEN` (no new secrets). Retries on transient
-errors (max 3, backoff 1s/2s). Fails closed on all other errors. The
-script is the single source of truth — no inline duplication in the
-workflow. Runtime tests in `v2/tests/ci/r169-signature-runtime.test.ts`
-execute this same script against a local HTTP fixture server.
+`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.
+Phase A: exists with full test coverage (47 runtime tests + 32 source
+inspection tests), not yet called by the workflow. Phase B: will be
+called by the mirror workflow with `ref: <Phase A squash SHA>` before
+checkout of `TARGET_SHA`. Uses `GITHUB_TOKEN` (no new secrets). Retries
+on transient errors (max 3, backoff 1s/2s). Fails closed on all other
+errors.

@@ -215,16 +215,21 @@ architecture is sufficient for the project's risk profile.
 
 ## 6. GitHub signature verification API unavailable
 
-Since SIG-R169, the mirror workflow verifies GitHub commit signatures
-before mirroring to GitLab. If the GitHub API is temporarily
-unavailable, the mirror will fail closed.
+SIG-R169 is being deployed in 2 phases. As of Phase A, the signature
+gate is NOT yet active — the mirror workflow operates without it.
+Phase B will activate the gate.
 
-### Response
+Once Phase B is deployed, if the GitHub API is temporarily unavailable,
+the mirror will fail closed.
+
+### Response (Phase B, after activation)
 
 - GitLab remains at the last successfully mirrored SHA
 - No manual unsigned bypass
 - Re-run the mirror workflow after GitHub API recovers
 - The signature gate will retry 3 times with backoff (1s, 2s) before failing
+- Rate limits (HTTP 429 or 403+x-ratelimit-remaining:0) are classified
+  as `GITHUB_SIGNATURE_API_RATE_LIMITED` and retried
 
 ### Acceptable
 

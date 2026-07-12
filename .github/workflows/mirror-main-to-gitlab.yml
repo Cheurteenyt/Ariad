@@ -1,17 +1,17 @@
 name: Mirror validated GitHub main to GitLab
 
 # R166: initial passive mirror workflow.
-# R167: split into named steps + fingerprint checks.
-# R168: state machine extracted to scripts/ci/mirror-main-to-gitlab.sh.
-# R168.1: GitHub reads fail-closed, trap outputs, test-only hooks.
-# SIG-R169: Cross-host signature trust gate.
-# SIG-R169-R2: Verification logic is in the CANONICAL script
-#   scripts/ci/verify-github-commit-signature.sh — the workflow calls it
-#   directly. No inline duplication. Runtime tests execute the same script.
-#   Trust boundary: the script is loaded from a signed commit on the default
-#   branch (NOT from TARGET_SHA). No checked-out repository code is executed
-#   before the gate. A GitHub "verified" badge proves cryptographic provenance,
-#   NOT code safety.
+# R167: monolithic step split into 9 named steps + fingerprint checks.
+# R168: state machine extracted to scripts/ci/mirror-main-to-gitlab.sh for
+#       testability with bare repos. The YAML is now a thin wrapper:
+#       checkout → materialize → call script → truthful summary → cleanup.
+#
+# Required environment (GitHub Environment "gitlab-passive-mirror"):
+#   Secret:    GITLAB_MIRROR_SSH_PRIVATE_KEY  (OpenSSH ed25519, no passphrase)
+#   Variable:  GITLAB_REPOSITORY_SSH_URL      (git@gitlab.com:cheurteen1/codebase-memory-V2.git)
+#   Variable:  GITLAB_KNOWN_HOSTS             (pinned GitLab.com host keys, full file content)
+#   Variable:  GITLAB_MIRROR_KEY_FINGERPRINT  (SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M)
+#   Variable:  GITLAB_ED25519_HOST_FINGERPRINT (SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8)
 
 on:
   workflow_run:
@@ -50,76 +50,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Invalid workflow_run head SHA: $TARGET_SHA"
             exit 1
           fi
+
           if [ -z "$GITLAB_URL" ]; then
             echo "::error::GITLAB_REPOSITORY_SSH_URL is empty."
             exit 1
           fi
+
           case "$GITLAB_URL" in
             git@gitlab.com:*) ;;
-            *) echo "::error::Expected a git@gitlab.com:... SSH URL."; exit 1 ;;
+            *)
+              echo "::error::Expected a git@gitlab.com:... SSH URL."
+              exit 1
+              ;;
           esac
+
           if [ -z "$EXPECTED_KEY_FP" ]; then
             echo "::error::GITLAB_MIRROR_KEY_FINGERPRINT is empty."
             exit 1
           fi
+
           if [ -z "$EXPECTED_HOST_FP" ]; then
             echo "::error::GITLAB_ED25519_HOST_FINGERPRINT is empty."
             exit 1
           fi
 
-      # ── Step 2: Checkout verifier script from default branch ────────
-      # SIG-AUD-01 + SIG-R169-DIV-01: The verifier script is checked out from
-      # the default branch HEAD (a signed commit), NOT from TARGET_SHA. Only
-      # scripts/ci/ is fetched (sparse checkout). This script is the single
-      # source of truth — the same code that runtime tests execute.
-      - name: Checkout verifier script
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 1
-          sparse-checkout: |
-            scripts/ci
-          persist-credentials: false
-
-      # ── Step 3: Verify GitHub commit signature (SIG-R169) ───────────
-      # Calls the canonical script. The script verifies TARGET_SHA via the
-      # GitHub REST API and writes JSON outputs to OUTPUT_FILE. This step
-      # reads the JSON and sets step outputs for the summary.
-      - name: Verify GitHub commit signature
-        id: github_signature
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          OUTPUT_FILE: ${{ runner.temp }}/github-signature-outputs.json
-        run: |
-          set -uo pipefail
-          # Run the canonical verifier script (SIG-R169-DIV-01)
-          bash scripts/ci/verify-github-commit-signature.sh || SCRIPT_EXIT=$?
-          SCRIPT_EXIT=${SCRIPT_EXIT:-0}
-
-          # Read JSON outputs and set GITHUB_OUTPUT (even on failure, so the
-          # summary has complete diagnostics — SIG-R169-DIAG-01)
-          if [ -f "$OUTPUT_FILE" ]; then
-            python3 -c "
-          import json, os
-          with open(os.environ['OUTPUT_FILE']) as f:
-              d = json.load(f)
-          for k, v in d.items():
-              print(f'{k}={v}')
-          " >> "$GITHUB_OUTPUT"
-          fi
-
-          if [ "$SCRIPT_EXIT" != "0" ]; then
-            exit "$SCRIPT_EXIT"
-          fi
-
-      # ── Step 4: Checkout exact CI-validated SHA ──────────────────────
-      # Only reached if signature verification passed. Full checkout for mirror.
+      # ── Step 2: Checkout exact CI-validated SHA ──────────────────────
       - name: Checkout exact CI-validated SHA
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -127,7 +87,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ── Step 5: Materialize SSH key + known_hosts ────────────────────
+      # ── Step 3: Materialize SSH key + known_hosts ────────────────────
       - name: Materialize SSH key and known_hosts
         id: materialize
         shell: bash
@@ -136,6 +96,7 @@ jobs:
           KNOWN_HOSTS: ${{ vars.GITLAB_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
+
           if [ -z "$SSH_PRIVATE_KEY" ]; then
             echo "::error::GITLAB_MIRROR_SSH_PRIVATE_KEY secret is empty."
             exit 1
@@ -144,15 +105,20 @@ jobs:
             echo "::error::GITLAB_KNOWN_HOSTS variable is empty."
             exit 1
           fi
+
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/gitlab_mirror_ed25519"
           chmod 600 "$HOME/.ssh/gitlab_mirror_ed25519"
           printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 644 "$HOME/.ssh/known_hosts"
+
           echo "ssh_key_file=$HOME/.ssh/gitlab_mirror_ed25519" >> "$GITHUB_OUTPUT"
           echo "known_hosts_file=$HOME/.ssh/known_hosts" >> "$GITHUB_OUTPUT"
 
-      # ── Step 6: Run mirror state machine ─────────────────────────────
+      # ── Step 4: Run mirror state machine ─────────────────────────────
+      # The script handles: fingerprint verification, Git operations,
+      # error classification, post-push verification, and truthful outcome.
+      # It writes structured outputs to $RUNNER_TEMP/mirror-outputs.txt
       - name: Run mirror state machine
         id: mirror
         shell: bash
@@ -165,115 +131,78 @@ jobs:
           set -euo pipefail
           bash scripts/ci/mirror-main-to-gitlab.sh || SCRIPT_EXIT=$?
           SCRIPT_EXIT=${SCRIPT_EXIT:-0}
+
+          # Read outputs into step outputs
           if [ -f "$OUTPUT_FILE" ]; then
             while IFS='=' read -r key value; do
               echo "$key=$value" >> "$GITHUB_OUTPUT"
             done < "$OUTPUT_FILE"
           fi
+
+          # If the script failed, fail this step
           if [ "$SCRIPT_EXIT" != "0" ]; then
             exit "$SCRIPT_EXIT"
           fi
 
-      # ── Step 7: Write truthful summary ───────────────────────────────
+      # ── Step 5: Write truthful summary (OBS-R168-01, OBS-R168-02) ────
+      # The summary is based on the script's actual outputs, not on
+      # assumptions. It reports verified=true only if the fingerprint
+      # steps actually succeeded.
       - name: Write truthful mirror summary
         if: always()
         shell: bash
         env:
-          SIG_VERIFIED: ${{ steps.github_signature.outputs.verified }}
-          SIG_REASON: ${{ steps.github_signature.outputs.reason }}
-          SIG_VERIFIED_AT: ${{ steps.github_signature.outputs.verified_at }}
-          SIG_API_SHA: ${{ steps.github_signature.outputs.api_sha }}
-          SIG_ERROR_CATEGORY: ${{ steps.github_signature.outputs.error_category }}
-          SIG_ATTEMPTS: ${{ steps.github_signature.outputs.attempts }}
           FINAL_RESULT: ${{ steps.mirror.outputs.final_result }}
           OBSERVED_SHA: ${{ steps.mirror.outputs.observed_sha }}
           GITHUB_MAIN_SHA: ${{ steps.mirror.outputs.github_main_sha }}
           ERROR_CATEGORY: ${{ steps.mirror.outputs.error_category }}
           ERROR_PHASE: ${{ steps.mirror.outputs.error_phase }}
+          CLIENT_FP_VERIFIED: ${{ steps.mirror.outputs.client_fp_verified }}
+          CLIENT_FP_ACTUAL: ${{ steps.mirror.outputs.client_fp_actual }}
+          HOST_FP_VERIFIED: ${{ steps.mirror.outputs.host_fp_verified }}
+          HOST_FP_ACTUAL: ${{ steps.mirror.outputs.host_fp_actual }}
+          PUSH_ATTEMPTED: ${{ steps.mirror.outputs.push_attempted }}
+          PUSH_COMPLETED: ${{ steps.mirror.outputs.push_completed }}
+          POST_VERIFY_RESULT: ${{ steps.mirror.outputs.post_verify_result }}
           JOB_STATUS: ${{ job.status }}
         run: |
-          # SIG-AUD-10: Explicit parity verdicts
-          SIG_SHA_MATCH="not-run"
-          GITLAB_PARITY="not-run"
-
-          if [ -n "${SIG_API_SHA:-}" ] && [ "${SIG_API_SHA}" = "${TARGET_SHA}" ]; then
-            SIG_SHA_MATCH="true"
-          elif [ -n "${SIG_API_SHA:-}" ]; then
-            SIG_SHA_MATCH="false"
-          fi
-
-          if [ -n "${OBSERVED_SHA:-}" ] && [ "${OBSERVED_SHA}" = "${TARGET_SHA}" ]; then
-            GITLAB_PARITY="true"
-          elif [ -n "${OBSERVED_SHA:-}" ]; then
-            GITLAB_PARITY="false"
-          fi
-
-          # SIG-R169-SUM-01: Normalize mirror success states
-          # mirrored, already-mirrored, and newer-valid-mirror-present are
-          # all valid success outcomes.
-          MIRROR_SUCCESS="false"
-          case "${FINAL_RESULT:-}" in
-            mirrored|already-mirrored|newer-valid-mirror-present)
-              MIRROR_SUCCESS="true"
-              ;;
-          esac
-
-          # Effective conclusion combines signature gate + mirror success
-          EFFECTIVE_RESULT="FAILED"
-          if [ "${SIG_VERIFIED:-}" = "true" ] && [ "$MIRROR_SUCCESS" = "true" ]; then
-            EFFECTIVE_RESULT="SUCCESS"
-          fi
-
           {
             echo "## GitLab passive mirror"
             echo
-            echo "### GitHub commit signature"
-            echo
             echo "- Target SHA: \`$TARGET_SHA\`"
-            echo "- API SHA: \`${SIG_API_SHA:-N/A}\`"
-            echo "- Verified: \`${SIG_VERIFIED:-not-run}\`"
-            echo "- Reason: \`${SIG_REASON:-N/A}\`"
-            echo "- Verified at: \`${SIG_VERIFIED_AT:-N/A}\`"
-            echo "- Attempts: \`${SIG_ATTEMPTS:-0}\`"
-            echo "- Error category: \`${SIG_ERROR_CATEGORY:-none}\`"
-            echo "- Target/API SHA match: \`$SIG_SHA_MATCH\`"
-            echo
-            echo "### Mirror result"
-            echo
-            echo "- Final result: \`${FINAL_RESULT:-not-run}\`"
-            echo "- Mirror success (normalized): \`$MIRROR_SUCCESS\`"
+            echo "- Final result: \`${FINAL_RESULT:-failed}\`"
             echo "- Job status: \`$JOB_STATUS\`"
             echo "- Observed GitLab SHA: \`${OBSERVED_SHA:-unknown}\`"
-            echo "- GitLab exact parity: \`$GITLAB_PARITY\`"
+            echo "- Re-read GitHub SHA: \`${GITHUB_MAIN_SHA:-unknown}\`"
+            echo
+            echo "### Fingerprint verification"
+            echo
+            echo "- Client key verified: \`${CLIENT_FP_VERIFIED:-not-run}\`"
+            echo "  - Expected: \`$EXPECTED_KEY_FP\`"
+            echo "  - Actual:   \`${CLIENT_FP_ACTUAL:-N/A}\`"
+            echo "- Host key verified: \`${HOST_FP_VERIFIED:-not-run}\`"
+            echo "  - Expected: \`$EXPECTED_HOST_FP\`"
+            echo "  - Actual:   \`${HOST_FP_ACTUAL:-N/A}\`"
+            echo
+            echo "### Push details"
+            echo
+            echo "- Push attempted: \`${PUSH_ATTEMPTED:-false}\`"
+            echo "- Push completed: \`${PUSH_COMPLETED:-false}\`"
+            echo "- Post-verification: \`${POST_VERIFY_RESULT:-not-run}\`"
+            echo
+            echo "### Error diagnostics"
+            echo
             echo "- Error category: \`${ERROR_CATEGORY:-none}\`"
             echo "- Error phase: \`${ERROR_PHASE:-none}\`"
             echo
-            echo "### Effective conclusion"
-            echo
-            echo "- **Overall: $EFFECTIVE_RESULT**"
-            echo
-            if [ "${SIG_VERIFIED:-}" = "true" ]; then
-              echo "- **Signature gate: PASSED**"
-            else
-              echo "- **Signature gate: ${SIG_ERROR_CATEGORY:-FAILED}**"
-            fi
-            if [ "$MIRROR_SUCCESS" = "true" ]; then
-              echo "- **Mirror: SUCCESS (${FINAL_RESULT:-})**"
-            elif [ -n "${FINAL_RESULT:-}" ]; then
-              echo "- **Mirror: ${FINAL_RESULT}**"
-            else
-              echo "- **Mirror: not-run**"
-            fi
-            echo "- **GitLab parity: $GITLAB_PARITY**"
-            echo
             echo "### Architecture"
             echo
+            echo "- Mirror workflow uses named diagnostic phases (see scripts/ci/mirror-main-to-gitlab.sh)"
             echo "- GitLab pipeline requested: \`no\`"
             echo "- Force push used: \`no\`"
-            echo "- Verifier: \`scripts/ci/verify-github-commit-signature.sh\` (canonical source)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Step 8: Remove SSH material + temp files ─────────────────────
+      # ── Step 6: Remove SSH material ─────────────────────────────────
       - name: Remove SSH material
         if: always()
         shell: bash
@@ -282,5 +211,4 @@ jobs:
             "$HOME/.ssh/gitlab_mirror_ed25519" \
             "$HOME/.ssh/config" \
             "$HOME/.ssh/known_hosts" \
-            "${RUNNER_TEMP:-/tmp}/mirror-outputs.txt" \
-            "${RUNNER_TEMP:-/tmp}/github-signature-outputs.json"
+            "${RUNNER_TEMP:-/tmp}/mirror-outputs.txt"
