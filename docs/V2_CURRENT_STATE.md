@@ -1,6 +1,7 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R168.1 (2026-07-12).
+> **Authoritative snapshot of the current product state.** Updated R169A (2026-07-13) — foundation in progress.
+> R169A lands the generation-store foundation (path helpers, manifest V1 types, resolver, atomic JSON writer) but does **NOT** activate atomic publication. The indexer and readers still use the legacy `<project>.db` path. `DATA-CARRY-01` (P1) remains open.
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -1101,33 +1102,89 @@ Do NOT hardcode version numbers or test counts in documentation — always refer
 - Backup rotation (max 5 `.bak` per note)
 - Dry-run on sync/export/import/backup
 
+## R169A — Atomic Generation Publication (FOUNDATION / INACTIVE)
+
+R169A lands the **non-active foundation** for atomic generation publication.
+The foundation is merged but no production code path uses it yet. The
+indexer still writes to the legacy `<project>.db`; readers still open the
+legacy DB directly. `DATA-CARRY-01` (P1) is **not** closed by R169A.
+
+### What R169A delivers (merged, tested, inert)
+
+- `v2/src/storage/generation-store.ts` — path helpers
+  (`projectStorageKey` = SHA-256 of project name, `projectStoreDir`,
+  `generationsDir`, `tmpDir`, `activeManifestPath`, `indexStatePath`,
+  `legacyCodeDbPath`), manifest parser and strict validator, fail-closed
+  read-only resolver (`resolveActiveCodeDb`), atomic JSON writer
+  (`writeJsonAtomically`: `fsync file → rename → fsync dir`).
+- `v2/src/storage/generation-types.ts` — manifest V1 types
+  (`GenerationManifestV1`, `MANIFEST_V1_KEYS`), `ResolvedCodeDb`
+  discriminated union (`generation | legacy | missing`),
+  `GenerationStoreError` with structured `GenerationStoreErrorCode`
+  taxonomy.
+- `v2/tests/storage/r169a-generation-store.test.ts` — full test matrix:
+  path safety, manifest valid/invalid cases, resolver fail-closed
+  behavior, atomic writer durability, source inspection that
+  `defaultCodeDbPath` is unchanged.
+
+### What R169A does NOT deliver
+
+- **Indexer integration** (R169B) — the indexer does not yet write
+  generation DBs under `generations/`.
+- **Reader integration** (R169C) — readers do not yet call
+  `resolveActiveCodeDb`.
+- **GC policy** (R169D) — keep-active-plus-2-previous GC is documented
+  but not implemented.
+- **Legacy migration completion + DATA-CARRY-01 close** (R169E).
+- **Multi-host fencing / lease** (R170).
+
+### Performance contract
+
+Zero overhead when unused. No production code imports
+`generation-store.js` at startup; no `fsync`, `mkdir`, or `lstat` runs
+on the hot path. The legacy `defaultCodeDbPath` is unchanged and remains
+the only path used by the indexer, readers, UI, MCP, and CLI.
+
+### See also
+
+- [ATOMIC_GENERATION_PUBLICATION.md](ATOMIC_GENERATION_PUBLICATION.md) —
+  full target architecture: storage layout, manifest schema V1, state
+  machine, durability ordering, reader contract, legacy migration,
+  failure taxonomy, GC policy, recovery, crash matrix C01–C20,
+  performance contract, R170 boundary.
+- [V2_ARCHITECTURE.md](V2_ARCHITECTURE.md) § 10 (publication current
+  state + R169 target) and § 15 (R169A generation store target).
+
 ## Limitations
 
 - V2 native indexer is most precise on **TypeScript/JavaScript**. Other languages are parsed structurally without cross-file resolution.
 - For full 158-language precision, use V1 C binary as fallback.
 - Graph UI capped at ~2000 nodes for performance.
-- CI runs on Ubuntu/Node 20 only (no Windows/macOS matrix yet).
-- No lockfile committed (dependency versions may drift).
-- Full index publication is not atomic (DATA-CARRY-01, P1 — open).
+- CI runs on Ubuntu only; Node minimum is `"node": ">=20.0.0"` from `v2/package.json` `engines` (no Windows/macOS matrix yet).
+- Lockfiles **are** committed: `v2/package-lock.json` and `graph-ui/package-lock.json` are both in the repo for reproducible installs. (The earlier `PKG-CARRY-01` lockfile gap is closed; the CI-matrix and Docker-smoke portions remain open.)
+- Full index publication is **not yet atomic** — R169A delivers the foundation only; activation is staged across R169B–R169E. `DATA-CARRY-01` (P1) remains open until R169B + R169C are merged.
 
 ## Blockers (open carryovers)
 
 | ID | Priority | Summary |
 |---|---|---|
-| DATA-CARRY-01 | P1 | Full index publication not atomic (clear → discover → extract; crash mid-way loses graph) |
+| DATA-CARRY-01 | P1 | Full index publication not atomic (clear → discover → extract; crash mid-way loses graph). R169A foundation merged but NOT active; closure in R169B–R169E. |
 | IDX-CARRY-01 | P1 | String-literal export names (`export { foo as "default" }`) not handled |
 | IDX-CARRY-02 | P1 | Interface default exports in type namespace clauses |
 | IDX-CARRY-03 | P1 | Module requests (non-star imports/re-exports) not validated globally |
-| PKG-CARRY-01 | P1 | No lockfile, no CI matrix, no Docker smoke test |
+| PKG-CARRY-01 | P1 | Lockfiles committed (closed). Open: CI multi-OS / Node matrix, Docker smoke test. |
 | SEC-CARRY-01 | P2 | TOCTOU: path strings between check and usage |
 
 ## Roadmap (next rounds)
 
-- **R144** — Deterministic file identity (multi-extension contract, collision detection)
-- **R145** — Atomic full publication (`project.db.next` → validate → atomic rename)
-- **R146** — Type namespace + module requests (IDX-CARRY-01/02/03)
-- **R147** — CI multi-OS / Node matrix / lockfile (PKG-CARRY-01)
-- **R148** — Performance caches / benchmarks (resolver cache, discovery benchmark)
+The R144–R148 roadmap (deterministic file identity, atomic full publication, type namespace, CI matrix, performance caches) is now historical — those rounds landed across R144–R168. The current roadmap is R169A–E plus R170:
+
+- **R169A** — Generation store foundation: path helpers, manifest V1 types, fail-closed resolver, atomic JSON writer. **MERGED — INACTIVE.** No production behavior change.
+- **R169B** — Indexer writes generation DBs under `generations/` + `active-generation.json` manifest. Activation begins; legacy DB still written as fallback.
+- **R169C** — Readers switch from `legacyCodeDbPath` → `resolveActiveCodeDb`. Legacy DB still written.
+- **R169D** — GC policy: keep active generation + 2 previous; sweep `tmp/` orphans. Best-effort.
+- **R169E** — Legacy migration completion: remove legacy DB write, remove legacy read fallback for re-indexed projects, close `DATA-CARRY-01`.
+- **R170** — Multi-host lease / fencing (out of scope for R169; single-host contract only).
 
 ## Workflow Git (GitHub canonical)
 
@@ -1141,4 +1198,4 @@ See [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) for the full workflow.
 
 ## Validation date
 
-This document was validated at R168.1 (2026-07-12). Always cross-check with `v2/CHANGELOG.md` for the latest state.
+This document was updated at R169A (2026-07-13) — foundation in progress, publication NOT active. Always cross-check with `v2/CHANGELOG.md` for the latest state.

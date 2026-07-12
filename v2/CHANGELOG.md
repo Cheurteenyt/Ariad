@@ -1,5 +1,139 @@
 # Changelog — Codebase Memory V2
 
+## 0.75.0 — R169A (2026-07-13) Atomic Generation Publication Foundation
+
+**Generation store foundation: path helpers, manifest V1 types, resolver,
+atomic JSON writer. Feature inactive — no production behavior change.**
+
+R169A lands the **non-active foundation** for atomic generation
+publication. The foundation is merged and tested, but no production code
+path calls it. The indexer still writes to the legacy `<project>.db`
+path; readers still open the legacy DB directly. `DATA-CARRY-01` (P1)
+remains open. Activation is staged across R169B–R169E; multi-host
+fencing is R170.
+
+### Foundation code (merged, tested, inert)
+
+- **`v2/src/storage/generation-store.ts`** — path helpers
+  (`projectStorageKey` = SHA-256 of project name, `projectStoreDir`,
+  `generationsDir`, `tmpDir`, `activeManifestPath`, `indexStatePath`,
+  `legacyCodeDbPath`), manifest parser and strict validator
+  (`validateGenerationManifest`, `parseGenerationManifest`), fail-closed
+  read-only resolver (`resolveActiveCodeDb`), atomic JSON writer
+  (`writeJsonAtomically`: `fsync file → rename → fsync dir`),
+  `listProjectStoreKeys` helper.
+- **`v2/src/storage/generation-types.ts`** — manifest V1 types
+  (`GenerationManifestV1`, `MANIFEST_V1_KEYS`), `IndexAttemptStateV1`
+  sidecar type, `ResolvedCodeDb` discriminated union
+  (`generation | legacy | missing`), `GenerationStoreError` with
+  structured `GenerationStoreErrorCode` taxonomy (15 codes).
+- **`v2/tests/storage/r169a-generation-store.test.ts`** — full test
+  matrix: path safety (normal, Unicode, spaces, traversal, absolute,
+  long, deterministic), manifest valid (V1 exact, zero counts, Unicode,
+  sha lowercase, timestamp timezone), manifest invalid (null, array,
+  missing key, extra key, future version, negative version, project
+  mismatch, invalid UUID, absolute dbFile, dbFile with `..`, dbFile
+  with backslash, invalid timestamp, negative count, float count,
+  invalid sha, multiline field), resolver fail-closed (valid →
+  generation; no manifest + no legacy → missing; no manifest + legacy →
+  legacy; invalid manifest → fail closed; target missing → fail closed;
+  project mismatch → fail closed; symlink manifest → rejected; symlink
+  target → rejected), atomic writer (success writes parseable exact
+  JSON, temp absent after success, write failure preserves old file,
+  crash before rename leaves old file readable, mode 0600), no
+  production behavior change (defaultCodeDbPath still importable,
+  legacyCodeDbPath == defaultCodeDbPath,
+  CURRENT_GENERATION_MANIFEST_VERSION == 1), source inspection that
+  no new `defaultCodeDbPath` consumers have appeared.
+
+### What R169A does NOT deliver
+
+- **Indexer integration** (R169B) — the indexer does not yet write
+  generation DBs under `generations/`.
+- **Reader integration** (R169C) — readers do not yet call
+  `resolveActiveCodeDb`.
+- **GC policy** (R169D) — keep-active-plus-2-previous GC is documented
+  but not implemented.
+- **Legacy migration completion + DATA-CARRY-01 close** (R169E).
+- **Multi-host fencing / lease** (R170).
+
+### Security
+
+- Project names are NEVER used directly as paths. A deterministic
+  SHA-256 key is used instead.
+- All paths are containment-checked against the injected cache root.
+- Symlinks in manifests and generation targets are rejected.
+- Path traversal (`..`), absolute paths, and backslash separators in
+  `dbFile` are rejected.
+- Atomic writer uses exclusive-create (`wx`) temp files with mode
+  `0o600` to prevent collision and permission leakage.
+
+### Durability ordering
+
+```
+fsync file  →  rename  →  fsync dir
+```
+
+Implemented in `writeJsonAtomically`. Directory fsync is best-effort on
+platforms that don't support it (notably Windows) — the rename itself
+has already succeeded by that point, so a directory-fsync failure does
+not fail the write.
+
+### Performance contract
+
+Zero overhead when unused. No production code imports
+`generation-store.js` at startup; no `fsync`, `mkdir`, or `lstat` runs
+on the hot path. Verified by the `R169A — No production behavior change`
+test block.
+
+### Documentation
+
+- **`docs/ATOMIC_GENERATION_PUBLICATION.md`** (new) — full target
+  architecture: storage layout, manifest schema V1, state machine,
+  durability ordering, reader contract, legacy migration, failure
+  taxonomy, GC policy, recovery, crash matrix C01–C20, performance
+  contract, R170 boundary. Status: FOUNDATION / INACTIVE.
+- **`docs/V2_CURRENT_STATE.md`** — header updated to R169A; R169A
+  section added (foundation in progress, publication NOT active);
+  limitations fixed (lockfiles ARE committed, Node minimum from
+  package.json `engines`); R144–R148 roadmap replaced with current
+  R169A–E + R170 plan; `PKG-CARRY-01` lockfile gap marked closed.
+- **`docs/V2_ARCHITECTURE.md`** — header status marked FOUNDATION /
+  INACTIVE; new section 15 added documenting the generation store
+  target architecture. Existing sections describing current behavior
+  left unchanged.
+- **`v2/CHANGELOG.md`** — this entry.
+
+### Files changed
+
+- `v2/src/storage/generation-store.ts` (new)
+- `v2/src/storage/generation-types.ts` (new)
+- `v2/tests/storage/r169a-generation-store.test.ts` (new)
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` (new)
+- `docs/V2_CURRENT_STATE.md` (updated)
+- `docs/V2_ARCHITECTURE.md` (updated)
+- `v2/CHANGELOG.md` (this entry)
+
+### Semantics versions NOT bumped
+
+- `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 8` (unchanged)
+- `CURRENT_DISCOVERY_POLICY_VERSION = 2` (unchanged)
+- `CURRENT_GENERATION_MANIFEST_VERSION = 1` (new constant, set to 1)
+
+### Package version
+
+- `v2/package.json` remains at `0.75.0`. R169A is a documentation +
+  foundation release; no production behavior change, no semver bump.
+
+### Next: R169B — Indexer writes generation DBs
+
+After R169A, the activation sequence is R169B (indexer writes
+generation DBs under `generations/` + manifest) → R169C (readers switch
+to `resolveActiveCodeDb`) → R169D (GC) → R169E (legacy migration
+completion + `DATA-CARRY-01` close). R170 adds multi-host lease /
+fencing (out of scope for R169).
+
+
 ## 0.73.1 — Round 168.1 (2026-07-12) Operational Closure
 
 **93rd round (infrastructure closure).** No code semantics change.
