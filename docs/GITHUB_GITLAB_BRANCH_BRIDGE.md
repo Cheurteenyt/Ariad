@@ -544,6 +544,40 @@ Before the mirror workflow materializes the GitLab SSH key or attempts
 any push to GitLab, it verifies that GitHub has cryptographically
 verified the commit at `TARGET_SHA`.
 
+### Trust boundary (SIG-R169-POLICY-01)
+
+The signature gate is a **provenance check**, not a **safety check**.
+
+It protects against:
+- Unsigned direct pushes to `main`
+- Commits with invalid or malformed signatures
+- Cryptographic identities GitHub does not recognize
+
+It does NOT prove:
+- Absence of malicious code in the commit
+- Sufficiency of human review
+- Immutability of the workflow itself (a future signed+merged PR can
+  modify the gate)
+
+The verifier script is loaded from a signed commit on the default
+branch (not from `TARGET_SHA`). No checked-out repository code is
+executed before the gate. However, the workflow file and the verifier
+script itself live on the default branch and can be modified by a
+future signed+merged PR — this is an accepted residual risk.
+
+### Canonical source (SIG-R169-DIV-01)
+
+The verification logic lives in a **single canonical script**:
+
+```text
+scripts/ci/verify-github-commit-signature.sh
+```
+
+The mirror workflow calls this script directly. There is no inline
+duplication. Runtime tests (`v2/tests/ci/r169-signature-runtime.test.ts`)
+execute this same script against a local HTTP fixture server — the
+tests prove the actual production code path, not a copy.
+
 ### API endpoint
 
 ```text
@@ -559,10 +593,13 @@ X-GitHub-Api-Version: 2026-03-10
 response.sha == TARGET_SHA
 commit.verification.verified == true
 commit.verification.reason == "valid"
-commit.verification.verified_at is non-empty
+commit.verification.verified_at is a valid ISO-8601 timestamp
 ```
 
 All four conditions must be met. No partial acceptance.
+
+The `verified_at` field is validated as an ISO-8601 timestamp
+(SIG-R169-SCHEMA-01) — values like `"foo"` or `"2026"` are rejected.
 
 ### Error categories
 
@@ -571,8 +608,9 @@ All four conditions must be met. No partial acceptance.
 | `GITHUB_SIGNATURE_CONFIG_ERROR` | Missing env vars | No |
 | `GITHUB_SIGNATURE_API_NETWORK_ERROR` | curl failure | Yes (3×) |
 | `GITHUB_SIGNATURE_API_HTTP_ERROR` | 401/404/other HTTP | No (429/5xx: yes) |
+| `GITHUB_SIGNATURE_API_RATE_LIMITED` | HTTP 429 | Yes (3×) |
 | `GITHUB_SIGNATURE_API_MALFORMED_JSON` | Invalid JSON | Yes (3×) |
-| `GITHUB_SIGNATURE_API_SCHEMA_ERROR` | Missing verification object | No |
+| `GITHUB_SIGNATURE_API_SCHEMA_ERROR` | Missing/malformed verification | No |
 | `GITHUB_SIGNATURE_SHA_MISMATCH` | API SHA != TARGET_SHA | No |
 | `GITHUB_SIGNATURE_UNSIGNED` | reason=unsigned | No |
 | `GITHUB_SIGNATURE_INVALID` | reason=invalid/malformed_signature | No |
@@ -582,9 +620,31 @@ All four conditions must be met. No partial acceptance.
 ### Retry policy
 
 - Max 3 attempts
-- Backoff: 1s, 2s, 4s
-- Only retries: network errors, HTTP 429/5xx, gpgverify_error, gpgverify_unavailable
-- No retry for: unsigned, invalid, SHA mismatch, HTTP 401/404
+- Backoff: 1s, 2s (between attempts 1→2 and 2→3)
+- Only retries: network errors, HTTP 429/5xx, malformed JSON, gpgverify_error/unavailable
+- No retry for: unsigned, invalid, SHA mismatch, HTTP 401/404, schema errors
+- Tests use `SIGNATURE_RETRY_DELAY_SCALE=0` to eliminate sleep delays
+
+### JSON output (SIG-AUD-05, SIG-R169-JSON-01/02)
+
+The script writes JSON to `OUTPUT_FILE` via a trap on EXIT. Values are
+passed through environment variables (not string interpolation) to
+prevent apostrophe/backslash injection. There is no `key=value` fallback
+— if JSON generation fails, the script exits with code 2.
+
+All six fields are always populated after a successful API response,
+even on refusal paths (SIG-R169-DIAG-01):
+
+```json
+{
+  "verified": "true|false|error|not-run",
+  "reason": "<GitHub reason>",
+  "verified_at": "<ISO timestamp>",
+  "api_sha": "<40-char hex>",
+  "error_category": "<GITHUB_SIGNATURE_*>",
+  "attempts": "<integer>"
+}
+```
 
 ### Fail-closed behavior
 
@@ -607,6 +667,38 @@ GitHub API verified == true
 GitLab main SHA == GitHub main SHA (exact object parity)
 ```
 
+### Mirror success normalization (SIG-R169-SUM-01)
+
+The workflow summary normalizes mirror outcomes into a boolean
+`MIRROR_SUCCESS`:
+
+```text
+mirrored                       → success
+already-mirrored               → success
+newer-valid-mirror-present     → success
+any other result               → failure
+```
+
+The effective conclusion combines signature gate + mirror success:
+
+```text
+SIG_VERIFIED=true + MIRROR_SUCCESS=true → SUCCESS
+otherwise                                → FAILED
+```
+
+### Runtime tests (SIG-R169-RT-01)
+
+The verifier script has both source-inspection tests and runtime tests:
+
+- `v2/tests/ci/r169-signature-gate.test.ts` — source structure,
+  token-leak detection with negative fixtures, workflow integration
+- `v2/tests/ci/r169-signature-runtime.test.ts` — executes the real
+  script against a local HTTP fixture server with 21 test cases
+  covering: valid, unsigned, invalid, unknown_key, 429-then-valid,
+  500-permanent, gpgverify-then-valid, 401, 404, malformed JSON,
+  schema-missing, verified_at-absent/invalid, SHA mismatch
+
 ### Script
 
-`scripts/ci/verify-github-commit-signature.sh`
+`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier,
+called directly by the mirror workflow.

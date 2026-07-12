@@ -5,8 +5,13 @@ name: Mirror validated GitHub main to GitLab
 # R168: state machine extracted to scripts/ci/mirror-main-to-gitlab.sh.
 # R168.1: GitHub reads fail-closed, trap outputs, test-only hooks.
 # SIG-R169: Cross-host signature trust gate.
-# SIG-AUD-01: Verification moved BEFORE checkout — no code from the
-#   target commit is executed before trust is established.
+# SIG-R169-R2: Verification logic is in the CANONICAL script
+#   scripts/ci/verify-github-commit-signature.sh — the workflow calls it
+#   directly. No inline duplication. Runtime tests execute the same script.
+#   Trust boundary: the script is loaded from a signed commit on the default
+#   branch (NOT from TARGET_SHA). No checked-out repository code is executed
+#   before the gate. A GitHub "verified" badge proves cryptographic provenance,
+#   NOT code safety.
 
 on:
   workflow_run:
@@ -66,11 +71,23 @@ jobs:
             exit 1
           fi
 
-      # ── Step 2: Verify GitHub commit signature (SIG-R169) ───────────
-      # SIG-AUD-01: This runs BEFORE checkout. No code from the target
-      # commit is executed. The verification is inline (not from a script
-      # in the target checkout) to prevent a malicious commit from
-      # modifying its own verifier.
+      # ── Step 2: Checkout verifier script from default branch ────────
+      # SIG-AUD-01 + SIG-R169-DIV-01: The verifier script is checked out from
+      # the default branch HEAD (a signed commit), NOT from TARGET_SHA. Only
+      # scripts/ci/ is fetched (sparse checkout). This script is the single
+      # source of truth — the same code that runtime tests execute.
+      - name: Checkout verifier script
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/ci
+          persist-credentials: false
+
+      # ── Step 3: Verify GitHub commit signature (SIG-R169) ───────────
+      # Calls the canonical script. The script verifies TARGET_SHA via the
+      # GitHub REST API and writes JSON outputs to OUTPUT_FILE. This step
+      # reads the JSON and sets step outputs for the summary.
       - name: Verify GitHub commit signature
         id: github_signature
         shell: bash
@@ -78,187 +95,31 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_API_URL: ${{ github.api_url }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SIGNATURE_OUTPUT_FILE: ${{ runner.temp }}/github-signature-outputs.json
+          OUTPUT_FILE: ${{ runner.temp }}/github-signature-outputs.json
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Run the canonical verifier script (SIG-R169-DIV-01)
+          bash scripts/ci/verify-github-commit-signature.sh || SCRIPT_EXIT=$?
+          SCRIPT_EXIT=${SCRIPT_EXIT:-0}
 
-          # Inline verification — does NOT use scripts/ci/ from target checkout
-          # (SIG-AUD-01: the verifier must not come from the commit being verified)
+          # Read JSON outputs and set GITHUB_OUTPUT (even on failure, so the
+          # summary has complete diagnostics — SIG-R169-DIAG-01)
+          if [ -f "$OUTPUT_FILE" ]; then
+            python3 -c "
+          import json, os
+          with open(os.environ['OUTPUT_FILE']) as f:
+              d = json.load(f)
+          for k, v in d.items():
+              print(f'{k}={v}')
+          " >> "$GITHUB_OUTPUT"
+          fi
 
-          TARGET_SHA="${TARGET_SHA}"
-          API_URL="${GITHUB_API_URL}"
-          REPO="${GITHUB_REPOSITORY}"
-          OUTPUT_FILE="${SIGNATURE_OUTPUT_FILE}"
+          if [ "$SCRIPT_EXIT" != "0" ]; then
+            exit "$SCRIPT_EXIT"
+          fi
 
-          MAX_ATTEMPTS=3
-          BACKOFF_DELAYS=(1 2)
-
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            echo "--- Signature verification attempt $attempt/$MAX_ATTEMPTS ---"
-
-            HTTP_RESPONSE=$(curl \
-              --connect-timeout 10 \
-              --max-time 30 \
-              --show-error \
-              --silent \
-              -w "\n%{http_code}" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "${API_URL}/repos/${REPO}/commits/${TARGET_SHA}" 2>&1) || {
-              echo "::error::Network error during signature verification"
-              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-                sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
-                continue
-              fi
-              echo "verified=error" >> "$GITHUB_OUTPUT"
-              echo "error_category=GITHUB_SIGNATURE_API_NETWORK_ERROR" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 1
-            }
-
-            HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
-            HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -1)
-
-            echo "  HTTP status: $HTTP_STATUS"
-
-            if [ "$HTTP_STATUS" != "200" ]; then
-              if [ "$HTTP_STATUS" = "429" ]; then
-                CAT="GITHUB_SIGNATURE_API_RATE_LIMITED"
-              elif [ "$HTTP_STATUS" = "500" ] || [ "$HTTP_STATUS" = "502" ] || [ "$HTTP_STATUS" = "503" ] || [ "$HTTP_STATUS" = "504" ]; then
-                CAT="GITHUB_SIGNATURE_API_HTTP_ERROR"
-              else
-                CAT="GITHUB_SIGNATURE_API_HTTP_ERROR"
-              fi
-
-              # Retry for 429 and 5xx
-              case "$HTTP_STATUS" in
-                429|500|502|503|504)
-                  if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-                    sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
-                    continue
-                  fi
-                  ;;
-              esac
-
-              echo "::error::HTTP $HTTP_STATUS — $CAT"
-              echo "verified=error" >> "$GITHUB_OUTPUT"
-              echo "error_category=$CAT" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-
-            # Single-pass strict parsing (SIG-AUD-07)
-            PARSE_RESULT=$(echo "$HTTP_BODY" | python3 -c "
-import json, sys, re
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print('MALFORMED_JSON')
-    sys.exit(0)
-sha = d.get('sha')
-if not isinstance(sha, str) or not re.match(r'^[0-9a-f]{40}$', sha):
-    print('SCHEMA_ERROR|sha')
-    sys.exit(0)
-v = d.get('commit', {}).get('verification')
-if not isinstance(v, dict):
-    print('SCHEMA_ERROR|verification')
-    sys.exit(0)
-verified = v.get('verified')
-if not isinstance(verified, bool):
-    print('SCHEMA_ERROR|verified_type')
-    sys.exit(0)
-reason = v.get('reason')
-if not isinstance(reason, str) or not reason:
-    print('SCHEMA_ERROR|reason')
-    sys.exit(0)
-verified_at = v.get('verified_at')
-if not isinstance(verified_at, str) or not verified_at:
-    print('SCHEMA_ERROR|verified_at')
-    sys.exit(0)
-print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
-" 2>/dev/null)
-
-            if [ "$PARSE_RESULT" = "MALFORMED_JSON" ]; then
-              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-                sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
-                continue
-              fi
-              echo "::error::Malformed JSON"
-              echo "verified=error" >> "$GITHUB_OUTPUT"
-              echo "error_category=GITHUB_SIGNATURE_API_MALFORMED_JSON" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-
-            if echo "$PARSE_RESULT" | grep -q "^SCHEMA_ERROR"; then
-              echo "::error::Schema error: $(echo "$PARSE_RESULT" | cut -d'|' -f2)"
-              echo "verified=error" >> "$GITHUB_OUTPUT"
-              echo "error_category=GITHUB_SIGNATURE_API_SCHEMA_ERROR" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-
-            API_SHA=$(echo "$PARSE_RESULT" | cut -d'|' -f1)
-            VERIFIED=$(echo "$PARSE_RESULT" | cut -d'|' -f2)
-            REASON=$(echo "$PARSE_RESULT" | cut -d'|' -f3)
-            VERIFIED_AT=$(echo "$PARSE_RESULT" | cut -d'|' -f4)
-
-            echo "  API SHA: $API_SHA"
-            echo "  Verified: $VERIFIED"
-            echo "  Reason: $REASON"
-            echo "  Verified at: $VERIFIED_AT"
-
-            if [ "$API_SHA" != "$TARGET_SHA" ]; then
-              echo "::error::SHA mismatch: API=$API_SHA, expected=$TARGET_SHA"
-              echo "verified=false" >> "$GITHUB_OUTPUT"
-              echo "error_category=GITHUB_SIGNATURE_SHA_MISMATCH" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-
-            if [ "$VERIFIED" = "true" ] && [ "$REASON" = "valid" ] && [ -n "$VERIFIED_AT" ]; then
-              echo "✓ GitHub commit signature verified"
-              echo "verified=true" >> "$GITHUB_OUTPUT"
-              echo "reason=$REASON" >> "$GITHUB_OUTPUT"
-              echo "verified_at=$VERIFIED_AT" >> "$GITHUB_OUTPUT"
-              echo "api_sha=$API_SHA" >> "$GITHUB_OUTPUT"
-              echo "error_category=none" >> "$GITHUB_OUTPUT"
-              echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            # Map reason to category
-            case "$REASON" in
-              unsigned) CAT="GITHUB_SIGNATURE_UNSIGNED" ;;
-              invalid|malformed_signature) CAT="GITHUB_SIGNATURE_INVALID" ;;
-              gpgverify_error|gpgverify_unavailable)
-                CAT="GITHUB_SIGNATURE_TRANSIENT_VERIFIER_ERROR"
-                if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-                  sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
-                  continue
-                fi
-                ;;
-              *) CAT="GITHUB_SIGNATURE_UNVERIFIED" ;;
-            esac
-
-            echo "::error::Verification failed: $CAT (reason=$REASON)"
-            echo "verified=false" >> "$GITHUB_OUTPUT"
-            echo "reason=$REASON" >> "$GITHUB_OUTPUT"
-            echo "error_category=$CAT" >> "$GITHUB_OUTPUT"
-            echo "attempts=$attempt" >> "$GITHUB_OUTPUT"
-            exit 1
-
-          done
-
-          echo "::error::Exhausted $MAX_ATTEMPTS attempts"
-          echo "verified=error" >> "$GITHUB_OUTPUT"
-          echo "error_category=GITHUB_SIGNATURE_TRANSIENT_VERIFIER_ERROR" >> "$GITHUB_OUTPUT"
-          echo "attempts=$MAX_ATTEMPTS" >> "$GITHUB_OUTPUT"
-          exit 1
-
-      # ── Step 3: Checkout exact CI-validated SHA ──────────────────────
-      # Only reached if signature verification passed
+      # ── Step 4: Checkout exact CI-validated SHA ──────────────────────
+      # Only reached if signature verification passed. Full checkout for mirror.
       - name: Checkout exact CI-validated SHA
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -266,7 +127,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
           fetch-depth: 0
           persist-credentials: false
 
-      # ── Step 4: Materialize SSH key + known_hosts ────────────────────
+      # ── Step 5: Materialize SSH key + known_hosts ────────────────────
       - name: Materialize SSH key and known_hosts
         id: materialize
         shell: bash
@@ -291,7 +152,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
           echo "ssh_key_file=$HOME/.ssh/gitlab_mirror_ed25519" >> "$GITHUB_OUTPUT"
           echo "known_hosts_file=$HOME/.ssh/known_hosts" >> "$GITHUB_OUTPUT"
 
-      # ── Step 5: Run mirror state machine ─────────────────────────────
+      # ── Step 6: Run mirror state machine ─────────────────────────────
       - name: Run mirror state machine
         id: mirror
         shell: bash
@@ -313,7 +174,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
             exit "$SCRIPT_EXIT"
           fi
 
-      # ── Step 6: Write truthful summary ───────────────────────────────
+      # ── Step 7: Write truthful summary ───────────────────────────────
       - name: Write truthful mirror summary
         if: always()
         shell: bash
@@ -347,6 +208,22 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
             GITLAB_PARITY="false"
           fi
 
+          # SIG-R169-SUM-01: Normalize mirror success states
+          # mirrored, already-mirrored, and newer-valid-mirror-present are
+          # all valid success outcomes.
+          MIRROR_SUCCESS="false"
+          case "${FINAL_RESULT:-}" in
+            mirrored|already-mirrored|newer-valid-mirror-present)
+              MIRROR_SUCCESS="true"
+              ;;
+          esac
+
+          # Effective conclusion combines signature gate + mirror success
+          EFFECTIVE_RESULT="FAILED"
+          if [ "${SIG_VERIFIED:-}" = "true" ] && [ "$MIRROR_SUCCESS" = "true" ]; then
+            EFFECTIVE_RESULT="SUCCESS"
+          fi
+
           {
             echo "## GitLab passive mirror"
             echo
@@ -364,6 +241,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
             echo "### Mirror result"
             echo
             echo "- Final result: \`${FINAL_RESULT:-not-run}\`"
+            echo "- Mirror success (normalized): \`$MIRROR_SUCCESS\`"
             echo "- Job status: \`$JOB_STATUS\`"
             echo "- Observed GitLab SHA: \`${OBSERVED_SHA:-unknown}\`"
             echo "- GitLab exact parity: \`$GITLAB_PARITY\`"
@@ -372,27 +250,30 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
             echo
             echo "### Effective conclusion"
             echo
-            if [ "${SIG_VERIFIED:-}" = "true" ] && [ "${FINAL_RESULT:-}" = "mirrored" ]; then
+            echo "- **Overall: $EFFECTIVE_RESULT**"
+            echo
+            if [ "${SIG_VERIFIED:-}" = "true" ]; then
               echo "- **Signature gate: PASSED**"
-              echo "- **Mirror: SUCCESS**"
-              echo "- **GitLab parity: $GITLAB_PARITY**"
-            elif [ "${SIG_VERIFIED:-}" = "true" ]; then
-              echo "- **Signature gate: PASSED**"
-              echo "- **Mirror: ${FINAL_RESULT:-FAILED}**"
-              echo "- **GitLab parity: $GITLAB_PARITY**"
             else
               echo "- **Signature gate: ${SIG_ERROR_CATEGORY:-FAILED}**"
-              echo "- **Mirror: not-run**"
-              echo "- **GitLab parity: not-run**"
             fi
+            if [ "$MIRROR_SUCCESS" = "true" ]; then
+              echo "- **Mirror: SUCCESS (${FINAL_RESULT:-})**"
+            elif [ -n "${FINAL_RESULT:-}" ]; then
+              echo "- **Mirror: ${FINAL_RESULT}**"
+            else
+              echo "- **Mirror: not-run**"
+            fi
+            echo "- **GitLab parity: $GITLAB_PARITY**"
             echo
             echo "### Architecture"
             echo
             echo "- GitLab pipeline requested: \`no\`"
             echo "- Force push used: \`no\`"
+            echo "- Verifier: \`scripts/ci/verify-github-commit-signature.sh\` (canonical source)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Step 7: Remove SSH material ─────────────────────────────────
+      # ── Step 8: Remove SSH material + temp files ─────────────────────
       - name: Remove SSH material
         if: always()
         shell: bash

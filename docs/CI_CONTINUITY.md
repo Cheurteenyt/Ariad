@@ -224,7 +224,7 @@ unavailable, the mirror will fail closed.
 - GitLab remains at the last successfully mirrored SHA
 - No manual unsigned bypass
 - Re-run the mirror workflow after GitHub API recovers
-- The signature gate will retry 3 times with backoff before failing
+- The signature gate will retry 3 times with backoff (1s, 2s) before failing
 
 ### Acceptable
 

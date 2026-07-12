@@ -291,6 +291,32 @@ automatically reuse GitHub's verification results.
 This is **not** a corruption indicator — it means GitLab's local trust
 model doesn't recognize the GitHub signing key.
 
+### Trust boundary (SIG-R169-POLICY-01)
+
+The signature gate is a **provenance check**, not a **safety check**.
+
+It protects against:
+- Unsigned direct pushes to `main`
+- Commits with invalid or malformed signatures
+- Cryptographic identities GitHub does not recognize
+
+It does NOT prove:
+- Absence of malicious code in the commit
+- Sufficiency of human review
+- Immutability of the workflow itself
+
+The verifier script is loaded from a signed commit on the default
+branch — no checked-out repository code is executed before the gate.
+The workflow and script can still be modified by a future signed+merged
+PR; this is an accepted residual risk.
+
+### Canonical source (SIG-R169-DIV-01)
+
+The verification logic lives in a **single canonical script**. The
+mirror workflow calls this script directly — no inline duplication.
+Runtime tests execute the same script against a local HTTP fixture
+server, proving the actual production code path.
+
 ### Trust contract
 
 The mirror workflow verifies, **before** materializing any GitLab SSH
@@ -299,7 +325,7 @@ credential:
 ```text
 GitHub API: commit.verification.verified == true
 GitHub API: commit.verification.reason == "valid"
-GitHub API: commit.verification.verified_at is non-empty
+GitHub API: commit.verification.verified_at is a valid ISO-8601 timestamp
 GitHub API: response.sha == TARGET_SHA
 ```
 
@@ -326,7 +352,10 @@ mirror will refuse to replicate it to GitLab.
 
 ### Script
 
-`scripts/ci/verify-github-commit-signature.sh` — called by the mirror
-workflow between checkout and SSH materialization. Uses `GITHUB_TOKEN`
-(no new secrets). Retries on transient errors (max 3, backoff 1/2/4s).
-Fails closed on all other errors.
+`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier,
+called directly by the mirror workflow **before** checkout of
+`TARGET_SHA`. Uses `GITHUB_TOKEN` (no new secrets). Retries on transient
+errors (max 3, backoff 1s/2s). Fails closed on all other errors. The
+script is the single source of truth — no inline duplication in the
+workflow. Runtime tests in `v2/tests/ci/r169-signature-runtime.test.ts`
+execute this same script against a local HTTP fixture server.

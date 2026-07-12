@@ -2,19 +2,52 @@
 #
 # scripts/ci/verify-github-commit-signature.sh
 #
-# SIG-R169: Cross-host Signature Trust Gate
-# SIG-AUD-01: This script is NOT executed from the target checkout in
-#   production. The workflow performs the verification inline BEFORE
-#   checkout. This script is kept for local testing only.
+# SIG-R169: Cross-host Signature Trust Gate — Canonical verifier.
 #
-# Verifies that GitHub has cryptographically verified the commit at TARGET_SHA.
-# Uses the GitHub REST API with the workflow's GITHUB_TOKEN (no new secrets).
-# Fails closed on any error — no fallback to unsigned acceptance.
+# This script is the SINGLE source of truth for commit signature verification.
+# The mirror workflow (.github/workflows/mirror-main-to-gitlab.yml) calls this
+# script directly. Runtime tests (v2/tests/ci/r169-signature-runtime.test.ts)
+# execute this same script against a local HTTP fixture server.
+#
+# Trust boundary (SIG-R169-POLICY-01):
+#   - This script is loaded from a signed commit on the default branch.
+#   - It verifies TARGET_SHA via the GitHub REST API.
+#   - No checked-out repository code is executed before this gate.
+#   - A GitHub "verified" badge proves cryptographic provenance, NOT code safety.
+#   - The gate can still be modified by a future signed+merged PR; it is NOT
+#     immutable. It protects against: unsigned pushes, invalid signatures, and
+#     cryptographic identities GitHub does not recognize.
+#
+# Env vars:
+#   TARGET_SHA (required)              — 40-char hex SHA to verify
+#   GITHUB_API_URL (required)          — API base URL (https://api.github.com in prod)
+#   GITHUB_REPOSITORY (required)       — owner/repo
+#   GITHUB_TOKEN (required)            — API auth token
+#   OUTPUT_FILE (optional)             — path to write JSON outputs
+#   CBM_SIGNATURE_TEST_MODE (optional) — set to 1 for local test mode (loopback only)
+#   SIGNATURE_RETRY_DELAY_SCALE (opt)  — multiplier for backoff (default 1; 0 = no sleep)
+#
+# Exit codes:
+#   0 — signature verified (verified=true, reason=valid, verified_at=ISO, sha matches)
+#   1 — verification failed (unsigned, invalid, SHA mismatch, HTTP error, etc.)
+#   2 — configuration error
+#
+# JSON output format (written to OUTPUT_FILE if set):
+#   {
+#     "verified": "true|false|error|not-run",
+#     "reason": "<GitHub reason string>",
+#     "verified_at": "<ISO timestamp>",
+#     "api_sha": "<40-char hex>",
+#     "error_category": "<GITHUB_SIGNATURE_*>",
+#     "attempts": "<integer as string>"
+#   }
+#
+# No key=value fallback — if JSON cannot be written, the script exits with code 2.
 #
 
 set -euo pipefail
 
-# In-memory state (emitted once via trap as JSON — SIG-AUD-05)
+# ─── In-memory state (emitted once via trap as JSON — SIG-AUD-05) ────────
 STATE_VERIFIED="not-run"
 STATE_REASON=""
 STATE_VERIFIED_AT=""
@@ -22,37 +55,47 @@ STATE_API_SHA=""
 STATE_ERROR_CATEGORY="none"
 STATE_ATTEMPTS="0"
 OUTPUT_FILE="${OUTPUT_FILE:-}"
+SIGNATURE_RETRY_DELAY_SCALE="${SIGNATURE_RETRY_DELAY_SCALE:-1}"
 
+# ─── Output emission ─────────────────────────────────────────────────────
+# SIG-R169-JSON-01: Values are passed via environment variables, NOT via
+#   string interpolation into Python code. This prevents apostrophe/backslash
+#   injection from breaking the JSON generator.
+# SIG-R169-JSON-02: No key=value fallback. If JSON generation fails, the
+#   script exits with code 2 (explicit failure, no silent degradation).
+# shellcheck disable=SC2329 # Invoked via trap, not directly
 emit_final_outputs() {
   local exit_code=$?
   if [ -n "$OUTPUT_FILE" ]; then
-    python3 -c "
-import json
+    if ! STATE_VERIFIED="$STATE_VERIFIED" \
+         STATE_REASON="$STATE_REASON" \
+         STATE_VERIFIED_AT="$STATE_VERIFIED_AT" \
+         STATE_API_SHA="$STATE_API_SHA" \
+         STATE_ERROR_CATEGORY="$STATE_ERROR_CATEGORY" \
+         STATE_ATTEMPTS="$STATE_ATTEMPTS" \
+         OUTPUT_FILE="$OUTPUT_FILE" \
+         python3 -c "
+import json, os
 data = {
-    'github_signature_verified': '$STATE_VERIFIED',
-    'github_signature_reason': '$STATE_REASON',
-    'github_signature_verified_at': '$STATE_VERIFIED_AT',
-    'github_signature_api_sha': '$STATE_API_SHA',
-    'github_signature_error_category': '$STATE_ERROR_CATEGORY',
-    'github_signature_attempts': '$STATE_ATTEMPTS',
+    'verified': os.environ.get('STATE_VERIFIED', ''),
+    'reason': os.environ.get('STATE_REASON', ''),
+    'verified_at': os.environ.get('STATE_VERIFIED_AT', ''),
+    'api_sha': os.environ.get('STATE_API_SHA', ''),
+    'error_category': os.environ.get('STATE_ERROR_CATEGORY', ''),
+    'attempts': os.environ.get('STATE_ATTEMPTS', '0'),
 }
-with open('$OUTPUT_FILE', 'w') as f:
+with open(os.environ['OUTPUT_FILE'], 'w') as f:
     json.dump(data, f, indent=2)
-" 2>/dev/null || {
-      : > "$OUTPUT_FILE"
-      printf 'github_signature_verified=%s\n' "$STATE_VERIFIED" >> "$OUTPUT_FILE"
-      printf 'github_signature_reason=%s\n' "$STATE_REASON" >> "$OUTPUT_FILE"
-      printf 'github_signature_verified_at=%s\n' "$STATE_VERIFIED_AT" >> "$OUTPUT_FILE"
-      printf 'github_signature_api_sha=%s\n' "$STATE_API_SHA" >> "$OUTPUT_FILE"
-      printf 'github_signature_error_category=%s\n' "$STATE_ERROR_CATEGORY" >> "$OUTPUT_FILE"
-      printf 'github_signature_attempts=%s\n' "$STATE_ATTEMPTS" >> "$OUTPUT_FILE"
-    }
+"; then
+      echo "::error::Failed to write JSON output — no fallback (SIG-R169-JSON-02)" >&2
+      exit_code=2
+    fi
   fi
   exit "$exit_code"
 }
 trap emit_final_outputs EXIT
 
-# Configuration validation
+# ─── Configuration validation ───────────────────────────────────────────
 if [ -z "${TARGET_SHA:-}" ]; then
   echo "::error::TARGET_SHA is not set" >&2
   STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_CONFIG_ERROR"
@@ -79,7 +122,9 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
   exit 2
 fi
 
-# SIG-AUD-03: Test mode isolation
+# ─── Test mode isolation (SIG-AUD-03) ────────────────────────────────────
+# In test mode, only loopback URLs are allowed. This prevents accidental
+# use of test mode against the real GitHub API.
 CBM_SIGNATURE_TEST_MODE="${CBM_SIGNATURE_TEST_MODE:-}"
 if [ "$CBM_SIGNATURE_TEST_MODE" = "1" ]; then
   if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
@@ -87,6 +132,7 @@ if [ "$CBM_SIGNATURE_TEST_MODE" = "1" ]; then
     STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_CONFIG_ERROR"
     exit 2
   fi
+  # shellcheck disable=SC2102 # [::1] is an IPv6 literal, not a range
   case "$GITHUB_API_URL" in
     http://127.0.0.1:*|http://localhost:*|http://[::1]:*) ;;
     *)
@@ -107,17 +153,31 @@ echo "=== GitHub Commit Signature Verification ==="
 echo "Target SHA: $TARGET_SHA"
 echo "Repository: $GITHUB_REPOSITORY"
 echo "API URL: $GITHUB_API_URL"
+echo "Retry delay scale: $SIGNATURE_RETRY_DELAY_SCALE"
 echo ""
 
-# SIG-AUD-09: 3 attempts, 2 delays: 1s and 2s
+# ─── Retry loop (SIG-AUD-08/09: 3 attempts, backoff 1s/2s) ───────────────
 MAX_ATTEMPTS=3
 BACKOFF_DELAYS=(1 2)
+
+# Scaled sleep — allows tests to set SIGNATURE_RETRY_DELAY_SCALE=0 for speed
+maybe_sleep() {
+  local delay="$1"
+  if [ "$SIGNATURE_RETRY_DELAY_SCALE" = "0" ]; then
+    return 0
+  fi
+  local scaled
+  scaled=$(awk "BEGIN { printf \"%d\", $delay * $SIGNATURE_RETRY_DELAY_SCALE }" 2>/dev/null || echo "$delay")
+  if [ "$scaled" -gt 0 ] 2>/dev/null; then
+    sleep "$scaled"
+  fi
+}
 
 for attempt in $(seq 1 $MAX_ATTEMPTS); do
   STATE_ATTEMPTS="$attempt"
   echo "--- Attempt $attempt/$MAX_ATTEMPTS ---"
 
-  # SIG-AUD-08: curl with timeouts
+  # SIG-AUD-08: curl with connect-timeout and max-time
   HTTP_RESPONSE=$(curl \
     --connect-timeout 10 \
     --max-time 30 \
@@ -132,7 +192,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
     echo "::error::Network error" >&2
     if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
       echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-      sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
+      maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
       continue
     fi
     exit 1
@@ -149,7 +209,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
       echo "::error::HTTP 429 — rate limited" >&2
       if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
         echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-        sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
+        maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
         continue
       fi
       exit 1
@@ -159,7 +219,7 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
       echo "::error::HTTP $HTTP_STATUS (retryable)" >&2
       if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
         echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-        sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
+        maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
         continue
       fi
       exit 1
@@ -178,16 +238,19 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
     fi
   fi
 
-  # SIG-AUD-07: Single-pass strict JSON parsing with type validation
+  # SIG-AUD-07 + SIG-R169-SCHEMA-01: Strict JSON parsing with ISO timestamp validation
+  # Values are parsed in Python and returned as a pipe-delimited string.
+  # This avoids shell/Python interpolation issues.
   PARSE_RESULT=$(echo "$HTTP_BODY" | python3 -c "
 import json, sys, re
+from datetime import datetime
 try:
     d = json.load(sys.stdin)
 except Exception:
     print('MALFORMED_JSON')
     sys.exit(0)
 sha = d.get('sha')
-if not isinstance(sha, str) or not re.match(r'^[0-9a-f]{40}$', sha):
+if not isinstance(sha, str) or not re.match(r'^[0-9a-f]{40}\$', sha):
     print('SCHEMA_ERROR|sha')
     sys.exit(0)
 v = d.get('commit', {}).get('verification')
@@ -206,6 +269,13 @@ verified_at = v.get('verified_at')
 if not isinstance(verified_at, str) or not verified_at:
     print('SCHEMA_ERROR|verified_at')
     sys.exit(0)
+# SIG-R169-SCHEMA-01: validate verified_at as ISO-8601 timestamp
+# Reject: 'foo', '2026', timestamps without timezone, etc.
+try:
+    datetime.fromisoformat(verified_at.replace('Z', '+00:00'))
+except Exception:
+    print('SCHEMA_ERROR|verified_at_format')
+    sys.exit(0)
 print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
 " 2>/dev/null)
 
@@ -214,7 +284,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
     echo "::error::Malformed JSON" >&2
     if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
       echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-      sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
+      maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
       continue
     fi
     exit 1
@@ -231,10 +301,12 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
   REASON=$(echo "$PARSE_RESULT" | cut -d'|' -f3)
   VERIFIED_AT=$(echo "$PARSE_RESULT" | cut -d'|' -f4)
 
+  # SIG-R169-DIAG-01: Always populate ALL state fields after successful parse,
+  # even on refusal paths. This ensures the summary has complete diagnostics.
   STATE_API_SHA="$API_SHA"
   STATE_REASON="$REASON"
   STATE_VERIFIED_AT="$VERIFIED_AT"
-  # SIG-AUD-06: Set verified to actual value
+  # SIG-AUD-06: Set verified to the actual API value (not "not-run")
   STATE_VERIFIED="$VERIFIED"
 
   echo "  API SHA: $API_SHA"
@@ -243,7 +315,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
 
   if [ "$API_SHA" != "$TARGET_SHA" ]; then
     STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_SHA_MISMATCH"
-    echo "::error::SHA mismatch" >&2
+    echo "::error::SHA mismatch: API=$API_SHA, target=$TARGET_SHA" >&2
     exit 1
   fi
 
@@ -263,7 +335,7 @@ print(f'{sha}|{str(verified).lower()}|{reason}|{verified_at}')
       STATE_ERROR_CATEGORY="GITHUB_SIGNATURE_TRANSIENT_VERIFIER_ERROR"
       if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
         echo "  Retrying in ${BACKOFF_DELAYS[$((attempt-1))]}s..."
-        sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
+        maybe_sleep "${BACKOFF_DELAYS[$((attempt-1))]}"
         continue
       fi
       ;;
