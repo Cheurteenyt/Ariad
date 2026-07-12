@@ -75,7 +75,7 @@ jobs:
           cache-dependency-path: v2/package.json
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Typecheck
         run: npx tsc --noEmit
@@ -111,7 +111,7 @@ jobs:
           cache-dependency-path: graph-ui/package.json
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Typecheck
         run: npx tsc --noEmit

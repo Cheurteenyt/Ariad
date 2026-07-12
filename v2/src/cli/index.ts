@@ -27,7 +27,7 @@ const program = new Command();
 
 program
   .name('cbm-v2')
-  .description('Codebase Memory V2 sidecar — human memory + Obsidian sync')
+  .description('Codebase Memory V2 — hybrid code intelligence (native WASM indexer + human memory graph + Obsidian sync + graph UI)')
   .version(VERSION, '-V, --version');
 
 registerObsidianCommand(program);

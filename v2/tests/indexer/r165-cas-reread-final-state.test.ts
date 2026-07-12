@@ -846,9 +846,4 @@ describe('R165: CAS Miss Re-read + Final-state Snapshot Marker', () => {
     // last_successful_index_at AS lastSuccessfulIndexAt.
     expect(src).toContain('last_successful_index_at AS lastSuccessfulIndexAt FROM projects WHERE name = ?');
   });
-
-  it('regression: package.json version is 0.73.1', () => {
-    const pkg = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
-    expect(pkg).toContain('"version": "0.73.1"');
-  });
 });

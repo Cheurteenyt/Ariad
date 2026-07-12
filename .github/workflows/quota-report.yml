@@ -31,15 +31,18 @@ jobs:
     name: Quota Report
     runs-on: ubuntu-latest
     steps:
-      - name: Generate quota report
+      - name: Generate repository health report
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "## Quota Report" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          echo "## Repository Health Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Single API call + single Python parse for all rate limit data
-          RATE_LIMIT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+          # GitHub API rate limits — fail on HTTP error (R168.2 fix)
+          RATE_LIMIT=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/rate_limit")
 
           echo "$RATE_LIMIT" | python3 -c "
@@ -56,23 +59,35 @@ jobs:
           print()
           " >> $GITHUB_STEP_SUMMARY
 
-          # Single API call for Actions runs count
-          RUNS_RESPONSE=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+          # Actions runs count — fail on HTTP error (R168.2 fix)
+          # Note: this is the total count of all workflow runs visible to
+          # the API, NOT filtered to the last 30 days. The GitHub API
+          # does not support date filtering on this endpoint.
+          RUNS_RESPONSE=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=1")
 
-          TOTAL_RUNS=$(echo "$RUNS_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count', 0))")
+          TOTAL_RUNS=$(echo "$RUNS_RESPONSE" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          if 'total_count' not in d:
+              print('ERROR: missing total_count', file=sys.stderr)
+              sys.exit(1)
+          print(d['total_count'])
+          ")
 
-          echo "### GitHub Actions (last 30 days)" >> $GITHUB_STEP_SUMMARY
+          echo "### GitHub Actions" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Total runs | $TOTAL_RUNS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Actions minutes | Unlimited (public repo) |" >> $GITHUB_STEP_SUMMARY
+          echo "| All workflow runs (visible to API) | $TOTAL_RUNS |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> Public repos have unlimited Actions minutes." >> $GITHUB_STEP_SUMMARY
+          echo "> Standard GitHub-hosted runners are free for public repositories." >> $GITHUB_STEP_SUMMARY
+          echo "> This report does not assert absence of technical or service limits." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- GitHub Actions: unlimited (public repo)" >> $GITHUB_STEP_SUMMARY
-          echo "- GitLab CI: ~1% usage (mirror only)" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Actions: free for public repos (standard runners)" >> $GITHUB_STEP_SUMMARY
+          echo "- GitLab CI: disabled; passive mirror creates no pipeline" >> $GITHUB_STEP_SUMMARY
           echo "- GitHub API: 5000 req/hr (authenticated)" >> $GITHUB_STEP_SUMMARY

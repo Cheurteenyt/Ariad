@@ -13,6 +13,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, extname, relative, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { HumanMemoryStore, defaultHumanDbPath } from '../human/store.js';
 import { CodeGraphReader, defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { getNotifyHub } from './notify-hub.js';
@@ -24,6 +25,40 @@ import { routeProjects, routeProjectHealth, routeProjectDelete } from './routes/
 import { routeHumanNotes, routeAdrGet, routeAdrPost } from './routes/human.js';
 import { routeIndex, routeIndexStatus } from './routes/index.js';
 import { routeBrowse, routeProcesses, routeProcessKill, routeLogs } from './routes/system.js';
+
+/**
+ * R168.2: Resolve the graph-ui dist path from the module location, not
+ * from process.cwd(). This allows the UI to be served when the package
+ * is installed globally or run from Docker.
+ *
+ * Resolution order:
+ * 1. dist/ui/ (embedded assets from Dockerfile / build script)
+ * 2. ../graph-ui/dist/ (dev mode — running from v2/ in the repo)
+ * 3. ../../graph-ui/dist/ (fallback for some layouts)
+ */
+function resolveGraphUiPath(): string {
+  // Try embedded assets first (dist/ui/ relative to this compiled file)
+  const moduleDir = resolve(fileURLToPath(import.meta.url), '..');
+  const embedded = resolve(moduleDir, '..', 'ui');
+  if (existsSync(resolve(embedded, 'index.html'))) {
+    return embedded;
+  }
+
+  // Dev mode: look for graph-ui/dist relative to the repo root
+  const devPath1 = resolve(process.cwd(), '..', 'graph-ui', 'dist');
+  if (existsSync(resolve(devPath1, 'index.html'))) {
+    return devPath1;
+  }
+
+  const devPath2 = resolve(moduleDir, '..', '..', '..', 'graph-ui', 'dist');
+  if (existsSync(resolve(devPath2, 'index.html'))) {
+    return devPath2;
+  }
+
+  // Fallback: return the embedded path even if it doesn't exist yet —
+  // the server will return 404 for UI assets but API endpoints still work.
+  return embedded;
+}
 
 export interface UiServerOptions {
   port?: number;
@@ -72,7 +107,7 @@ export class UiServer {
   constructor(opts: UiServerOptions) {
     this.port = opts.port ?? DEFAULT_PORT;
     this.project = opts.project;
-    this.graphUiPath = opts.graphUiPath ?? resolve(process.cwd(), '..', 'graph-ui', 'dist');
+    this.graphUiPath = opts.graphUiPath ?? resolveGraphUiPath();
     this.humanStore = new HumanMemoryStore(defaultHumanDbPath(this.project));
     this.humanStore.attachNotifyHub(getNotifyHub(), this.project);
     // Try to open the code graph reader. If the DB doesn't exist (project

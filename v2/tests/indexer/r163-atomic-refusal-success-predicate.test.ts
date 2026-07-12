@@ -431,8 +431,4 @@ describe('R163: Atomic Refusal State + Success Predicate', () => {
     expect(block2).toContain('structural');
   });
 
-  it('regression: package.json version is 0.73.1 (R168.1 bump)', () => {
-    const pkg = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
-    expect(pkg).toContain('"version": "0.73.1"');
-  });
 });

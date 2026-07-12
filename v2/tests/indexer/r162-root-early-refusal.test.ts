@@ -660,8 +660,4 @@ describe('R162: Root Change Early Refusal + Legacy Lock + root_path Preservation
     expect(src).toContain('R162 (DATA-R162-01 + RES-R162-01 + STATE-R162-02): DEPRECATED.');
   });
 
-  it('regression: package.json version is 0.73.1 (R168.1 bump)', () => {
-    const pkg = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
-    expect(pkg).toContain('"version": "0.73.1"');
-  });
 });

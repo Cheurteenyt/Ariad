@@ -7,7 +7,7 @@ Thank you for your interest in contributing! This guide covers everything you ne
 ```bash
 # Clone
 git clone https://github.com/Cheurteenyt/codebase-mirror.git
-cd cheurteen-project/v2
+cd codebase-mirror/v2
 
 # Install dependencies
 npm install
