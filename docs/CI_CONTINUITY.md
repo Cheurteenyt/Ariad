@@ -212,3 +212,28 @@ architecture is sufficient for the project's risk profile.
 - `v2/tests/ci/r166-github-canonical-passive-mirror.test.ts` —
   regression tests for the mirror contract
 - `worklog.md` — operational history (R157 → current)
+
+## 6. GitHub signature verification API unavailable
+
+SIG-R169 is being deployed in 2 phases. As of Phase A, the signature
+gate is NOT yet active — the mirror workflow operates without it.
+Phase B will activate the gate.
+
+Once Phase B is deployed, if the GitHub API is temporarily unavailable,
+the mirror will fail closed.
+
+### Response (Phase B, after activation)
+
+- GitLab remains at the last successfully mirrored SHA
+- No manual unsigned bypass
+- Re-run the mirror workflow after GitHub API recovers
+- The signature gate retries with a smart policy:
+  - Network errors, HTTP 5xx, gpgverify_error/unavailable: 3 attempts, backoff 1s/2s
+  - HTTP 429 or secondary rate limit with `Retry-After` ≤ 10s: honor it
+  - HTTP 403 + `x-ratelimit-remaining: 0` (primary exhausted): fail closed immediately
+  - HTTP 429 with `Retry-After` > 10s: fail closed (don't waste CI time)
+
+### Acceptable
+
+This is a fail-closed behavior. GitHub remains canonical. GitLab
+remains at the last verified SHA. No data is lost.

@@ -535,3 +535,292 @@ git ls-remote "$GITLAB_URL" refs/heads/main
 - Do not promote GitLab to canonical, even temporarily.
 
 If any of these seems necessary, stop and declare an incident.
+
+## 19. GitHub signature verification gate (SIG-R169)
+
+### Current state: Phase A (not yet activated)
+
+The signature gate is being deployed in a **2-phase bootstrap** to
+establish a non-circular trust root (SIG-R3-TRUST-01):
+
+- **Phase A (current):** The canonical verifier script, runtime tests,
+  and documentation are published. The mirror workflow does NOT yet
+  call the verifier. The workflow remains in its pre-SIG-R169 state.
+- **Phase B (next PR):** The mirror workflow is modified to checkout
+  the verifier at `ref: <Phase A squash SHA>` (an immutable 40-char
+  Git SHA) and call it before target checkout. This ensures the
+  verifier cannot come from `TARGET_SHA` or a future `main`.
+
+Rationale: If the workflow checked out the verifier from the default
+branch without a `ref`, `actions/checkout` would use the event SHA
+(which for `workflow_run` is the latest commit on the default branch).
+This means `TARGET_SHA` could supply its own verifier — a circular
+trust root. Pinning to the Phase A SHA breaks the circle.
+
+### Purpose (Phase B)
+
+Once activated, the gate will verify that GitHub has cryptographically
+verified the commit at `TARGET_SHA` **before** the mirror workflow
+materializes the GitLab SSH key or attempts any push to GitLab.
+
+### Trust boundary (SIG-R169-POLICY-01)
+
+The signature gate is a **provenance check**, not a **safety check**.
+
+It protects against:
+- Unsigned direct pushes to `main`
+- Commits with invalid or malformed signatures
+- Cryptographic identities GitHub does not recognize
+
+It does NOT prove:
+- Absence of malicious code in the commit
+- Sufficiency of human review
+- Immutability of the workflow itself (a future signed+merged PR can
+  modify the gate — the pin must be rotated in a separate PR)
+- Absence of account compromise
+
+The verifier script is loaded from an immutable pinned SHA (Phase B).
+No checked-out repository code is executed before the gate. The
+workflow itself remains protected by repository branch protection
+rules, not by the signature gate.
+
+### Canonical source (SIG-R169-DIV-01)
+
+The verification logic lives in a **single canonical script**:
+
+```text
+scripts/ci/verify-github-commit-signature.sh
+```
+
+Phase B will call this script directly from the workflow. There is no
+inline duplication. Runtime tests
+(`v2/tests/ci/r169-signature-runtime.test.ts`) execute this same script
+against a local HTTP fixture server — the tests prove the actual
+production code path, not a copy.
+
+### API endpoint
+
+```text
+GET /repos/{owner}/{repo}/commits/{TARGET_SHA}
+Authorization: Bearer ${{ github.token }}
+Accept: application/vnd.github+json
+X-GitHub-Api-Version: 2026-03-10
+```
+
+### Acceptance criteria
+
+```text
+response.sha == TARGET_SHA
+commit.verification.verified == true
+commit.verification.reason == "valid"
+commit.verification.verified_at is a valid ISO-8601 timestamp WITH timezone
+```
+
+All four conditions must be met. No partial acceptance.
+
+#### verified_at contract (SIG-R4-VERIFYAT-01)
+
+The `verified_at` field follows the REAL GitHub API contract:
+
+- **On success** (`verified=true`, `reason=valid`): `verified_at` must
+  be a non-null ISO-8601 string WITH timezone. Values like `"foo"`,
+  `"2026"`, `"2026-07-13T10:00:00"` (no timezone), and `"2026-07-13"`
+  (date-only) are all rejected as `SCHEMA_ERROR`.
+- **On refusal** (`verified=false`, `reason!=valid`): `verified_at` may
+  be `null` (this is the actual GitHub response for unsigned/invalid
+  commits). The parser normalizes `null` to `""` in the output JSON.
+
+Incoherent states are rejected as `SCHEMA_ERROR`:
+- `verified=true` + `reason!=valid`
+- `verified=false` + `reason=valid`
+
+### Reason validation (SIG-R4-PARSER-01)
+
+The `reason` field is validated against the official GitHub enum:
+`expired_key`, `not_signing_key`, `gpgverify_error`, `gpgverify_unavailable`,
+`unsigned`, `unknown_signature_type`, `no_user`, `unverified_email`,
+`bad_email`, `unknown_key`, `malformed_signature`, `invalid`, `valid`.
+
+Any reason not in this enum is rejected as `SCHEMA_ERROR` — this prevents
+arbitrary strings from reaching the shell pipe parser and forces a
+conscious audit when GitHub introduces new reason values.
+
+### Error categories
+
+| Category | Trigger | Retry? |
+|----------|---------|--------|
+| `GITHUB_SIGNATURE_CONFIG_ERROR` | Missing/invalid env vars | No |
+| `GITHUB_SIGNATURE_API_NETWORK_ERROR` | curl failure | Yes (3×) |
+| `GITHUB_SIGNATURE_API_HTTP_ERROR` | 401/404/403(non-rate-limit)/other | No |
+| `GITHUB_SIGNATURE_API_RATE_LIMITED` | HTTP 429 or 403+remaining:0 or secondary rate limit | Conditional (see below) |
+| `GITHUB_SIGNATURE_API_MALFORMED_JSON` | Invalid JSON | No (SIG-R3-RETRY-01) |
+| `GITHUB_SIGNATURE_API_SCHEMA_ERROR` | Missing/malformed verification, bad verified_at, unknown reason | No |
+| `GITHUB_SIGNATURE_SHA_MISMATCH` | API SHA != TARGET_SHA | No |
+| `GITHUB_SIGNATURE_UNSIGNED` | reason=unsigned | No |
+| `GITHUB_SIGNATURE_INVALID` | reason=invalid/malformed_signature | No |
+| `GITHUB_SIGNATURE_UNVERIFIED` | reason=unknown_key/expired_key/etc | No |
+| `GITHUB_SIGNATURE_TRANSIENT_VERIFIER_ERROR` | reason=gpgverify_error/unavailable | Yes (3×) |
+
+### Retry policy
+
+- Max 3 attempts
+- Backoff: 1s, 2s (between attempts 1→2 and 2→3)
+- Retries: network errors, HTTP 429 (with Retry-After ≤10s), HTTP 403
+  secondary rate limit, HTTP 5xx, gpgverify_error/unavailable
+- NO retry for: malformed JSON (SIG-R3-RETRY-01), schema errors,
+  unsigned, invalid, SHA mismatch, HTTP 401/404, HTTP 403 non-rate-limit,
+  HTTP 403+remaining=0 (primary exhausted)
+- `SIGNATURE_RETRY_DELAY_SCALE`: production must be `1`; test mode may
+  be `0` or `1` (SIG-R3-RETRY-02). Any other value is rejected.
+
+### Rate limit handling (SIG-R3-RATE-01 + SIG-R4-RATE-01)
+
+GitHub can signal rate limits via:
+- HTTP 429 (primary rate limit)
+- HTTP 403 + `x-ratelimit-remaining: 0` header (primary rate limit exhausted)
+- HTTP 403 + body containing "secondary rate limit"
+
+**Smart retry policy:**
+
+| Condition | Action |
+|-----------|--------|
+| HTTP 403 + remaining=0 (primary exhausted) | **Fail closed immediately** — retrying with 1s/2s won't succeed before reset |
+| HTTP 429 or secondary rate limit + `Retry-After` ≤ 10s | Honor `Retry-After`, retry once |
+| HTTP 429 or secondary rate limit + `Retry-After` > 10s | **Fail closed** — don't waste CI time |
+| HTTP 429 or secondary rate limit + no `Retry-After` | Use default backoff (1s/2s) |
+
+Response headers are captured via `curl --dump-header` to detect the
+403+header case and read `Retry-After`.
+
+### JSON output (SIG-AUD-05, SIG-R169-JSON-01/02)
+
+The script writes JSON to `OUTPUT_FILE` via a trap on EXIT. Values are
+passed through environment variables (not string interpolation) to
+prevent apostrophe/backslash injection. There is no `key=value` fallback
+— if JSON generation fails, the script exits with code 2.
+
+All six fields are always populated after a successful API response,
+even on refusal paths (SIG-R169-DIAG-01):
+
+```json
+{
+  "verified": "true|false|error|not-run",
+  "reason": "<GitHub reason>",
+  "verified_at": "<ISO timestamp>",
+  "api_sha": "<40-char hex>",
+  "error_category": "<GITHUB_SIGNATURE_*>",
+  "attempts": "<integer>"
+}
+```
+
+### Phase B: Fail-closed JSON validation (SIG-R3-OUTPUT-01)
+
+When Phase B activates the gate, the workflow wrapper will validate
+the JSON output fail-closed:
+
+1. Script exit 0 + JSON absent/empty → step fails
+2. Script exit 0 + JSON malformed → step fails
+3. Script exit 0 + `verified != true` → step fails
+4. Script exit 0 + `api_sha != TARGET_SHA` → step fails
+5. Script exit 0 + `error_category != none` → step fails
+6. Script exit 1 + valid JSON → diagnostics published, then step fails
+7. Any output with multiline values → step fails
+
+This prevents a fail-open scenario where a missing/malformed JSON
+allows the push to proceed.
+
+### Phase B: Strict summary (SIG-R3-SUMMARY-01)
+
+The workflow summary will require ALL of the following for
+`Overall: SUCCESS`:
+
+```text
+SIG_VERIFIED == true
+SIG_SHA_MATCH == true
+MIRROR_SUCCESS == true (mirrored|already-mirrored|newer-valid-mirror-present)
+GITLAB_PARITY == true
+JOB_STATUS == success
+```
+
+If any condition is false, the result is `FAILED`.
+
+### Expected GitLab UI badge
+
+GitLab may show "Unverified" for commits signed by GitHub's `web-flow`
+identity. This is expected and does not indicate corruption. The
+canonical proof is:
+
+```text
+GitHub API verified == true
++
+GitLab main SHA == GitHub main SHA (exact object parity)
+```
+
+### Runtime tests (SIG-R169-RT-01)
+
+The verifier script has both source-inspection tests and runtime tests:
+
+- `v2/tests/ci/r169-signature-gate.test.ts` — source structure,
+  token-leak detection with negative fixtures, Phase A bootstrap
+  verification, parser contract verification
+- `v2/tests/ci/r169-signature-runtime.test.ts` — executes the real
+  script against a local HTTP fixture server with 52 test cases:
+  - Success: valid, valid+offset, 429-then-valid, 429+Retry-After,
+    403-secondary-then-valid, gpgverify-then-valid
+  - Refusal (realistic null verified_at): unsigned, invalid,
+    malformed_signature, unknown_key, SHA mismatch, gpgverify_error (retry),
+    gpgverify_unavailable (retry), verified=true+reason!=valid (SCHEMA_ERROR),
+    verified=false+reason=valid (SCHEMA_ERROR), unknown reason (SCHEMA_ERROR)
+  - HTTP: 500, 502, 503, 504, 429-permanent, 401, 404, 403-non-rate-limit,
+    403+remaining=0 (fail closed), 429+Retry-After=60 (fail closed)
+  - JSON/schema: malformed, missing-verification, verified_at absent/foo/2026/no-tz/date-only,
+    verified wrong type, reason wrong type
+  - Config: missing TARGET_SHA, invalid SHA, missing TOKEN/URL/REPO,
+    non-loopback, GITHUB_ACTIONS=true, invalid scale, scale=0 in prod
+  - Network: connection refused
+  - Fixture verification: method, path, auth, accept, API-version headers,
+    request count per scenario
+
+Tests delete `GITHUB_ACTIONS` from the child environment so they can
+run in GitHub Actions (SIG-R3-CI-01). A dedicated test verifies that
+`GITHUB_ACTIONS=true` + test mode → `CONFIG_ERROR`.
+
+Child process has a 5s watchdog timer (SIG-R3-TESTTIME-01). Server is
+closed with a Promise to avoid orphan handles.
+
+Temp file cleanup is verified at runtime with a dedicated TMPDIR
+(SIG-R5-TEMP-01): tests confirm no orphaned temp files after 429-then-valid,
+500-permanent, 403-primary-exhausted, and 200-success scenarios.
+
+### CI ShellCheck validation (SIG-R4-CI-01, SIG-R5-CI-TEST-01)
+
+The Backend CI job includes a ShellCheck step for security-critical CI
+scripts. Configuration:
+
+```yaml
+- name: ShellCheck security-critical CI scripts
+  uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+  with:
+    severity: warning
+    scandir: ./scripts/ci
+    version: v0.10.0
+```
+
+- **Action pinned by SHA** (not tag): `00cae500b08a931fb5698e11e79bfbd38e612a38`
+  (verified via GitHub API as the real commit for tag 2.0.0)
+- **ShellCheck binary version pinned**: `v0.10.0` (not `stable`) for
+  reproducibility (SUPPLY-R5-01)
+- **Uses `scandir`** (not the non-existent `additional_paths` input) to
+  target `./scripts/ci`
+- **Step lives inside the Backend job** — no new required check
+- Verified: 2026-07-13
+
+Structural tests in `r169-signature-gate.test.ts` verify the CI YAML:
+action ref is a 40-char SHA, `additional_paths` is absent, `scandir`
+targets `scripts/ci`, version is explicit, step is in the Backend job.
+
+### Script
+
+`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.
+Phase A: exists with full test coverage, not yet called by the workflow.
+Phase B: will be called by the workflow with `ref: <Phase A squash SHA>`.

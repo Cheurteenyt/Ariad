@@ -83,6 +83,20 @@ jobs:
       - name: Build
         run: npm run build
 
+      # SIG-R4-CI-01: ShellCheck security-critical CI scripts.
+      # SIG-R6: Moved BEFORE Vitest so ShellCheck always runs even if tests
+      # fail (steps after a failure are skipped by default).
+      # Action pinned by SHA (tag 2.0.0 → 00cae500b08a931fb5698e11e79bfbd38e612a38).
+      # ShellCheck binary version pinned to v0.10.0 for reproducibility
+      # (SUPPLY-R5-01). The step runs inside the Backend job — no new
+      # required check. Verified: 2026-07-13.
+      - name: ShellCheck security-critical CI scripts
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+        with:
+          severity: warning
+          scandir: ./scripts/ci
+          version: v0.10.0
+
       - name: Test
         run: npx vitest run
 

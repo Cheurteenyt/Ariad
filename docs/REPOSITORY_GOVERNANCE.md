@@ -277,3 +277,103 @@ After any modification to GitHub repository settings:
 - [CI_CONTINUITY.md](CI_CONTINUITY.md) — Operational resilience plan
 - [RELEASE_POLICY.md](RELEASE_POLICY.md) — Release governance
 - [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) — Development workflow and conventions
+
+## 16. Cross-host Signature Trust Boundary (SIG-R169)
+
+### Current state: Phase A (not yet activated)
+
+The signature gate is being deployed in a **2-phase bootstrap** to
+establish a non-circular trust root (SIG-R3-TRUST-01):
+
+- **Phase A (current):** The canonical verifier script, runtime tests,
+  and documentation are published. The mirror workflow does NOT yet
+  call the verifier.
+- **Phase B (next PR):** The mirror workflow checks out the verifier
+  at `ref: <Phase A squash SHA>` and calls it before target checkout.
+
+### Architecture
+
+GitHub is the **canonical authority** for commit signature verification.
+
+GitLab may display "Unverified" for commits signed by GitHub's `web-flow`
+identity because GitLab maintains its own trust registry and does not
+automatically reuse GitHub's verification results.
+
+This is **not** a corruption indicator — it means GitLab's local trust
+model doesn't recognize the GitHub signing key.
+
+### Trust boundary (SIG-R169-POLICY-01)
+
+The signature gate is a **provenance check**, not a **safety check**.
+
+It protects against:
+- Unsigned direct pushes to `main`
+- Commits with invalid or malformed signatures
+- Cryptographic identities GitHub does not recognize
+
+It does NOT prove:
+- Absence of malicious code in the commit
+- Sufficiency of human review
+- Immutability of the workflow itself
+- Absence of account compromise
+
+The verifier script (Phase B) is loaded from an immutable pinned SHA —
+no checked-out repository code is executed before the gate. The
+workflow itself remains protected by repository branch protection
+rules, not by the signature gate.
+
+### Canonical source (SIG-R169-DIV-01)
+
+The verification logic lives in a **single canonical script**. Phase B
+will call this script directly from the workflow — no inline duplication.
+Runtime tests execute the same script against a local HTTP fixture
+server, proving the actual production code path.
+
+### Trust contract (Phase B)
+
+The mirror workflow will verify, **before** materializing any GitLab SSH
+credential:
+
+```text
+GitHub API: commit.verification.verified == true
+GitHub API: commit.verification.reason == "valid"
+GitHub API: commit.verification.verified_at is a valid ISO-8601 timestamp WITH timezone
+GitHub API: response.sha == TARGET_SHA
+```
+
+If any of these checks fail, the mirror does not proceed. No GitLab
+SSH key is written to disk. No push is attempted. GitLab remains at
+the last successfully mirrored SHA.
+
+The `verified_at` field follows the real GitHub API contract
+(SIG-R4-VERIFYAT-01): it is required (ISO-8601 with timezone) only on
+success (`verified=true`, `reason=valid`); on refusal it may be `null`
+and is normalized to `""` in the output. The `reason` field is validated
+against the official GitHub enum (SIG-R4-PARSER-01).
+
+After successful mirror: `GitLab main SHA == TARGET_SHA` proves the
+exact Git object verified by GitHub is now present on GitLab.
+
+### What NOT to do
+
+- Do not add GitHub's `web-flow` GPG key to a GitLab user profile
+- Do not pin the GitHub key ID in code or secrets
+- Do not enable `Reject unsigned commits` on GitLab (would break mirror)
+- Do not rewrite or re-sign commits to get a green GitLab badge
+- Do not accept unsigned commits as a fallback
+
+### Break-glass requirement
+
+Break-glass direct pushes to `main` must use a signing identity that
+GitHub verifies. An unsigned break-glass push will pass CI but the
+mirror will refuse to replicate it to GitLab.
+
+### Script
+
+`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.
+Phase A: exists with full test coverage (47 runtime tests + 32 source
+inspection tests), not yet called by the workflow. Phase B: will be
+called by the mirror workflow with `ref: <Phase A squash SHA>` before
+checkout of `TARGET_SHA`. Uses `GITHUB_TOKEN` (no new secrets). Retries
+on transient errors (max 3, backoff 1s/2s). Fails closed on all other
+errors.
