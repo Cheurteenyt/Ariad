@@ -1,10 +1,11 @@
 # Atomic Generation Publication — R169A Target Architecture
 
-> **Status: FOUNDATION / INACTIVE**
+> **Status: FOUNDATION / INACTIVE — implemented candidate, pending review**
 >
 > This document describes the **target architecture** for atomic generation
 > publication in Codebase Memory V2. As of R169A the foundational pieces are
-> merged (`v2/src/storage/generation-store.ts`,
+> an implemented candidate — inactive, pending review
+> (`v2/src/storage/generation-store.ts`,
 > `v2/src/storage/generation-types.ts`,
 > `v2/tests/storage/r169a-generation-store.test.ts`), but **no production
 > code path calls them yet**. The indexer still writes to the legacy
@@ -29,18 +30,22 @@ path helpers, manifest V1 types, a fail-closed read-only resolver, and an
 atomic JSON writer. The pieces are independently tested, inert by default,
 and impose **zero overhead** when unused.
 
-Activation is staged across R169B–R169E:
+Activation is staged across R169B–R169E (validated roadmap):
 
 | Round | Scope | Status |
 |-------|-------|--------|
-| R169A | Path helpers, manifest V1 types, resolver, atomic JSON writer | **MERGED — INACTIVE** |
-| R169B | Indexer writes generation DBs under `generations/` + manifest | planned |
-| R169C | Readers switch from `legacyCodeDbPath` → `resolveActiveCodeDb` | planned |
-| R169D | GC policy (keep active + 2 previous) | planned |
-| R169E | Legacy migration finish + DATA-CARRY-01 close | planned |
+| R169A | Generation Store Contract + Resolver Foundation | **implemented candidate — INACTIVE, pending review** |
+| R169B | Durable Staging Publisher + Validator + fsync + CAS + GC primitives | planned |
+| R169C | Indexer Integration + Outcome Contract | planned |
+| R169D | Reader Cutover + Legacy Migration + Project Lifecycle | planned |
+| R169E | Crash Matrix + Performance + Activation + Version | planned |
 
-`DATA-CARRY-01` (P1) is **not** closed by R169A. It is closed only when
-R169B+R169C are merged and the legacy fallback is removed from the hot path.
+`DATA-CARRY-01` (P1) is **not** closed by R169A. It remains **OPEN until
+R169E** — after the crash matrix (C01–C20 validation), concurrency
+analysis, performance contract verification, and activation gating have
+all been completed. R169B and R169C are necessary preconditions, but
+closing the carryover requires the full R169E crash + performance +
+activation evidence.
 
 ---
 
@@ -57,9 +62,14 @@ the new complete snapshot — never a partial publication**.
      NEVER a partial publication
 ```
 
-This is the contract that closes `DATA-CARRY-01` (P1). R169A delivers the
-non-active foundation; R169B–R169E deliver activation, GC, migration, and
-the formal close-out.
+This is the contract that will close `DATA-CARRY-01` (P1) — but only once
+the full R169A→R169E sequence has landed AND the R169E crash matrix,
+concurrency analysis, performance verification, and activation gating
+have all passed. R169A delivers the non-active foundation; R169B delivers
+the durable publisher + fsync + CAS + GC primitives; R169C integrates the
+indexer; R169D cuts over readers and migrates the legacy DB; R169E
+performs the crash matrix, performance, and activation gating that
+finally allow `DATA-CARRY-01` to be marked closed.
 
 ## 2. Invariants (specification section 4)
 
@@ -156,7 +166,7 @@ bumping `formatVersion` and a migration plan.
 | `formatVersion` | integer | Must be `1`. Any other value → `MANIFEST_UNSUPPORTED_VERSION`. |
 | `project` | string | Must match the requested project exactly. |
 | `generationId` | string | Canonical UUID v4 (lowercase, with hyphens). |
-| `dbFile` | string | Relative path from the project store directory. Must not contain `..`, must not be absolute, must not contain `\`. Example: `generations/generation-<uuid>.db`. |
+| `dbFile` | string | **Canonical form**: must equal exactly `generations/generation-<generationId>.db` (where `<generationId>` is the manifest's own `generationId`). Any other form — `.`, `active-generation.json`, `tmp/foo.db`, a different UUID, an absolute path, a backslash separator, or any `..` segment — is rejected with `MANIFEST_DBFILE_NOT_CANONICAL`. |
 | `createdAt` | string | ISO-8601 **with timezone**. `Z` or `±HH:MM`. |
 | `rootFingerprint` | string | Non-empty. Stable fingerprint of the project root (e.g. `dev:ino`). |
 | `extractorSemanticsVersion` | integer | `>= 0`. |
@@ -185,16 +195,25 @@ The exact set of keys is exported as `MANIFEST_V1_KEYS` in
    projects.
 5. `generationId` matches the canonical UUID v4 regex
    `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`.
-6. `dbFile` is a non-empty string, not absolute, contains no `..`
-   segment, contains no `\`. → `MANIFEST_TARGET_OUTSIDE_STORE` on
-   violation.
+6. `dbFile` is the **canonical path**
+   `generations/generation-<generationId>.db`, where `<generationId>` is
+   the manifest's own `generationId`. Any deviation — `.`, the manifest
+   filename, a `tmp/` path, a different UUID, an absolute path, a
+   backslash separator, or any `..` segment — raises
+   `MANIFEST_DBFILE_NOT_CANONICAL`. (The previous relative-path check
+   `MANIFEST_TARGET_OUTSIDE_STORE` is subsumed by the canonical check,
+   which is strictly stronger.)
 7. `createdAt` matches
    `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$`.
-   Date-only or no-timezone timestamps are rejected.
+   Date-only or no-timezone timestamps are rejected. Beyond the regex,
+   the components are calendar-validated: month 1–12, day 1–N where N is
+   the number of days in `(year, month)` (leap years handled correctly),
+   hour 0–23, minute 0–59, second 0–59 (POSIX — no leap seconds).
 8. `rootFingerprint` is a non-empty string.
 9. `extractorSemanticsVersion`, `discoveryPolicyVersion`, `nodeCount`,
-   `edgeCount`, `fileCount`, `sizeBytes` are integers `>= 0`. Floats and
-   negatives are rejected.
+   `edgeCount`, `fileCount`, `sizeBytes` are **safe integers** `>= 0`
+   (`Number.isSafeInteger`). Floats, negatives, `Infinity`, `NaN`, and
+   values greater than `Number.MAX_SAFE_INTEGER` are rejected.
 10. `sha256` matches `^[0-9a-f]{64}$`. Uppercase hex is rejected.
 11. No string field contains `\n` or `\r`. This keeps the manifest a
     single-line-friendly record and prevents newline-injection tricks.
@@ -284,9 +303,18 @@ The atomic writer enforces the following ordering, in this exact sequence:
    Without this, a crash could roll back the rename and leave the old
    file in place — which is correct for a writer (the old file is still
    valid) but undesirable for an indexer that wants confirmation that
-   the new file is committed. Directory fsync is best-effort on some
-   platforms (notably Windows); if it fails, we **do not** fail the
-   write, because the rename itself has already succeeded.
+   the new file is committed. **Directory fsync failure is NOT silent.**
+   If the directory cannot be opened, or if `fsync` on the directory
+   fails, the writer raises `ATOMIC_DURABILITY_UNKNOWN`. By the time
+   this step runs, `rename` has already happened, so the new target may
+   or may not be durable on crash — the caller (indexer) MUST re-read
+   the target and diagnose. The error is **not** swallowed and **not**
+   downgraded to success: silent success on directory fsync failure
+   would let the indexer believe the new generation is durable when in
+   fact it may be rolled back by a power loss. (On platforms that
+   genuinely cannot fsync a directory, the failure surfaces as
+   `ATOMIC_DURABILITY_UNKNOWN` so the indexer can take an explicit
+   recovery decision; it is never silently treated as committed.)
 
 The ordering can be summarized as:
 
@@ -300,9 +328,54 @@ Any deviation breaks the durability contract. In particular:
 - `fsync dir` before `rename` → useless; the rename hasn't happened yet.
 - Skipping `fsync file` → on crash, the rename succeeds but the file
   content is lost.
+- **Skipping `fsync dir` (or silently swallowing its failure)** → the
+  rename survives in the page cache but may not survive a power loss.
+  This is why the writer raises `ATOMIC_DURABILITY_UNKNOWN` on
+  directory-fsync failure rather than reporting success.
 
-This is implemented in `writeJsonAtomically(targetPath, value)` in
-`v2/src/storage/generation-store.ts`.
+### 6.1 Serialization and short-write safety
+
+Two further properties of the atomic writer are part of the contract:
+
+- **Serialization happens BEFORE any filesystem mutation.** The payload
+  is `JSON.stringify`-d (and the result type-checked) before the temp
+  file is opened. If serialization throws (circular references, BigInt)
+  or returns a non-string (`undefined`, functions, symbols), the writer
+  raises `ATOMIC_SERIALIZATION_FAILED` and **no temp file is created**.
+  This prevents partial writes caused by mid-payload serialization
+  failures and prevents leftover temp files.
+- **Short writes are accounted for.** The write loop tracks an offset
+  and continues from the new offset until the full payload is written.
+  If `writeSync` returns `<= 0`, the writer raises `ATOMIC_SHORT_WRITE`
+  and cleans up the temp file. Partial writes never reach the rename
+  step.
+
+### 6.2 Symlink chain security
+
+The resolver walks **every path component** from a higher-trust root
+(e.g. `generationStoreRoot`) down to both the manifest path and the
+generation DB path. For each component it performs an `lstat` and
+rejects ANY symlink in the chain — not just the final hop. The final
+candidate is then verified with `realpathSync.native` and containment-
+checked against the trust root.
+
+Error policy on the walk:
+
+- `ENOENT` on a component → return silently (the path is absent; the
+  resolver falls back to legacy or returns `missing`).
+- `EACCES`, `EIO`, `ENOTDIR`, `ELOOP` → fail closed with
+  `PATH_TRAVERSAL_REJECTED`. These are not swallowed: a permission or
+  I/O error during the walk is treated as evidence of tampering or
+  filesystem corruption, not as "absent".
+
+This means that a manifest parent directory that is a symlink, a
+`generations/` directory that is a symlink, or a generation DB that is
+a symlink are ALL rejected — the trust root must reach the target
+through regular directories and a regular file only. The legacy DB
+path uses the same walk and the same `lstat` chain.
+
+This is implemented in `assertPathInsideNoSymlinks` and
+`assertNotSymlink` in `v2/src/storage/generation-store.ts`.
 
 ## 7. Reader contract
 
@@ -354,14 +427,43 @@ The resolver's decision table:
 | Manifest state | Legacy DB state | Resolver result |
 |---|---|---|
 | valid | (ignored) | `generation` |
-| absent | exists | `legacy` |
+| absent | exists and is a regular file inside the trust root with no symlink chain | `legacy` |
+| absent | exists but is a directory, symlink, special file, or outside the trust root | **FAIL CLOSED** — `LEGACY_SOURCE_OPEN_FAILED` |
 | absent | absent | `missing` |
 | invalid (any reason) | (ignored) | **FAIL CLOSED** — `GenerationStoreError` |
 | manifest target missing | (ignored) | **FAIL CLOSED** — `MANIFEST_TARGET_MISSING` |
 | manifest target outside store | (ignored) | **FAIL CLOSED** — `MANIFEST_TARGET_OUTSIDE_STORE` |
+| manifest `dbFile` not canonical | (ignored) | **FAIL CLOSED** — `MANIFEST_DBFILE_NOT_CANONICAL` |
+| manifest target is not a regular file (directory / symlink / special) | (ignored) | **FAIL CLOSED** — `MANIFEST_TARGET_NOT_REGULAR` |
 | manifest project mismatch | (ignored) | **FAIL CLOSED** — `MANIFEST_PROJECT_MISMATCH` |
 | manifest is a symlink | (ignored) | **FAIL CLOSED** — `MANIFEST_SYMLINK_REJECTED` |
 | manifest target is a symlink | (ignored) | **FAIL CLOSED** — `GENERATION_TARGET_SYMLINK_REJECTED` |
+| any path component (manifest parent, `generations/`, target) is a symlink | (ignored) | **FAIL CLOSED** — `PATH_TRAVERSAL_REJECTED` |
+
+### 8.1 Legacy DB validation contract
+
+When the resolver falls back to the legacy DB (`<cbmCacheDir>/<project>.db`),
+it does NOT silently open whatever is on disk. The legacy path is
+validated with the same security invariants as the generation path:
+
+1. **Project key containment.** The project name is checked lexically
+   (no empty string, no absolute path, no `..`, no path separators, no
+   `.`). The legacy path is then constructed as
+   `<cacheRoot>/<project>.db` and containment-checked against
+   `<cacheRoot>` using `isLexicallyInside`.
+2. **No symlink chain.** Every path component from `<cacheRoot>` down
+   to the legacy DB file is walked with `lstat`; ANY symlink in the
+   chain raises `PATH_TRAVERSAL_REJECTED`.
+3. **Regular file.** `lstatSync(legacyPath)` must report a regular
+   file. A directory, symlink, FIFO, socket, or device node raises
+   `LEGACY_SOURCE_OPEN_FAILED`. There is no "open it read-only anyway"
+   fallback.
+
+For ordinary project names with the real cache root, this produces the
+same path as `defaultCodeDbPath` in `v2/src/bridge/sqlite-ro.ts`, so
+back-compat is preserved on the happy path. Anything that would have
+silently served unexpected content under the old behavior is now
+rejected explicitly.
 
 **The fail-closed rule is absolute.** An invalid manifest never silently
 falls back to the legacy DB. The reasoning:
@@ -376,18 +478,41 @@ falls back to the legacy DB. The reasoning:
   fallback turns a hard failure into a soft data-correctness bug, which
   is exactly what R169 is supposed to eliminate.
 
-Migration to generation-only operation happens in stages:
+Migration to generation-only operation happens across the validated
+R169A→R169E roadmap. Each round activates one piece with its own tests
+and audit. There is no "big bang" activation.
 
-- **R169A (this round):** resolver exists, but no production code calls
-  it. Legacy path is the only path used.
-- **R169B:** indexer starts writing generation DBs alongside the legacy
-  DB. Manifest is written. Resolver still not called by production
-  readers.
-- **R169C:** readers switch from `legacyCodeDbPath` to
-  `resolveActiveCodeDb`. Legacy DB is still written as a fallback.
-- **R169D–R169E:** legacy DB write is removed. Legacy DB is only read
-  for projects that have not yet been re-indexed under the new path.
-  Eventually the legacy path is removed entirely.
+- **R169A (this round) — Generation Store Contract + Resolver
+  Foundation.** Resolver, manifest V1 types, and atomic JSON writer
+  exist as an implemented candidate. No production code calls them.
+  Legacy path is the only path used. `DATA-CARRY-01` remains OPEN.
+- **R169B — Durable Staging Publisher + Validator + fsync + CAS + GC
+  primitives.** The indexer builds a staging DB in `tmp/`, validates
+  it, fsyncs it, atomically renames it into `generations/`, and writes
+  the manifest. GC primitives (keep active + 2 previous, `tmp/` sweep)
+  are landed but not yet active in production. Resolver still not
+  called by production readers.
+- **R169C — Indexer Integration + Outcome Contract.** The publication
+  pipeline is wired into the indexer end-to-end. The publication
+  outcome (`SUCCESS | SUCCESS_WITH_WARNINGS | STALE | PARTIAL |
+  FAILED`) is propagated through `IndexResult`. Legacy DB is still
+  written as a fallback; readers still open the legacy path directly.
+- **R169D — Reader Cutover + Legacy Migration + Project Lifecycle.**
+  Readers switch from `legacyCodeDbPath` to `resolveActiveCodeDb`. The
+  legacy DB write path is removed for projects that have at least one
+  published generation. Project lifecycle (create / re-index / archive)
+  is wired through the generation store.
+- **R169E — Crash Matrix + Performance + Activation + Version.** The
+  crash matrix C01–C20 is replayed against the integrated pipeline;
+  the performance contract (per-publication fsync cost, zero overhead
+  on readers) is verified; concurrency analysis (single-host safety,
+  multi-host boundary) is completed; the legacy read fallback is
+  removed for projects that have been re-indexed. **Only after R169E
+  passes all four (crash matrix + concurrency + performance +
+  activation) is `DATA-CARRY-01` (P1) marked closed.**
+
+R170 (out of scope for R169) adds multi-host lease / fencing on top of
+the R169A–R169E single-host foundation.
 
 ## 9. Failure taxonomy
 
@@ -402,17 +527,46 @@ type GenerationStoreErrorCode =
   | "MANIFEST_SCHEMA_ERROR"                  // JSON valid but schema wrong
   | "MANIFEST_TARGET_MISSING"                // dbFile does not exist
   | "MANIFEST_TARGET_OUTSIDE_STORE"          // dbFile escapes the project store
+  | "MANIFEST_TARGET_NOT_REGULAR"            // dbFile resolves to a directory / symlink / special file
+  | "MANIFEST_DBFILE_NOT_CANONICAL"          // dbFile is not `generations/generation-<generationId>.db`
   | "MANIFEST_PROJECT_MISMATCH"              // project field != requested project
   | "MANIFEST_UNSUPPORTED_VERSION"           // formatVersion != 1
   | "MANIFEST_SYMLINK_REJECTED"              // manifest path is a symlink
   | "GENERATION_TARGET_SYMLINK_REJECTED"     // dbFile is a symlink
-  | "LEGACY_SOURCE_OPEN_FAILED"              // legacy DB exists but cannot be opened
-  | "ATOMIC_WRITE_FAILED"                    // generic write failure
+  | "LEGACY_SOURCE_OPEN_FAILED"              // legacy DB exists but is a directory/symlink/special/outside store
+  | "ATOMIC_WRITE_FAILED"                    // generic write failure (open / write / close)
   | "ATOMIC_RENAME_FAILED"                   // rename failed (e.g. cross-device)
-  | "ATOMIC_FSYNC_FAILED"                    // fsync failed (storage issue)
-  | "PATH_TRAVERSAL_REJECTED"                // reserved: path escapes store
+  | "ATOMIC_FSYNC_FAILED"                    // fsync of the temp file failed
+  | "ATOMIC_DURABILITY_UNKNOWN"              // directory open or fsync failed post-rename; target MAY be new, caller must re-read
+  | "ATOMIC_SERIALIZATION_FAILED"            // JSON.stringify threw or returned non-string; no temp file created
+  | "ATOMIC_SHORT_WRITE"                     // writeSync returned <= 0; partial write never reached rename
+  | "PATH_TRAVERSAL_REJECTED"                // path escapes store OR any component in the walk is a symlink / EACCES / EIO / ENOTDIR / ELOOP
   | "PROJECT_KEY_INVALID";                   // project name was empty/non-string
 ```
+
+The five codes added in R169A (after the GPT 5.6 audit fix) are:
+
+- `MANIFEST_TARGET_NOT_REGULAR` — the resolved `dbFile` exists but is a
+  directory, symlink, or special file. The reader must never open a
+  non-regular file as a SQLite database.
+- `MANIFEST_DBFILE_NOT_CANONICAL` — `dbFile` is not exactly
+  `generations/generation-<generationId>.db`. This is strictly stronger
+  than the previous relative-path check; it rules out `.`, the manifest
+  filename, `tmp/` paths, mismatched UUIDs, absolute paths, and `\`
+  separators in one rule.
+- `ATOMIC_DURABILITY_UNKNOWN` — raised when the directory cannot be
+  opened or fsynced after `rename`. The rename has already happened, so
+  the target MAY be the new file, but we cannot guarantee durability
+  without the directory fsync. The caller (indexer) MUST re-read the
+  target and diagnose. This is NOT the same as silent success.
+- `ATOMIC_SERIALIZATION_FAILED` — raised when `JSON.stringify` throws
+  (BigInt, circular references) or returns a non-string. Raised BEFORE
+  the temp file is created, so no leftover temp file is possible from
+  this failure mode.
+- `ATOMIC_SHORT_WRITE` — raised when `writeSync` returns `<= 0` mid
+  payload. The write loop tracks the offset and continues from the new
+  offset on partial writes; this code is reserved for the "wrote zero
+  or negative bytes" case that cannot make progress.
 
 `GenerationStoreError` carries:
 
@@ -426,7 +580,8 @@ type GenerationStoreErrorCode =
 
 This taxonomy is exhaustive on the foundation path. New failure modes
 that emerge during R169B–R169E will be added as new codes, never folded
-into existing ones.
+into existing ones. The R169A foundation exports 20 codes (15 original
+plus the 5 added by the audit fix).
 
 ## 10. GC policy
 
@@ -574,10 +729,11 @@ contract R169A provides.
 To repeat the headline, because it is the most important fact in this
 document:
 
-> **R169A is merged but NOT active. No production code path uses the
-> generation store. The indexer still writes to the legacy DB. Readers
-> still open the legacy DB directly. `DATA-CARRY-01` (P1) remains
-> open.**
+> **R169A is an implemented candidate — INACTIVE, pending review. No
+> production code path uses the generation store. The indexer still
+> writes to the legacy DB. Readers still open the legacy DB directly.
+> `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix +
+> concurrency + performance + activation).**
 
 What R169A delivers:
 
@@ -590,15 +746,19 @@ What R169A delivers:
 
 What R169A does **not** deliver:
 
-- Indexer integration (R169B).
-- Reader integration (R169C).
-- GC (R169D).
-- Legacy migration completion and `DATA-CARRY-01` close (R169E).
-- Multi-host fencing (R170).
+- R169B — Durable Staging Publisher + Validator + fsync + CAS + GC primitives.
+- R169C — Indexer Integration + Outcome Contract.
+- R169D — Reader Cutover + Legacy Migration + Project Lifecycle.
+- R169E — Crash Matrix + Performance + Activation + Version (and the
+  formal close-out of `DATA-CARRY-01`).
+- R170 — Multi-host fencing / lease.
 
-The foundation is merged so that R169B–R169E can land incrementally,
-each round activating one piece with its own tests and audit. There is
-no "big bang" activation.
+The foundation is an implemented candidate (pending review) so that
+R169B–R169E can land incrementally, each round activating one piece
+with its own tests and audit. There is no "big bang" activation.
+`DATA-CARRY-01` (P1) remains OPEN until R169E has passed the crash
+matrix, concurrency analysis, performance verification, and activation
+gating.
 
 ## 16. References
 
@@ -607,7 +767,7 @@ no "big bang" activation.
 - `v2/tests/storage/r169a-generation-store.test.ts` — test matrix.
 - `docs/V2_ARCHITECTURE.md` — section 10 (publication, current state +
   R169 target) and section 15 (R169A generation store target).
-- `docs/V2_CURRENT_STATE.md` — R169A section (foundation in progress).
+- `docs/V2_CURRENT_STATE.md` — R169A section (foundation implemented as a candidate, inactive, pending review, publication NOT active).
 - `v2/CHANGELOG.md` — R169A entry (foundation, feature inactive).
 - `v2/src/indexer/schema.ts` — `CURRENT_GENERATION_MANIFEST_VERSION = 1`.
 - `v2/src/bridge/sqlite-ro.ts` — `defaultCodeDbPath` (the legacy path,

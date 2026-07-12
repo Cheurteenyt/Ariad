@@ -38,8 +38,9 @@ export interface GenerationManifestV1 {
 
   /**
    * Relative path to the DB file, from the project store directory.
-   * Must NOT contain `..`, absolute paths, or backslash separators.
-   * Example: `generations/generation-<uuid>.db`
+   * R169A-FIX (DATA-R169A-01): dbFile MUST be exactly
+   *   `generations/generation-<generationId>.db`
+   * No other form is accepted.
    */
   readonly dbFile: string;
 
@@ -169,6 +170,13 @@ export interface ResolvedMissingDb {
 /**
  * Structured error codes for the generation store.
  * Never group all errors under a single DB_ERROR.
+ *
+ * R169A-FIX (GPT 5.6 audit): Added five new codes:
+ *   - ATOMIC_DURABILITY_UNKNOWN     (DUR-R169A-01: rename succeeded but dir fsync failed)
+ *   - ATOMIC_SERIALIZATION_FAILED   (DUR-R169A-02: JSON.stringify returned non-string)
+ *   - ATOMIC_SHORT_WRITE            (DUR-R169A-02: writeSync returned <=0 mid-payload)
+ *   - MANIFEST_TARGET_NOT_REGULAR   (DATA-R169A-01: resolved dbPath is not a regular file)
+ *   - MANIFEST_DBFILE_NOT_CANONICAL (DATA-R169A-01: dbFile != generations/generation-<uuid>.db)
  */
 export type GenerationStoreErrorCode =
   | "GENERATION_STORE_CONFIG_ERROR"
@@ -180,10 +188,15 @@ export type GenerationStoreErrorCode =
   | "MANIFEST_UNSUPPORTED_VERSION"
   | "MANIFEST_SYMLINK_REJECTED"
   | "GENERATION_TARGET_SYMLINK_REJECTED"
+  | "MANIFEST_TARGET_NOT_REGULAR"
+  | "MANIFEST_DBFILE_NOT_CANONICAL"
   | "LEGACY_SOURCE_OPEN_FAILED"
   | "ATOMIC_WRITE_FAILED"
   | "ATOMIC_RENAME_FAILED"
   | "ATOMIC_FSYNC_FAILED"
+  | "ATOMIC_DURABILITY_UNKNOWN"
+  | "ATOMIC_SERIALIZATION_FAILED"
+  | "ATOMIC_SHORT_WRITE"
   | "PATH_TRAVERSAL_REJECTED"
   | "PROJECT_KEY_INVALID";
 
