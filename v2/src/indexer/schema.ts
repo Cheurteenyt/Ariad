@@ -117,6 +117,19 @@ export const CURRENT_EXTRACTOR_SEMANTICS_VERSION = 8;
 export const CURRENT_DISCOVERY_POLICY_VERSION = 2;
 
 /**
+ * R169: Generation manifest format version.
+ *
+ * This tracks the format of `active-generation.json`, NOT the AST output
+ * or discovery policy. It is separate from CURRENT_EXTRACTOR_SEMANTICS_VERSION
+ * and CURRENT_DISCOVERY_POLICY_VERSION.
+ *
+ * Bump when the manifest schema changes (new fields, removed fields,
+ * incompatible type changes). Readers must reject manifests with
+ * incompatible format versions.
+ */
+export const CURRENT_GENERATION_MANIFEST_VERSION = 1;
+
+/**
  * Tables created by the native indexer. Matches V1's schema so that
  * CodeGraphReader (sqlite-ro.ts) can read the DB transparently.
  */

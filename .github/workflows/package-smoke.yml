@@ -1,0 +1,108 @@
+# R168.3a — Package smoke test
+# Tests that npm pack produces a valid tarball with UI assets,
+# and that the installed package works from an arbitrary cwd.
+
+name: Package Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'v2/package.json'
+      - 'v2/package-lock.json'
+      - 'v2/scripts/build-package.mjs'
+      - 'v2/src/ui/server.ts'
+      - 'graph-ui/package.json'
+      - 'graph-ui/package-lock.json'
+  pull_request:
+    paths:
+      - 'v2/package.json'
+      - 'v2/package-lock.json'
+      - 'v2/scripts/build-package.mjs'
+      - 'v2/src/ui/server.ts'
+      - 'graph-ui/package.json'
+      - 'graph-ui/package-lock.json'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    name: npm pack + install + CLI + UI smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: v2/package-lock.json
+
+      - name: Build graph-ui (for prepack to find)
+        working-directory: graph-ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: npm pack (triggers prepack → build-package.mjs)
+        working-directory: v2
+        run: |
+          npm ci
+          npm pack --json > pack-result.json
+          cat pack-result.json
+          TARBALL=$(python3 -c "import json; print(json.load(open('pack-result.json'))[0]['filename'])")
+          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
+
+      - name: Inspect tarball contents
+        working-directory: v2
+        run: |
+          echo "=== Tarball contents ==="
+          tar -tf ${{ env.TARBALL }} | sort
+          echo ""
+          echo "=== Required files check ==="
+          CONTENTS=$(tar -tf ${{ env.TARBALL }})
+          for required in \
+            "package/package.json" \
+            "package/LICENSE" \
+            "package/README.md" \
+            "package/CHANGELOG.md" \
+            "package/dist/cli/index.js" \
+            "package/dist/ui/index.html"; do
+            if echo "$CONTENTS" | grep -q "^$required$"; then
+              echo "  ✓ $required"
+            else
+              echo "  ✗ MISSING: $required"
+              exit 1
+            fi
+          done
+          echo ""
+          echo "=== Forbidden files check ==="
+          for forbidden in \
+            "package/src/" \
+            "package/tests/" \
+            "package/node_modules/" \
+            "package/.git" \
+            "package/*.db"; do
+            if echo "$CONTENTS" | grep -q "^$forbidden"; then
+              echo "  ✗ FORBIDDEN: $forbidden found in tarball"
+              exit 1
+            fi
+          done
+          echo "  ✓ No forbidden files"
+
+      - name: Install tarball in temp directory
+        run: |
+          mkdir -p /tmp/cbm-install
+          npm install --prefix /tmp/cbm-install v2/${{ env.TARBALL }}
+
+      - name: CLI smoke test from arbitrary cwd
+        working-directory: /tmp
+        run: |
+          /tmp/cbm-install/node_modules/.bin/cbm-v2 --version
+          /tmp/cbm-install/node_modules/.bin/cbm-v2 --help

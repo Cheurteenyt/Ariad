@@ -1,7 +1,7 @@
 # Release Policy — Codebase Memory V2
 
 > **Status:** current
-> **Last verified:** 0.74.0 / R168.2
+> **Last verified:** 0.74.1 / R168.3a
 
 ## Overview
 
@@ -52,8 +52,8 @@ A GitHub Release is a public distribution event. It requires:
 
 The first public release (a **pre-release**) should happen only after:
 
-- R168.2: packaging implementation landed (lockfiles, UI assets, Docker)
-- R168.3: packaging evidence required (npm pack smoke, Docker smoke)
+- R168.3a: package + Docker smoke evidence
+- R169: atomic generation publication
 - R170: project lease/fencing
 
 Suggested first pre-release: `v0.8.0-alpha.1`.

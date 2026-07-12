@@ -42,8 +42,10 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Copy built files from builder (includes dist/ui from graph-ui)
 COPY --from=builder /app/dist ./dist
 
-# Create a volume for the cache directory (SQLite DBs)
-RUN useradd -m -u 1000 cbm
+# Create non-root user and cache directory
+RUN useradd -m -u 1000 cbm \
+ && mkdir -p /home/cbm/.cache/codebase-memory-mcp \
+ && chown -R cbm:cbm /home/cbm/.cache
 USER cbm
 VOLUME ["/home/cbm/.cache/codebase-memory-mcp"]
 
