@@ -56,9 +56,19 @@ Response:
    - Document the local validation result in the PR description
    - A maintainer may approve an exception merge with explicit
      "merged without CI, locally validated" annotation
-3. Consider activating a **GitHub self-hosted runner** as a temporary
-   redundancy measure (pre-configured, hardened). The same workflow
-   YAML and branch protections apply; only the runner pool changes.
+3. **Self-hosted runner (CONT-R168-01 security warning)**: for a public
+   repository, switching `runs-on: ubuntu-latest` to `self-hosted` in
+   workflows that execute on `pull_request` events is **dangerous**. A
+   forked PR can run arbitrary code on a persistent runner and
+   compromise the machine, credentials, and network. If a self-hosted
+   runner is absolutely necessary:
+   - Use an **ephemeral JIT runner** (VM destroyed after each job)
+   - Restrict to a **single job** with no long-lived secrets
+   - Use `workflow_dispatch` or push to a **trusted branch** only
+   - **Never** run on `pull_request` from forks
+   - Limit the runner group to this repository only
+   - The preferred alternative is an **external hosted CI provider** or
+     **documented local validation** until a dedicated audit is done.
 4. Do **not** reactivate GitLab shared runners as a CI fallback. The
    quota incident that motivated R166 was caused exactly by this
    configuration.
@@ -66,7 +76,7 @@ Response:
    or failed during the outage. Re-merge PRs that were held.
 6. Post-incident review: if the outage exceeded 12 hours, document the
    timeline and consider whether a permanent self-hosted runner is
-   warranted.
+   warranted (with the security constraints above).
 
 ## 4. Level 3 — GitHub entirely unavailable
 

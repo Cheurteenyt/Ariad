@@ -39,6 +39,13 @@ function readRepoFile(rel: string): string {
   return readFileSync(path, "utf-8");
 }
 
+// R168: the mirror logic was extracted to a shell script for testability.
+// Tests that check implementation details (fingerprint checks, error
+// classifier, step names) now read from the script, not the YAML.
+function readMirrorScript(): string {
+  return readRepoFile("scripts/ci/mirror-main-to-gitlab.sh");
+}
+
 describe("R166 — GitLab CI is passive", () => {
   const gitlabCi = readRepoFile(".gitlab-ci.yml");
 
@@ -82,7 +89,7 @@ describe("R166 — obsolete GitHub workflows are removed", () => {
 });
 
 describe("R166 — mirror-main-to-gitlab workflow contract", () => {
-  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml") + "\n" + readMirrorScript();
 
   it("mirror-main-to-gitlab.yml exists", () => {
     expect(mirror.length).toBeGreaterThan(0);
@@ -111,7 +118,7 @@ describe("R166 — mirror-main-to-gitlab workflow contract", () => {
   });
 
   it("configures StrictHostKeyChecking yes", () => {
-    expect(mirror).toContain("StrictHostKeyChecking yes");
+    expect(mirror).toMatch(/StrictHostKeyChecking[= ]yes/);
   });
 
   it("uses GITLAB_MIRROR_SSH_PRIVATE_KEY secret", () => {
@@ -145,7 +152,7 @@ describe("R166 — mirror-main-to-gitlab workflow contract", () => {
 
   it("verifies post-push SHA", () => {
     expect(mirror).toContain("OBSERVED_SHA");
-    expect(mirror).toContain("git ls-remote gitlab refs/heads/main");
+    expect(mirror).toMatch(/ls-remote gitlab refs\/heads\/main/);
   });
 
   it("removes SSH material at the end (cleanup if always)", () => {
@@ -282,12 +289,12 @@ describe("R167 — bridge doc operational completeness", () => {
 // =============================================================================
 
 describe("R167 — mirror workflow split into diagnostic steps", () => {
-  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml") + "\n" + readMirrorScript();
 
-  it("workflow has 9+ named steps (split from 1 monolithic in R166)", () => {
-    // Count the "- name:" entries in the steps section
-    const stepMatches = mirror.match(/^      - name: /gm) ?? [];
-    expect(stepMatches.length).toBeGreaterThanOrEqual(9);
+  it("workflow uses named diagnostic phases (DOC-R168-01: no hardcoded count)", () => {
+    // The workflow is a thin wrapper that calls scripts/ci/mirror-main-to-gitlab.sh
+    // The script contains the diagnostic phases. Don't hardcode a step count.
+    expect(mirror).toContain("scripts/ci/mirror-main-to-gitlab.sh");
   });
 
   it("workflow has a 'Validate event identity' step", () => {
@@ -310,20 +317,20 @@ describe("R167 — mirror workflow split into diagnostic steps", () => {
     expect(mirror).toContain("Verify GitLab.com host key fingerprint");
   });
 
-  it("workflow has a 'Read GitHub main and GitLab main' step", () => {
-    expect(mirror).toContain("Read GitHub main and GitLab main");
+  it("workflow has a 'Read GitHub main' step", () => {
+    expect(mirror).toContain("Read GitHub main");
   });
 
-  it("workflow has a 'Classify mirror state and fast-forward push' step", () => {
-    expect(mirror).toContain("Classify mirror state and fast-forward push");
+  it("workflow has a 'Classify mirror state' step", () => {
+    expect(mirror).toContain("Classify mirror state");
   });
 
   it("workflow has a 'Post-push verification' step", () => {
     expect(mirror).toContain("Post-push verification");
   });
 
-  it("workflow has a 'Write mirror summary' step (if: always)", () => {
-    expect(mirror).toContain("Write mirror summary");
+  it("workflow has a 'Write truthful mirror summary' step (if: always)", () => {
+    expect(mirror).toContain("Write truthful mirror summary");
   });
 
   it("workflow has a 'Remove SSH material' step (if: always)", () => {
@@ -332,7 +339,7 @@ describe("R167 — mirror workflow split into diagnostic steps", () => {
 });
 
 describe("R167 — fingerprint verification contract", () => {
-  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml") + "\n" + readMirrorScript();
 
   it("workflow reads GITLAB_MIRROR_KEY_FINGERPRINT variable", () => {
     expect(mirror).toContain("GITLAB_MIRROR_KEY_FINGERPRINT");
@@ -362,7 +369,7 @@ describe("R167 — fingerprint verification contract", () => {
 });
 
 describe("R167 — push error classifier", () => {
-  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml") + "\n" + readMirrorScript();
 
   it("workflow classifies HOST_KEY_MISMATCH errors", () => {
     expect(mirror).toContain("HOST_KEY_MISMATCH");
@@ -390,7 +397,7 @@ describe("R167 — push error classifier", () => {
 });
 
 describe("R167 — invariants preserved from R166", () => {
-  const mirror = readWorkflow("mirror-main-to-gitlab.yml");
+  const mirror = readWorkflow("mirror-main-to-gitlab.yml") + "\n" + readMirrorScript();
 
   it("workflow still uses -o ci.no_pipeline", () => {
     expect(mirror).toContain("-o ci.no_pipeline");
@@ -405,7 +412,7 @@ describe("R167 — invariants preserved from R166", () => {
   });
 
   it("workflow still uses StrictHostKeyChecking yes", () => {
-    expect(mirror).toContain("StrictHostKeyChecking yes");
+    expect(mirror).toMatch(/StrictHostKeyChecking[= ]yes/);
   });
 
   it("workflow still uses the gitlab-passive-mirror environment", () => {
@@ -484,8 +491,8 @@ describe("R166 — package version bumped", () => {
     version: string;
   };
 
-  it("v2/package.json version is at least 0.71.0 (R166 bump, R167 = 0.72.0)", () => {
-    // R166 bumped to 0.71.0. R167 bumped to 0.72.0. Future rounds may bump
+  it("v2/package.json version is at least 0.71.0 (R166 floor)", () => {
+    // R166 bumped to 0.71.0. Future rounds may bump further. Future rounds may bump
     // further; this test asserts we never regress below the R166 floor.
     const v = pkg.version;
     const [major, minor] = v.split(".").map(Number);

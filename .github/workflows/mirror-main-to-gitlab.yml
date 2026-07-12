@@ -1,10 +1,10 @@
 name: Mirror validated GitHub main to GitLab
 
 # R166: initial passive mirror workflow.
-# R167: monolithic mirror step split into 7 diagnostic steps + fingerprint
-#       verification for both the client deploy key and the GitLab.com host
-#       key. The fast-forward-only / no-force / no-rollback / divergence
-#       fail-closed invariants are preserved exactly.
+# R167: monolithic step split into 9 named steps + fingerprint checks.
+# R168: state machine extracted to scripts/ci/mirror-main-to-gitlab.sh for
+#       testability with bare repos. The YAML is now a thin wrapper:
+#       checkout → materialize → call script → truthful summary → cleanup.
 #
 # Required environment (GitHub Environment "gitlab-passive-mirror"):
 #   Secret:    GITLAB_MIRROR_SSH_PRIVATE_KEY  (OpenSSH ed25519, no passphrase)
@@ -12,12 +12,6 @@ name: Mirror validated GitHub main to GitLab
 #   Variable:  GITLAB_KNOWN_HOSTS             (pinned GitLab.com host keys, full file content)
 #   Variable:  GITLAB_MIRROR_KEY_FINGERPRINT  (SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M)
 #   Variable:  GITLAB_ED25519_HOST_FINGERPRINT (SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8)
-#
-# The two fingerprint variables are non-secret. They let the workflow
-# verify that the secret + known_hosts actually contain the expected
-# key material before attempting any Git operation. This avoids opaque
-# exit 128 errors and turns future key-rotation incidents into clear
-# fingerprint-mismatch failures.
 
 on:
   workflow_run:
@@ -63,36 +57,31 @@ jobs:
           fi
 
           if [ -z "$GITLAB_URL" ]; then
-            echo "::error::GITLAB_REPOSITORY_SSH_URL is empty. Configure the gitlab-passive-mirror environment."
+            echo "::error::GITLAB_REPOSITORY_SSH_URL is empty."
             exit 1
           fi
 
           case "$GITLAB_URL" in
             git@gitlab.com:*) ;;
             *)
-              echo "::error::Expected a git@gitlab.com:... SSH URL. Got: $GITLAB_URL"
+              echo "::error::Expected a git@gitlab.com:... SSH URL."
               exit 1
               ;;
           esac
 
           if [ -z "$EXPECTED_KEY_FP" ]; then
-            echo "::error::GITLAB_MIRROR_KEY_FINGERPRINT variable is empty. R167 requires this for client key verification."
+            echo "::error::GITLAB_MIRROR_KEY_FINGERPRINT is empty."
             exit 1
           fi
 
           if [ -z "$EXPECTED_HOST_FP" ]; then
-            echo "::error::GITLAB_ED25519_HOST_FINGERPRINT variable is empty. R167 requires this for host key verification."
+            echo "::error::GITLAB_ED25519_HOST_FINGERPRINT is empty."
             exit 1
           fi
 
-          echo "Target SHA:      $TARGET_SHA"
-          echo "GitLab URL:      $GITLAB_URL"
-          echo "Expected key FP: $EXPECTED_KEY_FP"
-          echo "Expected host FP: $EXPECTED_HOST_FP"
-
       # ── Step 2: Checkout exact CI-validated SHA ──────────────────────
       - name: Checkout exact CI-validated SHA
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
@@ -100,6 +89,7 @@ jobs:
 
       # ── Step 3: Materialize SSH key + known_hosts ────────────────────
       - name: Materialize SSH key and known_hosts
+        id: materialize
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.GITLAB_MIRROR_SSH_PRIVATE_KEY }}
@@ -111,391 +101,108 @@ jobs:
             echo "::error::GITLAB_MIRROR_SSH_PRIVATE_KEY secret is empty."
             exit 1
           fi
-
           if [ -z "$KNOWN_HOSTS" ]; then
             echo "::error::GITLAB_KNOWN_HOSTS variable is empty."
             exit 1
           fi
 
           install -d -m 700 "$HOME/.ssh"
-
-          printf '%s\n' "$SSH_PRIVATE_KEY" \
-            > "$HOME/.ssh/gitlab_mirror_ed25519"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/gitlab_mirror_ed25519"
           chmod 600 "$HOME/.ssh/gitlab_mirror_ed25519"
-
-          printf '%s\n' "$KNOWN_HOSTS" \
-            > "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 644 "$HOME/.ssh/known_hosts"
 
-          cat > "$HOME/.ssh/config" <<'EOF'
-          Host gitlab.com
-            HostName gitlab.com
-            User git
-            IdentityFile ~/.ssh/gitlab_mirror_ed25519
-            IdentitiesOnly yes
-            StrictHostKeyChecking yes
-            UserKnownHostsFile ~/.ssh/known_hosts
-          EOF
-          chmod 600 "$HOME/.ssh/config"
+          echo "ssh_key_file=$HOME/.ssh/gitlab_mirror_ed25519" >> "$GITHUB_OUTPUT"
+          echo "known_hosts_file=$HOME/.ssh/known_hosts" >> "$GITHUB_OUTPUT"
 
-      # ── Step 4: Verify client key fingerprint (SEC-R167-01) ─────────
-      # Derives the public key from the materialized private key and
-      # compares its SHA256 fingerprint against the expected value.
-      # Catches: wrong secret, public key pasted as private, PKCS8
-      # format, truncated key, environment scope error.
-      - name: Verify client key fingerprint
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ssh-keygen -y \
-            -f "$HOME/.ssh/gitlab_mirror_ed25519" \
-            > "$RUNNER_TEMP/gitlab_mirror.pub"
-
-          ACTUAL_FP="$(
-            ssh-keygen \
-              -lf "$RUNNER_TEMP/gitlab_mirror.pub" \
-              -E sha256 |
-            awk '{print $2}'
-          )"
-
-          echo "Expected client key fingerprint: $EXPECTED_KEY_FP"
-          echo "Actual   client key fingerprint: $ACTUAL_FP"
-
-          if [ "$ACTUAL_FP" != "$EXPECTED_KEY_FP" ]; then
-            echo "::error::Client deploy key fingerprint mismatch."
-            echo "The GITLAB_MIRROR_SSH_PRIVATE_KEY secret does not match the expected public key."
-            echo "Possible causes: wrong secret, public key pasted as private, PKCS8 format, truncated key, environment scope error."
-            exit 1
-          fi
-
-          echo "✓ Client key fingerprint matches."
-
-      # ── Step 5: Verify GitLab.com host key fingerprint (SEC-R167-02) ─
-      # Extracts the ed25519 host key from the materialized known_hosts
-      # and compares its SHA256 fingerprint against the expected value.
-      # Catches: stale known_hosts, MITM, dynamic key injection, wrong
-      # host key captured by mistake.
-      #
-      # Never trust ssh-keyscan or an unverified handshake. The pinned
-      # fingerprint is the only source of truth.
-      - name: Verify GitLab.com host key fingerprint
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Extract the ed25519 entry from known_hosts (host field may
-          # be a comma-separated list or a hash; we look for the line
-          # containing "ssh-ed25519").
-          ED25519_LINE="$(
-            grep -E 'ssh-ed25519' "$HOME/.ssh/known_hosts" |
-            head -n 1 ||
-            true
-          )"
-
-          if [ -z "$ED25519_LINE" ]; then
-            echo "::error::No ssh-ed25519 entry found in GITLAB_KNOWN_HOSTS."
-            exit 1
-          fi
-
-          # The line format is: <hosts> ssh-ed25519 <base64-key>
-          # Extract the base64 key (third field).
-          ED25519_KEY_B64="$(printf '%s\n' "$ED25519_LINE" | awk '{print $3}')"
-
-          if [ -z "$ED25519_KEY_B64" ]; then
-            echo "::error::Could not extract ed25519 key bytes from known_hosts line: $ED25519_LINE"
-            exit 1
-          fi
-
-          # Compute the SHA256 fingerprint of the key blob.
-          # The SSH wire format is: <4-byte length><key-type><4-byte length><key-data>
-          # The base64 in known_hosts is exactly that blob, base64-encoded.
-          ACTUAL_HOST_FP="$(
-            printf '%s' "$ED25519_KEY_B64" |
-            base64 -d |
-            openssl dgst -sha256 -binary |
-            base64 |
-            tr -d '=' |
-            tr '+/' '-_' |
-            { read fp; echo "SHA256:$fp"; }
-          )"
-
-          echo "Expected host key fingerprint: $EXPECTED_HOST_FP"
-          echo "Actual   host key fingerprint: $ACTUAL_HOST_FP"
-
-          if [ "$ACTUAL_HOST_FP" != "$EXPECTED_HOST_FP" ]; then
-            echo "::error::GitLab.com host key fingerprint mismatch."
-            echo "The ed25519 host key in GITLAB_KNOWN_HOSTS does not match the pinned fingerprint."
-            echo "Possible causes: stale known_hosts, GitLab rotated host keys (verify against official GitLab announcement), MITM, wrong host key captured."
-            echo "Do NOT disable StrictHostKeyChecking. Update the pinned fingerprint only after verifying the official GitLab announcement."
-            exit 1
-          fi
-
-          echo "✓ Host key fingerprint matches."
-
-      # ── Step 6: Read GitHub main + GitLab main ───────────────────────
-      # Reads both SHAs and verifies GitLab main is an ancestor of
-      # GitHub main (no divergence). If GitLab has commits not in
-      # GitHub main, fail closed — never force-push.
-      - name: Read GitHub main and GitLab main
-        id: read_remotes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Verify the checkout is at the exact target SHA
-          LOCAL_SHA="$(git rev-parse HEAD)"
-          if [ "$LOCAL_SHA" != "$TARGET_SHA" ]; then
-            echo "::error::Checkout mismatch."
-            echo "Expected: $TARGET_SHA"
-            echo "Observed: $LOCAL_SHA"
-            exit 1
-          fi
-
-          # Verify Git object integrity for the target SHA
-          git cat-file -e "${TARGET_SHA}^{commit}"
-          git cat-file -e "${TARGET_SHA}^{tree}"
-
-          # Fetch GitHub main to get the current canonical SHA
-          git fetch --no-tags origin \
-            main:refs/remotes/origin/main
-
-          CURRENT_GITHUB_MAIN="$(
-            git rev-parse refs/remotes/origin/main
-          )"
-
-          # Verify the target SHA is still in GitHub main history
-          # (no rollback if main has moved past it)
-          if ! git merge-base --is-ancestor \
-            "$TARGET_SHA" \
-            "$CURRENT_GITHUB_MAIN"; then
-            echo "::error::Validated SHA is no longer in GitHub main history."
-            echo "Validated:    $TARGET_SHA"
-            echo "GitHub main: $CURRENT_GITHUB_MAIN"
-            exit 1
-          fi
-
-          # Add the GitLab remote
-          git remote add gitlab "$GITLAB_URL"
-
-          # Read GitLab main (may be empty on first mirror)
-          REMOTE_SHA="$(
-            git ls-remote gitlab refs/heads/main |
-            awk '{print $1}'
-          )"
-
-          if [ -n "$REMOTE_SHA" ]; then
-            git fetch --no-tags gitlab \
-              main:refs/remotes/gitlab/main
-
-            # DIVERGENCE CHECK: GitLab main must be an ancestor of
-            # GitHub main. If GitLab has commits not in GitHub main,
-            # this is a divergence incident — fail closed, never
-            # force-push.
-            if ! git merge-base --is-ancestor \
-              "$REMOTE_SHA" \
-              "$CURRENT_GITHUB_MAIN"; then
-              echo "::error::DIVERGENCE: GitLab main contains history absent from GitHub main."
-              echo "GitLab main: $REMOTE_SHA"
-              echo "GitHub main: $CURRENT_GITHUB_MAIN"
-              echo "Do NOT force-push. Audit the GitLab-only commits before doing anything else."
-              exit 1
-            fi
-          fi
-
-          echo "github_main=$CURRENT_GITHUB_MAIN" >> "$GITHUB_OUTPUT"
-          echo "gitlab_main=${REMOTE_SHA:-}" >> "$GITHUB_OUTPUT"
-
-          echo "GitHub main: $CURRENT_GITHUB_MAIN"
-          echo "GitLab main: ${REMOTE_SHA:-<empty>}"
-
-      # ── Step 7: Classify mirror state and fast-forward push ──────────
-      # Determines the mirror state and either:
-      #   - already-mirrored (GitLab already at TARGET_SHA) → no-op
-      #   - newer-valid-mirror-present (GitLab already ahead) → no-op
-      #   - fast-forward eligible → push with -o ci.no_pipeline
-      #   - non-linear → fail closed
-      #
-      # IMPORTANT: git push --dry-run does NOT exercise the pre-receive
-      # hook, so it cannot detect protected-branch rejections. The real
-      # push may still fail with PROTECTED_BRANCH_REJECTED. The error
-      # classifier below surfaces this case clearly.
-      - name: Classify mirror state and fast-forward push
+      # ── Step 4: Run mirror state machine ─────────────────────────────
+      # The script handles: fingerprint verification, Git operations,
+      # error classification, post-push verification, and truthful outcome.
+      # It writes structured outputs to $RUNNER_TEMP/mirror-outputs.txt
+      - name: Run mirror state machine
         id: mirror
         shell: bash
         env:
-          GITHUB_MAIN: ${{ steps.read_remotes.outputs.github_main }}
-          REMOTE_SHA: ${{ steps.read_remotes.outputs.gitlab_main }}
+          SSH_KEY_FILE: ${{ steps.materialize.outputs.ssh_key_file }}
+          KNOWN_HOSTS_FILE: ${{ steps.materialize.outputs.known_hosts_file }}
+          GITHUB_REMOTE: origin
+          OUTPUT_FILE: ${{ runner.temp }}/mirror-outputs.txt
         run: |
           set -euo pipefail
+          bash scripts/ci/mirror-main-to-gitlab.sh || SCRIPT_EXIT=$?
+          SCRIPT_EXIT=${SCRIPT_EXIT:-0}
 
-          # Case 1: GitLab already at the target SHA → no-op
-          if [ "$REMOTE_SHA" = "$TARGET_SHA" ]; then
-            echo "GitLab already contains the validated SHA."
-            echo "result=already-mirrored" >> "$GITHUB_OUTPUT"
-            echo "remote_sha=$REMOTE_SHA" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Read outputs into step outputs
+          if [ -f "$OUTPUT_FILE" ]; then
+            while IFS='=' read -r key value; do
+              echo "$key=$value" >> "$GITHUB_OUTPUT"
+            done < "$OUTPUT_FILE"
           fi
 
-          # Case 2: GitLab already ahead of the target SHA → no-op
-          # (a newer validated workflow run already advanced GitLab)
-          if [ -n "$REMOTE_SHA" ] && \
-             git merge-base --is-ancestor \
-               "$TARGET_SHA" \
-               "$REMOTE_SHA"; then
-            echo "A newer validated workflow run already advanced GitLab."
-            echo "result=newer-valid-mirror-present" >> "$GITHUB_OUTPUT"
-            echo "remote_sha=$REMOTE_SHA" >> "$GITHUB_OUTPUT"
-            exit 0
+          # If the script failed, fail this step
+          if [ "$SCRIPT_EXIT" != "0" ]; then
+            exit "$SCRIPT_EXIT"
           fi
 
-          # Case 3: fast-forward eligible (GitLab empty, or GitLab is
-          # an ancestor of TARGET_SHA) → push
-          if [ -z "$REMOTE_SHA" ] || \
-             git merge-base --is-ancestor \
-               "$REMOTE_SHA" \
-               "$TARGET_SHA"; then
-
-            # Dry-run first (does NOT exercise pre-receive hook —
-            # see SEC-R167-02 / docs/GITHUB_GITLAB_BRANCH_BRIDGE.md
-            # section 16).
-            if ! git push \
-              --dry-run \
-              -o ci.no_pipeline \
-              gitlab \
-              "$TARGET_SHA:refs/heads/main" 2>&1; then
-              echo "::error::Dry-run push failed. See output above for classification."
-              exit 1
-            fi
-
-            # Real fast-forward push
-            PUSH_OUTPUT="$(
-              git push \
-                -o ci.no_pipeline \
-                gitlab \
-                "$TARGET_SHA:refs/heads/main" 2>&1
-            )" || {
-              # Classify the push error
-              echo "::error::Real push failed. Classifying..."
-              echo "$PUSH_OUTPUT"
-              echo ""
-              case "$PUSH_OUTPUT" in
-                *"Host key verification failed"*)
-                  echo "Category: HOST_KEY_MISMATCH" ;;
-                *"Permission denied (publickey)"*)
-                  echo "Category: SSH_PUBLICKEY_REJECTED" ;;
-                *"not allowed to push code to protected branches"*)
-                  echo "Category: PROTECTED_BRANCH_REJECTED" ;;
-                *"not allowed to push"*|*"protected branch"*)
-                  echo "Category: PROTECTED_BRANCH_REJECTED" ;;
-                *"non-fast-forward"*)
-                  echo "Category: NON_FAST_FORWARD" ;;
-                *"Could not read from remote"*)
-                  echo "Category: REMOTE_UNREACHABLE" ;;
-                *)
-                  echo "Category: UNKNOWN_GIT_ERROR" ;;
-              esac
-              echo ""
-              echo "See docs/GITHUB_GITLAB_BRANCH_BRIDGE.md section 15 for the full diagnostic matrix."
-              exit 1
-            }
-
-            echo "$PUSH_OUTPUT"
-            echo "result=mirrored" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Case 4: non-linear state (should not happen after the
-          # divergence check in step 6, but defend in depth)
-          echo "::error::Non-linear mirror state; refusing to modify GitLab."
-          echo "GitLab main: $REMOTE_SHA"
-          echo "Target SHA:  $TARGET_SHA"
-          exit 1
-
-      # ── Step 8: Post-push verification ───────────────────────────────
-      # Reads GitLab main again and verifies it is at TARGET_SHA or at
-      # a validated descendant of TARGET_SHA (race condition: another
-      # mirror run won the race).
-      - name: Post-push verification
-        id: verify
-        shell: bash
-        env:
-          GITHUB_MAIN: ${{ steps.read_remotes.outputs.github_main }}
-          MIRROR_RESULT: ${{ steps.mirror.outputs.result }}
-        run: |
-          set -euo pipefail
-
-          # If the mirror step was a no-op (already-mirrored or
-          # newer-valid-mirror-present), skip the post-push check.
-          if [ "$MIRROR_RESULT" = "already-mirrored" ] || \
-             [ "$MIRROR_RESULT" = "newer-valid-mirror-present" ]; then
-            echo "Mirror was a no-op ($MIRROR_RESULT). Skipping post-push verification."
-            exit 0
-          fi
-
-          OBSERVED_SHA="$(
-            git ls-remote gitlab refs/heads/main |
-            awk '{print $1}'
-          )"
-
-          echo "Expected (TARGET_SHA): $TARGET_SHA"
-          echo "Observed GitLab main:  $OBSERVED_SHA"
-
-          if [ "$OBSERVED_SHA" = "$TARGET_SHA" ]; then
-            echo "✓ GitLab main matches TARGET_SHA."
-            echo "observed_sha=$OBSERVED_SHA" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Race condition: another mirror run may have advanced GitLab
-          # past TARGET_SHA. Verify the observed SHA is a descendant of
-          # TARGET_SHA and still in GitHub main history.
-          git fetch --no-tags gitlab \
-            main:refs/remotes/gitlab/main
-
-          if git merge-base --is-ancestor \
-               "$TARGET_SHA" \
-               refs/remotes/gitlab/main && \
-             git merge-base --is-ancestor \
-               refs/remotes/gitlab/main \
-               "$GITHUB_MAIN"; then
-            echo "A newer validated mirror won the race after our push."
-            echo "result=newer-valid-mirror-present" >> "$GITHUB_OUTPUT"
-            echo "observed_sha=$OBSERVED_SHA" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "::error::Post-push verification failed."
-          echo "Expected target or validated descendant: $TARGET_SHA"
-          echo "Observed GitLab main:                 $OBSERVED_SHA"
-          exit 1
-
-      # ── Step 9: Write mirror summary ─────────────────────────────────
-      - name: Write mirror summary
+      # ── Step 5: Write truthful summary (OBS-R168-01, OBS-R168-02) ────
+      # The summary is based on the script's actual outputs, not on
+      # assumptions. It reports verified=true only if the fingerprint
+      # steps actually succeeded.
+      - name: Write truthful mirror summary
         if: always()
         shell: bash
         env:
-          MIRROR_RESULT: ${{ steps.mirror.outputs.result }}
-          REMOTE_SHA: ${{ steps.mirror.outputs.remote_sha }}
-          OBSERVED_SHA: ${{ steps.verify.outputs.observed_sha }}
+          FINAL_RESULT: ${{ steps.mirror.outputs.final_result }}
+          OBSERVED_SHA: ${{ steps.mirror.outputs.observed_sha }}
+          GITHUB_MAIN_SHA: ${{ steps.mirror.outputs.github_main_sha }}
+          ERROR_CATEGORY: ${{ steps.mirror.outputs.error_category }}
+          ERROR_PHASE: ${{ steps.mirror.outputs.error_phase }}
+          CLIENT_FP_VERIFIED: ${{ steps.mirror.outputs.client_fp_verified }}
+          CLIENT_FP_ACTUAL: ${{ steps.mirror.outputs.client_fp_actual }}
+          HOST_FP_VERIFIED: ${{ steps.mirror.outputs.host_fp_verified }}
+          HOST_FP_ACTUAL: ${{ steps.mirror.outputs.host_fp_actual }}
+          PUSH_ATTEMPTED: ${{ steps.mirror.outputs.push_attempted }}
+          PUSH_COMPLETED: ${{ steps.mirror.outputs.push_completed }}
+          POST_VERIFY_RESULT: ${{ steps.mirror.outputs.post_verify_result }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           {
             echo "## GitLab passive mirror"
             echo
-            echo "- Validated GitHub SHA: \`$TARGET_SHA\`"
-            echo "- Result: \`${MIRROR_RESULT:-failed}\`"
-            echo "- Observed GitLab SHA: \`${OBSERVED_SHA:-${REMOTE_SHA:-unknown}}\`"
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Final result: \`${FINAL_RESULT:-failed}\`"
+            echo "- Job status: \`$JOB_STATUS\`"
+            echo "- Observed GitLab SHA: \`${OBSERVED_SHA:-unknown}\`"
+            echo "- Re-read GitHub SHA: \`${GITHUB_MAIN_SHA:-unknown}\`"
+            echo
+            echo "### Fingerprint verification"
+            echo
+            echo "- Client key verified: \`${CLIENT_FP_VERIFIED:-not-run}\`"
+            echo "  - Expected: \`$EXPECTED_KEY_FP\`"
+            echo "  - Actual:   \`${CLIENT_FP_ACTUAL:-N/A}\`"
+            echo "- Host key verified: \`${HOST_FP_VERIFIED:-not-run}\`"
+            echo "  - Expected: \`$EXPECTED_HOST_FP\`"
+            echo "  - Actual:   \`${HOST_FP_ACTUAL:-N/A}\`"
+            echo
+            echo "### Push details"
+            echo
+            echo "- Push attempted: \`${PUSH_ATTEMPTED:-false}\`"
+            echo "- Push completed: \`${PUSH_COMPLETED:-false}\`"
+            echo "- Post-verification: \`${POST_VERIFY_RESULT:-not-run}\`"
+            echo
+            echo "### Error diagnostics"
+            echo
+            echo "- Error category: \`${ERROR_CATEGORY:-none}\`"
+            echo "- Error phase: \`${ERROR_PHASE:-none}\`"
+            echo
+            echo "### Architecture"
+            echo
+            echo "- Mirror workflow uses named diagnostic phases (see scripts/ci/mirror-main-to-gitlab.sh)"
             echo "- GitLab pipeline requested: \`no\`"
             echo "- Force push used: \`no\`"
-            echo
-            echo "### R167 hardening"
-            echo
-            echo "- Client key fingerprint verified: \`$EXPECTED_KEY_FP\`"
-            echo "- Host key fingerprint verified: \`$EXPECTED_HOST_FP\`"
-            echo "- Workflow step count: 9 (split from 1 monolithic step in R166)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Step 10: Remove SSH material ─────────────────────────────────
+      # ── Step 6: Remove SSH material ─────────────────────────────────
       - name: Remove SSH material
         if: always()
         shell: bash
@@ -504,4 +211,4 @@ jobs:
             "$HOME/.ssh/gitlab_mirror_ed25519" \
             "$HOME/.ssh/config" \
             "$HOME/.ssh/known_hosts" \
-            "$RUNNER_TEMP/gitlab_mirror.pub"
+            "${RUNNER_TEMP:-/tmp}/mirror-outputs.txt"

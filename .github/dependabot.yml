@@ -1,0 +1,23 @@
+# Dependabot configuration for GitHub Actions supply chain security (R168).
+# Opens PRs to update action SHAs when new versions are released.
+# The SHAs are pinned in the workflow files for immutability; Dependabot
+# will propose updates as new versions are released.
+
+version: 2
+
+updates:
+  # GitHub Actions ecosystem
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "Cheurteenyt"
