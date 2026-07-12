@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state.** Updated R165 (2026-07-12).
+> **Authoritative snapshot of the current product state.** Updated R168.1 (2026-07-12).
 > For the historical roadmap, see [V2_ROADMAP.md](V2_ROADMAP.md) (archive, 0.15.9 era).
 > For the authoritative version and bug count, see `v2/package.json` and `v2/CHANGELOG.md`.
 
@@ -1141,4 +1141,4 @@ See [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) for the full workflow.
 
 ## Validation date
 
-This document was validated at R166 (2026-07-12). Always cross-check with `v2/CHANGELOG.md` for the latest state.
+This document was validated at R168.1 (2026-07-12). Always cross-check with `v2/CHANGELOG.md` for the latest state.

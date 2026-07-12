@@ -3,6 +3,11 @@
 # scripts/ci/mirror-main-to-gitlab.sh
 #
 # R168 — Mirror state machine extracted from the workflow YAML for testability.
+# R168.1 — Operational Closure:
+#   - MIRROR-R168.1-01: GitHub reads fail-closed (no || true), fresh POST_GITHUB_MAIN required
+#   - OBS-R168.1-01: outputs emitted exactly once via trap (in-memory state, no last-write-wins)
+#   - DIAG-R168.1-01: GitHub reads + local object errors classified
+#   - TEST-R168.1-01: test-only hooks for real race condition tests
 #
 # Called by .github/workflows/mirror-main-to-gitlab.yml (production).
 # Tested by v2/tests/ci/r168-mirror-runtime.test.ts (bare repo tests).
@@ -28,17 +33,19 @@
 # Optional (for tests):
 #   SKIP_SSH_CONFIG     — "yes" to skip SSH config (bare repo tests)
 #   SKIP_FP_CHECKS      — "yes" to skip fingerprint verification (bare repo tests)
-#   GIT_SSH_COMMAND     — override SSH command (for fake SSH wrappers in tests)
+#   CBM_MIRROR_TEST_MODE — "1" to enable test-only hooks (race injection)
+#                          Only active when GITLAB_URL starts with file:// and
+#                          GITHUB_ACTIONS is not "true"
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# Outputs (written to $OUTPUT_FILE or stdout if not set)
+# Outputs (written to $OUTPUT_FILE — each key exactly once, OBS-R168.1-01)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 #   final_result          — mirrored | already-mirrored | newer-valid-mirror-present | failed
 #   observed_sha          — GitLab main SHA after operation
-#   github_main_sha       — GitHub main SHA (re-read at end)
-#   error_category        — HOST_KEY_MISMATCH | SSH_PUBLICKEY_REJECTED | ...
-#   error_phase           — ls-remote | fetch | dry-run | push | post-read | fingerprint | host-key | none
+#   github_main_sha       — GitHub main SHA (re-read at end, must be non-empty)
+#   error_category        — HOST_KEY_MISMATCH | SSH_PUBLICKEY_REJECTED | ... | none
+#   error_phase           — ls-remote | fetch | dry-run | push | post-read | fingerprint | host-key | github-read | github-post-read | none
 #   client_fp_verified    — true | false | not-run
 #   client_fp_actual      — actual fingerprint (or empty)
 #   host_fp_verified      — true | false | not-run
@@ -57,43 +64,57 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# In-memory state (OBS-R168.1-01: no more last-write-wins on OUTPUT_FILE)
 # ─────────────────────────────────────────────────────────────────────────────
+
+STATE_FINAL_RESULT="failed"
+STATE_OBSERVED_SHA=""
+STATE_GITHUB_MAIN_SHA=""
+STATE_ERROR_CATEGORY="none"
+STATE_ERROR_PHASE="none"
+STATE_CLIENT_FP_VERIFIED="not-run"
+STATE_CLIENT_FP_ACTUAL=""
+STATE_HOST_FP_VERIFIED="not-run"
+STATE_HOST_FP_ACTUAL=""
+STATE_PUSH_ATTEMPTED="false"
+STATE_PUSH_COMPLETED="false"
+STATE_POST_VERIFY_RESULT="not-run"
 
 OUTPUT_FILE="${OUTPUT_FILE:-}"
 
-write_output() {
-  local key="$1"
-  local value="$2"
-  if [ -n "$OUTPUT_FILE" ]; then
-    # Append to file in key=value format
-    printf '%s=%s\n' "$key" "$value" >> "$OUTPUT_FILE"
-  else
-    printf '%s=%s\n' "$key" "$value"
-  fi
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Trap: emit outputs exactly once on exit (OBS-R168.1-01)
+# ─────────────────────────────────────────────────────────────────────────────
 
-init_outputs() {
+emit_final_outputs() {
+  local exit_code=$?
   if [ -n "$OUTPUT_FILE" ]; then
     : > "$OUTPUT_FILE"
+    printf '%s=%s\n' "final_result"        "$STATE_FINAL_RESULT"        >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "observed_sha"        "$STATE_OBSERVED_SHA"        >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "github_main_sha"     "$STATE_GITHUB_MAIN_SHA"     >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "error_category"      "$STATE_ERROR_CATEGORY"      >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "error_phase"         "$STATE_ERROR_PHASE"         >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "client_fp_verified"  "$STATE_CLIENT_FP_VERIFIED"  >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "client_fp_actual"    "$STATE_CLIENT_FP_ACTUAL"    >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "host_fp_verified"    "$STATE_HOST_FP_VERIFIED"    >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "host_fp_actual"      "$STATE_HOST_FP_ACTUAL"      >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "push_attempted"      "$STATE_PUSH_ATTEMPTED"      >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "push_completed"      "$STATE_PUSH_COMPLETED"      >> "$OUTPUT_FILE"
+    printf '%s=%s\n' "post_verify_result"  "$STATE_POST_VERIFY_RESULT"  >> "$OUTPUT_FILE"
   fi
-  write_output "final_result" "failed"
-  write_output "observed_sha" ""
-  write_output "github_main_sha" ""
-  write_output "error_category" "none"
-  write_output "error_phase" "none"
-  write_output "client_fp_verified" "not-run"
-  write_output "client_fp_actual" ""
-  write_output "host_fp_verified" "not-run"
-  write_output "host_fp_actual" ""
-  write_output "push_attempted" "false"
-  write_output "push_completed" "false"
-  write_output "post_verify_result" "not-run"
+  exit "$exit_code"
 }
+
+trap emit_final_outputs EXIT
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Classify a Git error based on its output text.
 # Arguments: $1 = phase, $2 = combined stdout+stderr of the failed command
-# Sets error_category and error_phase, then exits 1.
+# Sets STATE_ERROR_CATEGORY and STATE_ERROR_PHASE, then exits 1.
 classify_and_fail() {
   local phase="$1"
   local output="$2"
@@ -124,9 +145,9 @@ classify_and_fail() {
       category="UNKNOWN_GIT_ERROR" ;;
   esac
 
-  write_output "error_category" "$category"
-  write_output "error_phase" "$phase"
-  write_output "final_result" "failed"
+  STATE_ERROR_CATEGORY="$category"
+  STATE_ERROR_PHASE="$phase"
+  STATE_FINAL_RESULT="failed"
   echo "::error::[$category] during $phase" >&2
   echo "$output" >&2
   exit 1
@@ -134,8 +155,6 @@ classify_and_fail() {
 
 # Run a Git command against the GitLab remote, classifying any error.
 # Arguments: $1 = phase, $2... = git args
-# On success, stdout is the command's stdout.
-# On failure, calls classify_and_fail.
 run_gitlab_git() {
   local phase="$1"
   shift
@@ -146,30 +165,110 @@ run_gitlab_git() {
   printf '%s' "$output"
 }
 
+# Run a Git command against the GitHub remote, classifying any error.
+# MIRROR-R168.1-01: NO || true fallback — fail closed if GitHub is unreachable.
+# Arguments: $1 = phase, $2... = git args
+run_github_git() {
+  local phase="$1"
+  shift
+  local output
+  if ! output="$(git "$@" 2>&1)"; then
+    # Classify GitHub-specific errors
+    local category="GITHUB_REMOTE_UNREACHABLE"
+    case "$output" in
+      *"Could not resolve hostname"*|*"Name or service not known"*)
+        category="GITHUB_DNS_FAILURE" ;;
+      *"Permission denied"*|*"Authentication failed"*)
+        category="GITHUB_AUTH_FAILURE" ;;
+      *"Connection timed out"*|*"timed out"*)
+        category="GITHUB_REMOTE_UNREACHABLE" ;;
+      *"Could not read from remote"*|*"Connection refused"*|*"Connection reset"*)
+        category="GITHUB_REMOTE_UNREACHABLE" ;;
+      *"Remote branch"*"not found"*|*"refs/heads/main"*"not found"*)
+        category="GITHUB_REF_MISSING" ;;
+    esac
+    STATE_ERROR_CATEGORY="$category"
+    STATE_ERROR_PHASE="$phase"
+    STATE_FINAL_RESULT="failed"
+    echo "::error::[$category] during $phase" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  printf '%s' "$output"
+}
+
+# Run a local Git command, classifying object/ref errors.
+# Arguments: $1 = phase, $2... = git args
+run_local_git() {
+  local phase="$1"
+  shift
+  local output
+  if ! output="$(git "$@" 2>&1)"; then
+    local category="LOCAL_GIT_ERROR"
+    case "$output" in
+      *"Not a valid object name"*|*"bad object"*)
+        category="LOCAL_OBJECT_MISSING" ;;
+      *"unknown revision"*|*"not a valid ref"*)
+        category="LOCAL_REF_MISSING" ;;
+      *"fatal: not a git repository"*)
+        category="LOCAL_NOT_A_REPO" ;;
+    esac
+    STATE_ERROR_CATEGORY="$category"
+    STATE_ERROR_PHASE="$phase"
+    STATE_FINAL_RESULT="failed"
+    echo "::error::[$category] during $phase" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  printf '%s' "$output"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test-only hooks (TEST-R168.1-01)
+# These allow race condition tests to mutate state at specific points.
+# They are ONLY active when:
+#   CBM_MIRROR_TEST_MODE=1
+#   GITHUB_ACTIONS != "true"
+#   GITLAB_URL starts with file://
+# ─────────────────────────────────────────────────────────────────────────────
+
+test_hook() {
+  local hook_name="$1"
+  if [ "${CBM_MIRROR_TEST_MODE:-}" = "1" ] \
+     && [ "${GITHUB_ACTIONS:-}" != "true" ] \
+     && [[ "${GITLAB_URL:-}" == file://* ]]; then
+    # Call the hook if it exists as an env var (command string)
+    local hook_cmd
+    eval "hook_cmd=\${${hook_name}:-}"
+    if [ -n "$hook_cmd" ]; then
+      echo "[test-hook] $hook_name: $hook_cmd" >&2
+      eval "$hook_cmd" || true
+    fi
+  fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration validation
 # ─────────────────────────────────────────────────────────────────────────────
 
-init_outputs
-
 if [ -z "${TARGET_SHA:-}" ]; then
   echo "::error::TARGET_SHA is not set" >&2
-  write_output "error_category" "CONFIG_ERROR"
-  write_output "error_phase" "validation"
+  STATE_ERROR_CATEGORY="CONFIG_ERROR"
+  STATE_ERROR_PHASE="validation"
   exit 2
 fi
 
 if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::TARGET_SHA is not a valid 40-char hex SHA: $TARGET_SHA" >&2
-  write_output "error_category" "CONFIG_ERROR"
-  write_output "error_phase" "validation"
+  STATE_ERROR_CATEGORY="CONFIG_ERROR"
+  STATE_ERROR_PHASE="validation"
   exit 2
 fi
 
 if [ -z "${GITLAB_URL:-}" ]; then
   echo "::error::GITLAB_URL is not set" >&2
-  write_output "error_category" "CONFIG_ERROR"
-  write_output "error_phase" "validation"
+  STATE_ERROR_CATEGORY="CONFIG_ERROR"
+  STATE_ERROR_PHASE="validation"
   exit 2
 fi
 
@@ -193,18 +292,17 @@ echo "Skip FP checks:   $SKIP_FP_CHECKS"
 if [ "$SKIP_SSH_CONFIG" != "yes" ]; then
   if [ -z "${SSH_KEY_FILE:-}" ]; then
     echo "::error::SSH_KEY_FILE is not set" >&2
-    write_output "error_category" "CONFIG_ERROR"
-    write_output "error_phase" "ssh-config"
+    STATE_ERROR_CATEGORY="CONFIG_ERROR"
+    STATE_ERROR_PHASE="ssh-config"
     exit 2
   fi
   if [ -z "${KNOWN_HOSTS_FILE:-}" ]; then
     echo "::error::KNOWN_HOSTS_FILE is not set" >&2
-    write_output "error_category" "CONFIG_ERROR"
-    write_output "error_phase" "ssh-config"
+    STATE_ERROR_CATEGORY="CONFIG_ERROR"
+    STATE_ERROR_PHASE="ssh-config"
     exit 2
   fi
 
-  # Configure SSH with timeouts and batch mode (OPS-R168-01)
   export GIT_SSH_COMMAND="/usr/bin/ssh \
     -i $SSH_KEY_FILE \
     -o IdentitiesOnly=yes \
@@ -217,11 +315,10 @@ if [ "$SKIP_SSH_CONFIG" != "yes" ]; then
     -o ServerAliveCountMax=2"
   export GIT_SSH_VARIANT=ssh
 
-  # Verify the private key has no passphrase (OPS-R168-01)
   if ! ssh-keygen -y -P '' -f "$SSH_KEY_FILE" >/dev/null 2>&1; then
-    echo "::error::SSH private key is passphrase-protected or invalid. Deploy keys for CI must be unencrypted." >&2
-    write_output "error_category" "SSH_KEY_PASSPHRASE"
-    write_output "error_phase" "ssh-config"
+    echo "::error::SSH private key is passphrase-protected or invalid." >&2
+    STATE_ERROR_CATEGORY="SSH_KEY_PASSPHRASE"
+    STATE_ERROR_PHASE="ssh-config"
     exit 2
   fi
 fi
@@ -231,185 +328,151 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 
 if [ "$SKIP_FP_CHECKS" != "yes" ]; then
-  # ── Client key fingerprint (SEC-R168-02: use ssh-keygen, not manual base64) ──
   echo ""
   echo "=== Verify client key fingerprint ==="
 
-  CLIENT_FP_ACTUAL="$(ssh-keygen -y -f "$SSH_KEY_FILE" | ssh-keygen -lf - -E sha256 | awk '{print $2}')"
-  write_output "client_fp_actual" "$CLIENT_FP_ACTUAL"
+  STATE_CLIENT_FP_ACTUAL="$(ssh-keygen -y -f "$SSH_KEY_FILE" | ssh-keygen -lf - -E sha256 | awk '{print $2}')"
 
   echo "Expected: $EXPECTED_KEY_FP"
-  echo "Actual:   $CLIENT_FP_ACTUAL"
+  echo "Actual:   $STATE_CLIENT_FP_ACTUAL"
 
-  if [ "$CLIENT_FP_ACTUAL" != "$EXPECTED_KEY_FP" ]; then
+  if [ "$STATE_CLIENT_FP_ACTUAL" != "$EXPECTED_KEY_FP" ]; then
     echo "::error::Client deploy key fingerprint mismatch." >&2
-    write_output "client_fp_verified" "false"
-    write_output "error_category" "CLIENT_KEY_FP_MISMATCH"
-    write_output "error_phase" "fingerprint"
-    write_output "final_result" "failed"
+    STATE_CLIENT_FP_VERIFIED="false"
+    STATE_ERROR_CATEGORY="CLIENT_KEY_FP_MISMATCH"
+    STATE_ERROR_PHASE="fingerprint"
     exit 3
   fi
 
-  write_output "client_fp_verified" "true"
+  STATE_CLIENT_FP_VERIFIED="true"
   echo "✓ Client key fingerprint matches."
 
-  # ── Host key fingerprint (SEC-R168-01: bound to gitlab.com) ──
   echo ""
   echo "=== Verify GitLab.com host key fingerprint ==="
 
-  # Use ssh-keygen -F to extract the key for gitlab.com specifically.
-  # This ensures we verify the key for the correct host, not just any
-  # ed25519 entry in the file.
   HOST_KEY_OUTPUT="$(ssh-keygen -F gitlab.com -f "$KNOWN_HOSTS_FILE" 2>&1 || true)"
 
   if [ -z "$HOST_KEY_OUTPUT" ]; then
     echo "::error::No gitlab.com entry found in known_hosts." >&2
-    write_output "host_fp_verified" "false"
-    write_output "error_category" "HOST_KEY_NOT_FOUND"
-    write_output "error_phase" "host-key"
-    write_output "final_result" "failed"
+    STATE_HOST_FP_VERIFIED="false"
+    STATE_ERROR_CATEGORY="HOST_KEY_NOT_FOUND"
+    STATE_ERROR_PHASE="host-key"
     exit 3
   fi
 
-  # Count ed25519 entries for gitlab.com — there must be exactly one
   ED25519_COUNT="$(echo "$HOST_KEY_OUTPUT" | grep -c 'ssh-ed25519' || true)"
   if [ "$ED25519_COUNT" -eq 0 ]; then
-    echo "::error::No ssh-ed25519 entry for gitlab.com in known_hosts." >&2
-    write_output "host_fp_verified" "false"
-    write_output "error_category" "HOST_KEY_NO_ED25519"
-    write_output "error_phase" "host-key"
-    write_output "final_result" "failed"
+    echo "::error::No ssh-ed25519 entry for gitlab.com." >&2
+    STATE_HOST_FP_VERIFIED="false"
+    STATE_ERROR_CATEGORY="HOST_KEY_NO_ED25519"
+    STATE_ERROR_PHASE="host-key"
     exit 3
   fi
   if [ "$ED25519_COUNT" -gt 1 ]; then
-    echo "::error::Multiple ssh-ed25519 entries for gitlab.com in known_hosts. Expected exactly one." >&2
-    write_output "host_fp_verified" "false"
-    write_output "error_category" "HOST_KEY_DUPLICATE"
-    write_output "error_phase" "host-key"
-    write_output "final_result" "failed"
+    echo "::error::Multiple ssh-ed25519 entries for gitlab.com." >&2
+    STATE_HOST_FP_VERIFIED="false"
+    STATE_ERROR_CATEGORY="HOST_KEY_DUPLICATE"
+    STATE_ERROR_PHASE="host-key"
     exit 3
   fi
 
-  # Extract the ed25519 key and compute its fingerprint using ssh-keygen
-  # (SEC-R168-02: don't use URL-safe base64 — use ssh-keygen -lf)
   ED25519_KEY_B64="$(echo "$HOST_KEY_OUTPUT" | grep 'ssh-ed25519' | awk '{print $3}' | head -1)"
-
-  # Write to a temp file in the ssh-keygen -lf format
   TMP_HOST_PUB="$(mktemp)"
   printf 'gitlab.com ssh-ed25519 %s\n' "$ED25519_KEY_B64" > "$TMP_HOST_PUB"
-
-  HOST_FP_ACTUAL="$(ssh-keygen -lf "$TMP_HOST_PUB" -E sha256 | awk '{print $2}')"
+  STATE_HOST_FP_ACTUAL="$(ssh-keygen -lf "$TMP_HOST_PUB" -E sha256 | awk '{print $2}')"
   rm -f "$TMP_HOST_PUB"
 
-  write_output "host_fp_actual" "$HOST_FP_ACTUAL"
-
   echo "Expected: $EXPECTED_HOST_FP"
-  echo "Actual:   $HOST_FP_ACTUAL"
+  echo "Actual:   $STATE_HOST_FP_ACTUAL"
 
-  if [ "$HOST_FP_ACTUAL" != "$EXPECTED_HOST_FP" ]; then
+  if [ "$STATE_HOST_FP_ACTUAL" != "$EXPECTED_HOST_FP" ]; then
     echo "::error::GitLab.com host key fingerprint mismatch." >&2
-    write_output "host_fp_verified" "false"
-    write_output "error_category" "HOST_KEY_FP_MISMATCH"
-    write_output "error_phase" "host-key"
-    write_output "final_result" "failed"
+    STATE_HOST_FP_VERIFIED="false"
+    STATE_ERROR_CATEGORY="HOST_KEY_FP_MISMATCH"
+    STATE_ERROR_PHASE="host-key"
     exit 3
   fi
 
-  write_output "host_fp_verified" "true"
+  STATE_HOST_FP_VERIFIED="true"
   echo "✓ Host key fingerprint matches."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Verify local checkout is at TARGET_SHA
+# Verify local checkout is at TARGET_SHA (DIAG-R168.1-01: classify local errors)
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Verify checkout ==="
 
-LOCAL_SHA="$(git rev-parse HEAD)"
+LOCAL_SHA="$(run_local_git "checkout" rev-parse HEAD)"
 if [ "$LOCAL_SHA" != "$TARGET_SHA" ]; then
   echo "::error::Checkout mismatch. Expected: $TARGET_SHA, Got: $LOCAL_SHA" >&2
-  write_output "error_category" "CHECKOUT_MISMATCH"
-  write_output "error_phase" "checkout"
-  write_output "final_result" "failed"
+  STATE_ERROR_CATEGORY="CHECKOUT_MISMATCH"
+  STATE_ERROR_PHASE="checkout"
   exit 1
 fi
 
-git cat-file -e "${TARGET_SHA}^{commit}"
-git cat-file -e "${TARGET_SHA}^{tree}"
+run_local_git "checkout" cat-file -e "${TARGET_SHA}^{commit}"
+run_local_git "checkout" cat-file -e "${TARGET_SHA}^{tree}"
 echo "✓ Checkout at TARGET_SHA, objects verified."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Read GitHub main (re-read at end for truthfulness — MIRROR-R168-01)
+# Read GitHub main (MIRROR-R168.1-01: fail-closed, no || true)
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "=== Read GitHub main ==="
+echo "=== Read GitHub main (fail-closed) ==="
 
-git fetch --no-tags "$GITHUB_REMOTE" main:refs/remotes/github/main 2>/dev/null || \
-  git fetch --no-tags origin main:refs/remotes/github/main 2>/dev/null || true
+run_github_git "github-read" fetch --no-tags "$GITHUB_REMOTE" main:refs/remotes/github/main
 
-CURRENT_GITHUB_MAIN="$(git rev-parse refs/remotes/github/main 2>/dev/null || echo "")"
-if [ -z "$CURRENT_GITHUB_MAIN" ]; then
-  # Try origin/main fallback
-  CURRENT_GITHUB_MAIN="$(git rev-parse refs/remotes/origin/main 2>/dev/null || echo "")"
-fi
-
-if [ -z "$CURRENT_GITHUB_MAIN" ]; then
-  echo "::error::Could not determine GitHub main SHA." >&2
-  write_output "error_category" "GITHUB_MAIN_UNREADABLE"
-  write_output "error_phase" "github-read"
-  write_output "final_result" "failed"
-  exit 1
-fi
-
+CURRENT_GITHUB_MAIN="$(run_local_git "github-read" rev-parse refs/remotes/github/main)"
 echo "GitHub main: $CURRENT_GITHUB_MAIN"
 
-# Verify TARGET_SHA is still in GitHub main history (no rollback)
-if ! git merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_GITHUB_MAIN" 2>/dev/null; then
-  echo "::error::Validated SHA is no longer in GitHub main history." >&2
-  write_output "error_category" "TARGET_SHA_NOT_ANCESTOR"
-  write_output "error_phase" "github-read"
-  write_output "final_result" "failed"
+if ! run_local_git "github-read" merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_GITHUB_MAIN" 2>/dev/null; then
+  echo "::error::TARGET_SHA is not an ancestor of GitHub main." >&2
+  STATE_ERROR_CATEGORY="TARGET_SHA_NOT_ANCESTOR"
+  STATE_ERROR_PHASE="github-read"
   exit 1
 fi
 echo "✓ TARGET_SHA is ancestor of GitHub main."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Add GitLab remote + read GitLab main (DIAG-R168-01: classify all ops)
+# Add GitLab remote + read GitLab main
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Read GitLab main ==="
 
-# Remove existing gitlab remote if present (idempotent)
 git remote remove gitlab 2>/dev/null || true
 git remote add gitlab "$GITLAB_URL"
 
-# Read GitLab main — classify errors (DIAG-R168-01)
 REMOTE_SHA_OUTPUT="$(run_gitlab_git "ls-remote" ls-remote gitlab refs/heads/main)"
 REMOTE_SHA="$(echo "$REMOTE_SHA_OUTPUT" | awk '{print $1}')"
 REMOTE_SHA="${REMOTE_SHA:-}"
 
 echo "GitLab main: ${REMOTE_SHA:-<empty>}"
 
-# If GitLab has content, fetch it and check divergence
 if [ -n "$REMOTE_SHA" ]; then
   run_gitlab_git "fetch" fetch --no-tags gitlab main:refs/remotes/gitlab/main
 
-  # DIVERGENCE CHECK: GitLab main must be ancestor of GitHub main
+  # DIVERGENCE CHECK: GitLab main must be ancestor of GitHub main.
+  # merge-base --is-ancestor returns exit 1 when NOT an ancestor — this is
+  # a normal result, not an error. Only treat it as divergence when it
+  # explicitly returns non-ancestor (exit 1).
   if ! git merge-base --is-ancestor "$REMOTE_SHA" "$CURRENT_GITHUB_MAIN" 2>/dev/null; then
-    echo "::error::DIVERGENCE: GitLab main contains history absent from GitHub main." >&2
+    echo "::error::DIVERGENCE: GitLab main has history absent from GitHub main." >&2
     echo "GitLab main: $REMOTE_SHA" >&2
     echo "GitHub main: $CURRENT_GITHUB_MAIN" >&2
-    write_output "error_category" "DIVERGENCE"
-    write_output "error_phase" "divergence-check"
-    write_output "final_result" "failed"
-    write_output "observed_sha" "$REMOTE_SHA"
+    STATE_ERROR_CATEGORY="DIVERGENCE"
+    STATE_ERROR_PHASE="divergence-check"
+    STATE_OBSERVED_SHA="$REMOTE_SHA"
     exit 1
   fi
   echo "✓ No divergence."
 fi
+
+# Test hook: race after initial read (TEST-R168.1-01)
+test_hook "MIRROR_TEST_AFTER_INITIAL_READ"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Classify mirror state and execute
@@ -418,104 +481,110 @@ fi
 echo ""
 echo "=== Classify mirror state ==="
 
-# Case 1: GitLab already at TARGET_SHA
+PROVISIONAL_RESULT=""
+
 if [ "$REMOTE_SHA" = "$TARGET_SHA" ]; then
   echo "GitLab already at TARGET_SHA."
-  # MIRROR-R168-01: DO NOT skip re-verification. Fall through to post-verify.
-  write_output "push_attempted" "false"
-  # Set provisional result — will be confirmed by post-verify
+  STATE_PUSH_ATTEMPTED="false"
   PROVISIONAL_RESULT="already-mirrored"
 elif [ -n "$REMOTE_SHA" ] && git merge-base --is-ancestor "$TARGET_SHA" "$REMOTE_SHA" 2>/dev/null; then
-  # Case 2: GitLab already ahead (newer valid mirror)
-  echo "GitLab already ahead of TARGET_SHA (newer valid mirror)."
-  write_output "push_attempted" "false"
+  echo "GitLab already ahead (newer valid mirror)."
+  STATE_PUSH_ATTEMPTED="false"
   PROVISIONAL_RESULT="newer-valid-mirror-present"
 elif [ -z "$REMOTE_SHA" ] || git merge-base --is-ancestor "$REMOTE_SHA" "$TARGET_SHA" 2>/dev/null; then
-  # Case 3: Fast-forward eligible (empty GitLab, or GitLab is ancestor)
-  echo "Fast-forward eligible. Attempting push."
+  echo "Fast-forward eligible."
 
-  # Dry-run (does NOT exercise pre-receive hook — documented limitation)
   run_gitlab_git "dry-run" push --dry-run -o ci.no_pipeline gitlab "$TARGET_SHA:refs/heads/main"
   echo "✓ Dry-run accepted."
 
-  # Real push (DIAG-R168-01: classified)
-  write_output "push_attempted" "true"
+  STATE_PUSH_ATTEMPTED="true"
   run_gitlab_git "push" push -o ci.no_pipeline gitlab "$TARGET_SHA:refs/heads/main"
-  write_output "push_completed" "true"
+  STATE_PUSH_COMPLETED="true"
   echo "✓ Push completed."
   PROVISIONAL_RESULT="mirrored"
+
+  # Test hook: race after push (TEST-R168.1-01)
+  test_hook "MIRROR_TEST_AFTER_PUSH"
 else
-  # Case 4: non-linear (should be caught by divergence check, but defend in depth)
   echo "::error::Non-linear mirror state." >&2
-  write_output "error_category" "NON_LINEAR"
-  write_output "error_phase" "classify"
-  write_output "final_result" "failed"
+  STATE_ERROR_CATEGORY="NON_LINEAR"
+  STATE_ERROR_PHASE="classify"
   exit 1
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Post-push verification — ALWAYS runs, even for no-op paths (MIRROR-R168-01)
+# Post-push verification — ALWAYS runs (MIRROR-R168-01)
+# MIRROR-R168.1-01: re-read BOTH GitLab AND GitHub, require non-empty + ancestry
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "=== Post-push verification (always runs) ==="
+echo "=== Post-push verification (always runs, both remotes re-read) ==="
 
-# Re-read GitLab main (always, even for no-op)
+# Test hook: race before final read (TEST-R168.1-01)
+test_hook "MIRROR_TEST_BEFORE_FINAL_READ"
+
+# Re-read GitLab main
 POST_REMOTE_OUTPUT="$(run_gitlab_git "post-read" ls-remote gitlab refs/heads/main)"
-OBSERVED_SHA="$(echo "$POST_REMOTE_OUTPUT" | awk '{print $1}')"
-OBSERVED_SHA="${OBSERVED_SHA:-}"
+STATE_OBSERVED_SHA="$(echo "$POST_REMOTE_OUTPUT" | awk '{print $1}')"
+echo "Observed GitLab main: $STATE_OBSERVED_SHA"
 
-write_output "observed_sha" "$OBSERVED_SHA"
-echo "Observed GitLab main: $OBSERVED_SHA"
+# Re-read GitHub main — MUST be non-empty (MIRROR-R168.1-01)
+POST_GITHUB_OUTPUT="$(run_github_git "github-post-read" ls-remote "$GITHUB_REMOTE" refs/heads/main)"
+STATE_GITHUB_MAIN_SHA="$(echo "$POST_GITHUB_OUTPUT" | awk '{print $1}')"
 
-# Re-read GitHub main (MIRROR-R168-01: don't use stale SHA)
-POST_GITHUB_OUTPUT="$(git ls-remote "$GITHUB_REMOTE" refs/heads/main 2>/dev/null || git ls-remote origin refs/heads/main 2>/dev/null || echo "")"
-POST_GITHUB_MAIN="$(echo "$POST_GITHUB_OUTPUT" | awk '{print $1}')"
-write_output "github_main_sha" "$POST_GITHUB_MAIN"
-echo "Re-read GitHub main: $POST_GITHUB_MAIN"
+if [ -z "$STATE_GITHUB_MAIN_SHA" ]; then
+  echo "::error::Post-verification: GitHub main SHA is empty. Cannot verify ancestry." >&2
+  STATE_POST_VERIFY_RESULT="failure"
+  STATE_ERROR_CATEGORY="GITHUB_MAIN_EMPTY_POST_READ"
+  STATE_ERROR_PHASE="github-post-read"
+  exit 1
+fi
+echo "Re-read GitHub main: $STATE_GITHUB_MAIN_SHA"
 
-# Determine final result (OBS-R168-01: truthful outcome based on ALL evidence)
-if [ -z "$OBSERVED_SHA" ]; then
-  echo "::error::Post-verification: GitLab main is empty after operation." >&2
-  write_output "post_verify_result" "failure"
-  write_output "final_result" "failed"
-  write_output "error_category" "POST_VERIFY_EMPTY"
-  write_output "error_phase" "post-read"
+# Verify GitLab observed SHA
+if [ -z "$STATE_OBSERVED_SHA" ]; then
+  echo "::error::Post-verification: GitLab main is empty." >&2
+  STATE_POST_VERIFY_RESULT="failure"
+  STATE_ERROR_CATEGORY="POST_VERIFY_EMPTY"
+  STATE_ERROR_PHASE="post-read"
   exit 1
 fi
 
 # Case A: GitLab is exactly at TARGET_SHA
-if [ "$OBSERVED_SHA" = "$TARGET_SHA" ]; then
-  echo "✓ GitLab main matches TARGET_SHA."
-  write_output "post_verify_result" "success"
-  write_output "final_result" "$PROVISIONAL_RESULT"
+if [ "$STATE_OBSERVED_SHA" = "$TARGET_SHA" ]; then
+  # MIRROR-R168.1-01: even in this case, verify TARGET_SHA is ancestor of fresh GitHub main
+  if ! run_local_git "post-read" merge-base --is-ancestor "$TARGET_SHA" "$STATE_GITHUB_MAIN_SHA" 2>/dev/null; then
+    echo "::error::TARGET_SHA is no longer an ancestor of fresh GitHub main." >&2
+    STATE_POST_VERIFY_RESULT="failure"
+    STATE_ERROR_CATEGORY="TARGET_SHA_NOT_IN_FRESH_GITHUB"
+    STATE_ERROR_PHASE="post-read"
+    exit 1
+  fi
+  echo "✓ GitLab main matches TARGET_SHA, and TARGET_SHA is in fresh GitHub main."
+  STATE_POST_VERIFY_RESULT="success"
+  STATE_FINAL_RESULT="$PROVISIONAL_RESULT"
   exit 0
 fi
 
 # Case B: GitLab is a descendant of TARGET_SHA (race: newer mirror won)
-if git merge-base --is-ancestor "$TARGET_SHA" "$OBSERVED_SHA" 2>/dev/null; then
-  # Verify the observed SHA is still in GitHub main history
-  if [ -n "$POST_GITHUB_MAIN" ] && git merge-base --is-ancestor "$OBSERVED_SHA" "$POST_GITHUB_MAIN" 2>/dev/null; then
-    echo "✓ A newer validated mirror won the race. GitLab is ahead of TARGET_SHA but still in GitHub main history."
-    write_output "post_verify_result" "success"
-    write_output "final_result" "newer-valid-mirror-present"
+if run_local_git "post-read" merge-base --is-ancestor "$TARGET_SHA" "$STATE_OBSERVED_SHA" 2>/dev/null; then
+  if run_local_git "post-read" merge-base --is-ancestor "$STATE_OBSERVED_SHA" "$STATE_GITHUB_MAIN_SHA" 2>/dev/null; then
+    echo "✓ Newer validated mirror won the race."
+    STATE_POST_VERIFY_RESULT="success"
+    STATE_FINAL_RESULT="newer-valid-mirror-present"
     exit 0
   else
-    echo "::error::GitLab is ahead of TARGET_SHA but the observed SHA is NOT in GitHub main history." >&2
-    write_output "post_verify_result" "failure"
-    write_output "final_result" "failed"
-    write_output "error_category" "POST_VERIFY_DESCENDANT_NOT_IN_GITHUB"
-    write_output "error_phase" "post-read"
+    echo "::error::GitLab is ahead of TARGET_SHA but not in fresh GitHub main." >&2
+    STATE_POST_VERIFY_RESULT="failure"
+    STATE_ERROR_CATEGORY="POST_VERIFY_DESCENDANT_NOT_IN_GITHUB"
+    STATE_ERROR_PHASE="post-read"
     exit 1
   fi
 fi
 
-# Case C: GitLab is NOT at TARGET_SHA and NOT a descendant — failure
+# Case C: failure
 echo "::error::Post-push verification failed." >&2
-echo "Expected TARGET_SHA or validated descendant: $TARGET_SHA" >&2
-echo "Observed GitLab main:                       $OBSERVED_SHA" >&2
-write_output "post_verify_result" "failure"
-write_output "final_result" "failed"
-write_output "error_category" "POST_VERIFY_MISMATCH"
-write_output "error_phase" "post-read"
+STATE_POST_VERIFY_RESULT="failure"
+STATE_ERROR_CATEGORY="POST_VERIFY_MISMATCH"
+STATE_ERROR_PHASE="post-read"
 exit 1
