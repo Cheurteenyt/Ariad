@@ -113,12 +113,36 @@ interface ScriptResult {
   timedOut: boolean;
 }
 
-// SIG-R3-CI-01: Build a LOCAL environment for fixture tests.
-// Delete GITHUB_ACTIONS so the script's test-mode refusal doesn't trigger
-// when tests run inside GitHub Actions.
-function localFixtureEnv(port: number, targetSha: string = TARGET_SHA): NodeJS.ProcessEnv {
+// SIG-R6-TEST-ENV-01: Clean ALL signature-related env vars from process.env.
+// GitHub Actions sets GITHUB_REPOSITORY, GITHUB_API_URL, and GITHUB_ACTIONS
+// automatically. If we only delete GITHUB_ACTIONS, the "missing config" tests
+// inherit the real repository/API URL from CI, making them false positives.
+// This function strips ALL signature-related vars so tests start from a
+// known-clean baseline, then applies test-specific overrides.
+const SIGNATURE_ENV_VARS = [
+  "TARGET_SHA",
+  "GITHUB_API_URL",
+  "GITHUB_REPOSITORY",
+  "GITHUB_TOKEN",
+  "OUTPUT_FILE",
+  "SIGNATURE_RETRY_DELAY_SCALE",
+  "CBM_SIGNATURE_TEST_MODE",
+  "GITHUB_ACTIONS",
+];
+
+function cleanVerifierEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  delete env.GITHUB_ACTIONS;
+  for (const key of SIGNATURE_ENV_VARS) {
+    delete env[key];
+  }
+  return env;
+}
+
+// SIG-R3-CI-01: Build a LOCAL environment for fixture tests.
+// Uses cleanVerifierEnv() to strip all signature vars, then applies
+// test-specific defaults for the fixture server.
+function localFixtureEnv(port: number, targetSha: string = TARGET_SHA): NodeJS.ProcessEnv {
+  const env = cleanVerifierEnv();
   return {
     ...env,
     TARGET_SHA: targetSha,
@@ -188,13 +212,14 @@ function runScriptAsync(port: number, targetSha: string = TARGET_SHA): Promise<S
   });
 }
 
-// Sync runner for config error tests (no server needed)
+// Sync runner for config error tests (no server needed).
+// SIG-R6-TEST-ENV-01: Uses cleanVerifierEnv() to strip ALL signature vars
+// before applying envOverrides. This ensures "missing X" tests actually
+// test missing X, not inherited-from-CI X.
 function runScriptSync(envOverrides: Record<string, string>): ScriptResult {
   const tmpDir = mkdtempSync(join(tmpdir(), "r169-cfg-"));
   const outputFile = join(tmpDir, "outputs.json");
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  // SIG-R3-CI-01: delete GITHUB_ACTIONS by default for local tests
-  delete env.GITHUB_ACTIONS;
+  const env: NodeJS.ProcessEnv = cleanVerifierEnv();
   Object.assign(env, {
     OUTPUT_FILE: outputFile,
     SIGNATURE_RETRY_DELAY_SCALE: "0",
@@ -789,7 +814,7 @@ describe("R169 SIG runtime — JSON/schema error cases", () => {
 });
 
 describe("R169 SIG runtime — config error cases", () => {
-  it("missing TARGET_SHA → exit 2, CONFIG_ERROR", () => {
+  it("missing TARGET_SHA → exit 2, CONFIG_ERROR, attempts=0 (SIG-R6-TEST-ENV-01)", () => {
     const r = runScriptSync({
       GITHUB_API_URL: "http://127.0.0.1:1",
       GITHUB_REPOSITORY: "test/repo",
@@ -797,9 +822,11 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    // SIG-R6-TEST-ENV-01: Config errors must exit before any HTTP request
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("invalid TARGET_SHA (not 40 hex) → exit 2, CONFIG_ERROR (SIG-R3-TESTCOVER-01)", () => {
+  it("invalid TARGET_SHA (not 40 hex) → exit 2, CONFIG_ERROR, attempts=0 (SIG-R3-TESTCOVER-01)", () => {
     const r = runScriptSync({
       TARGET_SHA: "abc123",
       GITHUB_API_URL: "http://127.0.0.1:1",
@@ -808,9 +835,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("missing GITHUB_TOKEN → exit 2, CONFIG_ERROR", () => {
+  it("missing GITHUB_TOKEN → exit 2, CONFIG_ERROR, attempts=0 (SIG-R6-TEST-ENV-01)", () => {
     const r = runScriptSync({
       TARGET_SHA,
       GITHUB_API_URL: "http://127.0.0.1:1",
@@ -818,9 +846,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("missing GITHUB_API_URL → exit 2, CONFIG_ERROR (SIG-R3-TESTCOVER-01)", () => {
+  it("missing GITHUB_API_URL → exit 2, CONFIG_ERROR, attempts=0 (SIG-R6-TEST-ENV-01)", () => {
     const r = runScriptSync({
       TARGET_SHA,
       GITHUB_REPOSITORY: "test/repo",
@@ -828,9 +857,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("missing GITHUB_REPOSITORY → exit 2, CONFIG_ERROR (SIG-R3-TESTCOVER-01)", () => {
+  it("missing GITHUB_REPOSITORY → exit 2, CONFIG_ERROR, attempts=0 (SIG-R6-TEST-ENV-01)", () => {
     const r = runScriptSync({
       TARGET_SHA,
       GITHUB_API_URL: "http://127.0.0.1:1",
@@ -838,9 +868,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("test mode rejects non-loopback URL → exit 2, CONFIG_ERROR", () => {
+  it("test mode rejects non-loopback URL → exit 2, CONFIG_ERROR, attempts=0", () => {
     const r = runScriptSync({
       TARGET_SHA,
       GITHUB_API_URL: "https://api.github.com",
@@ -849,9 +880,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("GITHUB_ACTIONS=true + test mode → exit 2, CONFIG_ERROR (SIG-R3-CI-01)", () => {
+  it("GITHUB_ACTIONS=true + test mode → exit 2, CONFIG_ERROR, attempts=0 (SIG-R3-CI-01)", () => {
     // This test explicitly verifies that the script refuses test mode
     // when GITHUB_ACTIONS=true. The runtime tests above delete
     // GITHUB_ACTIONS from the child env so they can run in CI.
@@ -864,9 +896,10 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("invalid SIGNATURE_RETRY_DELAY_SCALE (2) → exit 2, CONFIG_ERROR (SIG-R3-RETRY-02)", () => {
+  it("invalid SIGNATURE_RETRY_DELAY_SCALE (2) → exit 2, CONFIG_ERROR, attempts=0 (SIG-R3-RETRY-02)", () => {
     const r = runScriptSync({
       TARGET_SHA,
       GITHUB_API_URL: "http://127.0.0.1:1",
@@ -876,15 +909,16 @@ describe("R169 SIG runtime — config error cases", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(r.outputs?.attempts).toBe("0");
   });
 
-  it("scale=0 in production mode (non-loopback) → exit 2, CONFIG_ERROR (SIG-R3-RETRY-02)", () => {
+  it("scale=0 in production mode (non-loopback) → exit 2, CONFIG_ERROR, attempts=0 (SIG-R3-RETRY-02)", () => {
     // Without CBM_SIGNATURE_TEST_MODE=1, the script enforces production rules.
     // scale=0 is not allowed in production.
     const tmpDir = mkdtempSync(join(tmpdir(), "r169-cfg-"));
     const outputFile = join(tmpDir, "outputs.json");
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    delete env.GITHUB_ACTIONS;
+    // SIG-R6-TEST-ENV-01: Use cleanVerifierEnv() to strip ALL signature vars
+    const env: NodeJS.ProcessEnv = cleanVerifierEnv();
     delete env.CBM_SIGNATURE_TEST_MODE;
     const result = spawnSync("bash", [SCRIPT_PATH], {
       env: {
@@ -904,6 +938,7 @@ describe("R169 SIG runtime — config error cases", () => {
     rmSync(tmpDir, { recursive: true, force: true });
     expect(result.status).toBe(2);
     expect(outputs?.error_category).toBe("GITHUB_SIGNATURE_CONFIG_ERROR");
+    expect(outputs?.attempts).toBe("0");
   });
 });
 
@@ -913,8 +948,8 @@ describe("R169 SIG runtime — network error cases", () => {
     // We don't start a server — the connection will be refused
     const tmpDir = mkdtempSync(join(tmpdir(), "r169-net-"));
     const outputFile = join(tmpDir, "outputs.json");
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    delete env.GITHUB_ACTIONS;
+    // SIG-R6-TEST-ENV-01: Use cleanVerifierEnv() to strip ALL signature vars
+    const env: NodeJS.ProcessEnv = cleanVerifierEnv();
 
     const result = await new Promise<ScriptResult>((resolve) => {
       const child = spawn("bash", [SCRIPT_PATH], {
@@ -1025,9 +1060,8 @@ describe("R169 SIG runtime — temp file cleanup (SIG-R5-TEMP-01)", () => {
   ): Promise<ScriptResult> {
     return new Promise((resolve) => {
       const outputFile = join(tmpdirPath, "outputs.json");
-      // SIG-R3-CI-01: Delete GITHUB_ACTIONS so test mode works in CI
-      const baseEnv = { ...process.env };
-      delete (baseEnv as any).GITHUB_ACTIONS;
+      // SIG-R6-TEST-ENV-01: Use cleanVerifierEnv() to strip ALL signature vars
+      const baseEnv = cleanVerifierEnv();
       const child = spawn("bash", [SCRIPT_PATH], {
         env: {
           ...baseEnv,

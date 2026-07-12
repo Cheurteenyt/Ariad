@@ -355,12 +355,26 @@ describe("R169 SIG — CI ShellCheck configuration (SIG-R5-CI-TEST-01)", () => {
   });
 
   it("ShellCheck step is inside the Backend job (no new required check)", () => {
-    // The step should appear after the Test step in the backend job
+    // The step should appear in the backend job
     const backendSection = ciWorkflow.substring(
       ciWorkflow.indexOf("name: Backend (v2)"),
       ciWorkflow.indexOf("name: Frontend (graph-ui)")
     );
     expect(backendSection).toContain("ShellCheck security-critical CI scripts");
+  });
+
+  it("ShellCheck step runs BEFORE Vitest (SIG-R6: not skipped on test failure)", () => {
+    // ShellCheck must come before the Test step so it always runs even if
+    // tests fail (steps after a failure are skipped by default).
+    const backendSection = ciWorkflow.substring(
+      ciWorkflow.indexOf("name: Backend (v2)"),
+      ciWorkflow.indexOf("name: Frontend (graph-ui)")
+    );
+    const shellcheckIdx = backendSection.indexOf("ShellCheck security-critical CI scripts");
+    const testIdx = backendSection.indexOf("- name: Test\n");
+    expect(shellcheckIdx).toBeGreaterThan(-1);
+    expect(testIdx).toBeGreaterThan(-1);
+    expect(shellcheckIdx).toBeLessThan(testIdx);
   });
 });
 

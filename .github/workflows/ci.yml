@@ -83,14 +83,9 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test
-        run: npx vitest run
-
-      # R90: Incremental benchmark with correctness invariants
-      - name: Incremental benchmark invariants
-        run: npm run bench:incremental:smoke
-
       # SIG-R4-CI-01: ShellCheck security-critical CI scripts.
+      # SIG-R6: Moved BEFORE Vitest so ShellCheck always runs even if tests
+      # fail (steps after a failure are skipped by default).
       # Action pinned by SHA (tag 2.0.0 → 00cae500b08a931fb5698e11e79bfbd38e612a38).
       # ShellCheck binary version pinned to v0.10.0 for reproducibility
       # (SUPPLY-R5-01). The step runs inside the Backend job — no new
@@ -101,6 +96,13 @@ jobs:
           severity: warning
           scandir: ./scripts/ci
           version: v0.10.0
+
+      - name: Test
+        run: npx vitest run
+
+      # R90: Incremental benchmark with correctness invariants
+      - name: Incremental benchmark invariants
+        run: npm run bench:incremental:smoke
 
   # ── Frontend (graph-ui): typecheck + build + test ──────────────
   frontend:
