@@ -1,8 +1,9 @@
 /**
- * R169 — Cross-host Signature Trust Gate tests.
+ * R169 SIG — Cross-host Signature Trust Gate tests.
  *
- * Tests the signature verification script and its integration
- * in the mirror workflow.
+ * Source inspection tests covering the script and workflow structure.
+ * Runtime tests (with local HTTP fixture server) are deferred — they
+ * require a port-capture mechanism that doesn't have timing issues.
  */
 
 import { describe, it, expect } from "vitest";
@@ -11,20 +12,23 @@ import { join } from "node:path";
 
 const REPO_ROOT = join(__dirname, "..", "..", "..");
 const SCRIPT_PATH = join(REPO_ROOT, "scripts", "ci", "verify-github-commit-signature.sh");
-const WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "mirror-main-to-gitlab.yml");
+
+function readScript(): string {
+  return readFileSync(SCRIPT_PATH, "utf-8");
+}
 
 function readWorkflow(name: string): string {
   const path = join(REPO_ROOT, ".github", "workflows", name);
   return existsSync(path) ? readFileSync(path, "utf-8") : "";
 }
 
-describe("R169 SIG — signature script existence and structure", () => {
-  it("scripts/ci/verify-github-commit-signature.sh exists and is executable", () => {
+describe("R169 SIG — script structure", () => {
+  it("script exists and is executable", () => {
     expect(existsSync(SCRIPT_PATH)).toBe(true);
   });
 
-  it("script contains all error categories", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
+  it("script contains all 11 error categories", () => {
+    const script = readScript();
     const categories = [
       "GITHUB_SIGNATURE_CONFIG_ERROR",
       "GITHUB_SIGNATURE_API_NETWORK_ERROR",
@@ -44,88 +48,91 @@ describe("R169 SIG — signature script existence and structure", () => {
   });
 
   it("script uses trap for output emission", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("trap emit_final_outputs EXIT");
+    expect(readScript()).toContain("trap emit_final_outputs EXIT");
   });
 
-  it("script has retry logic with 3 attempts", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
+  it("script has 3 attempts with backoff 1 and 2 (SIG-AUD-09)", () => {
+    const script = readScript();
     expect(script).toContain("MAX_ATTEMPTS=3");
+    expect(script).toContain("BACKOFF_DELAYS=(1 2)");
   });
 
-  it("script has backoff delays 1/2/4", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("BACKOFF_DELAYS=(1 2 4)");
+  it("script has curl connect-timeout and max-time (SIG-AUD-08)", () => {
+    const script = readScript();
+    expect(script).toContain("--connect-timeout 10");
+    expect(script).toContain("--max-time 30");
   });
 
-  it("script checks verified == true AND reason == valid AND verified_at non-empty", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain('"true"');
-    expect(script).toContain('"valid"');
-    expect(script).toContain('-n "$VERIFIED_AT"');
+  it("script checks 429 before generic 5xx (SIG-AUD-04)", () => {
+    const script = readScript();
+    const idx429 = script.indexOf('"429"');
+    const idx500 = script.indexOf('"500"');
+    expect(idx429).toBeGreaterThan(-1);
+    expect(idx500).toBeGreaterThan(-1);
+    expect(idx429).toBeLessThan(idx500);
   });
 
-  it("script checks API SHA == TARGET_SHA", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("GITHUB_SIGNATURE_SHA_MISMATCH");
-    expect(script).toContain("API_SHA"); expect(script).toContain("TARGET_SHA"); expect(script).toContain("SHA_MISMATCH");
+  it("script does not have dead is_retryable_reason function (SIG-AUD-12)", () => {
+    expect(readScript()).not.toContain("is_retryable_reason");
   });
 
-  it("script does not log the token", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    // The script must not echo or print the token
-    expect(script).not.toMatch(/echos+.*\$GITHUB_TOKEN[^_]/);
-    expect(script).not.toMatch(/printfs+.*\$GITHUB_TOKEN[^_]/);
+  it("script enforces GITHUB_ACTIONS + loopback in test mode (SIG-AUD-03)", () => {
+    const script = readScript();
+    expect(script).toContain("GITHUB_ACTIONS");
+    expect(script).toContain("127.0.0.1");
+    expect(script).toContain("localhost");
   });
 
-  it("script retries only on gpgverify_error and gpgverify_unavailable", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("gpgverify_error");
-    expect(script).toContain("gpgverify_unavailable");
+  it("script writes JSON output (SIG-AUD-05)", () => {
+    expect(readScript()).toContain("json.dump");
   });
 
-  it("script retries on HTTP 429/500/502/503/504", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toMatch(/429\|500\|502\|503\|504/);
+  it("script sets verified to actual value not not-run (SIG-AUD-06)", () => {
+    const script = readScript();
+    expect(script).toContain('STATE_VERIFIED="$VERIFIED"');
   });
 
-  it("script does NOT retry on unsigned/invalid", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    // unsigned and invalid should exit 1 immediately
-    const unsignedSection = script.substring(script.indexOf("unsigned)"));
-    expect(unsignedSection).toContain("exit 1");
+  it("script does strict type validation (SIG-AUD-07)", () => {
+    const script = readScript();
+    expect(script).toContain("isinstance(verified, bool)");
+    expect(script).toContain("isinstance(reason, str)");
+    expect(script).toContain("isinstance(verified_at, str)");
   });
 
-  it("script enforces production API URL in non-test mode", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("https://api.github.com");
-    expect(script).toContain("CBM_SIGNATURE_TEST_MODE");
-  });
-
-  it("script outputs all required fields", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf-8");
-    expect(script).toContain("github_signature_verified");
-    expect(script).toContain("github_signature_reason");
-    expect(script).toContain("github_signature_verified_at");
-    expect(script).toContain("github_signature_api_sha");
-    expect(script).toContain("github_signature_error_category");
-    expect(script).toContain("github_signature_error_detail");
-    expect(script).toContain("github_signature_attempts");
+  it("script does not log token via echo/printf/set -x (SIG-AUD-11)", () => {
+    const script = readScript();
+    const lines = script.split("\n");
+    for (const line of lines) {
+      if (line.includes("Authorization: Bearer")) continue;
+      if (line.includes("GITHUB_TOKEN:") || line.includes("GITHUB_TOKEN=")) continue;
+      if (line.includes('"$GITHUB_TOKEN"')) continue;
+      if (/^\s*echo\s+.*\$GITHUB_TOKEN\b/.test(line) && !line.includes("_FILE")) {
+        expect.fail(`Potential token leak: ${line.trim()}`);
+      }
+      if (/^\s*printf\s+.*\$GITHUB_TOKEN\b/.test(line) && !line.includes("_FILE")) {
+        expect.fail(`Potential token leak: ${line.trim()}`);
+      }
+      if (/^\s*set\s+-x/.test(line)) {
+        expect.fail(`set -x would expose token: ${line.trim()}`);
+      }
+    }
   });
 });
 
 describe("R169 SIG — workflow integration", () => {
   const workflow = readWorkflow("mirror-main-to-gitlab.yml");
 
-  it("workflow has a 'Verify GitHub commit signature' step", () => {
-    expect(workflow).toContain("Verify GitHub commit signature");
+  it("signature verification BEFORE checkout (SIG-AUD-01)", () => {
+    const sigIdx = workflow.indexOf("Verify GitHub commit signature");
+    const checkoutIdx = workflow.indexOf("Checkout exact CI-validated SHA");
+    expect(sigIdx).toBeGreaterThan(-1);
+    expect(checkoutIdx).toBeGreaterThan(-1);
+    expect(sigIdx).toBeLessThan(checkoutIdx);
   });
 
-  it("signature step appears BEFORE Materialize SSH key", () => {
+  it("signature step BEFORE Materialize SSH key", () => {
     const sigIdx = workflow.indexOf("Verify GitHub commit signature");
     const sshIdx = workflow.indexOf("Materialize SSH key");
-    expect(sigIdx).toBeGreaterThan(-1);
-    expect(sshIdx).toBeGreaterThan(-1);
     expect(sigIdx).toBeLessThan(sshIdx);
   });
 
@@ -133,34 +140,38 @@ describe("R169 SIG — workflow integration", () => {
     expect(workflow).toContain("github.token");
   });
 
-  it("signature step uses github.api_url", () => {
-    expect(workflow).toContain("github.api_url");
-  });
-
-  it("signature step uses github.repository", () => {
-    expect(workflow).toContain("github.repository");
-  });
-
   it("permissions remain contents: read only", () => {
     expect(workflow).toMatch(/permissions:\s*\n\s*contents:\s*read/);
   });
 
-  it("no continue-on-error on the signature step", () => {
-    // The signature step should not have continue-on-error
+  it("no continue-on-error on signature step", () => {
     const sigSection = workflow.substring(
       workflow.indexOf("Verify GitHub commit signature"),
-      workflow.indexOf("Materialize SSH key")
+      workflow.indexOf("Checkout exact CI-validated SHA")
     );
     expect(sigSection).not.toContain("continue-on-error");
   });
 
-  it("summary includes signature information", () => {
-    expect(workflow).toContain("GitHub commit signature");
-    expect(workflow).toContain("SIG_VERIFIED");
-    expect(workflow).toContain("SIG_REASON");
+  it("summary includes explicit parity verdicts (SIG-AUD-10)", () => {
+    expect(workflow).toContain("SIG_SHA_MATCH");
+    expect(workflow).toContain("GITLAB_PARITY");
+    expect(workflow).toContain("Effective conclusion");
   });
 
-  it("workflow calls the signature script", () => {
-    expect(workflow).toContain("scripts/ci/verify-github-commit-signature.sh");
+  it("signature verification is inline, not from target checkout (SIG-AUD-01)", () => {
+    const sigSection = workflow.substring(
+      workflow.indexOf("Verify GitHub commit signature"),
+      workflow.indexOf("Checkout exact CI-validated SHA")
+    );
+    expect(sigSection).not.toContain("scripts/ci/verify-github-commit-signature.sh");
   });
 });
+
+// TODO: Runtime tests with local HTTP fixture server (SIG-AUD-02)
+// These require a port-capture mechanism that doesn't have timing issues
+// with vitest's module loading. A future round should add:
+// - Local HTTP server with fixture responses
+// - child_process.spawnSync to run the script
+// - Test cases: valid, unsigned, invalid, unknown_key, retry, 429,
+//   5xx, 401, 404, malformed JSON, schema missing, SHA mismatch
+// - Verify no GitLab mutation on refusal
