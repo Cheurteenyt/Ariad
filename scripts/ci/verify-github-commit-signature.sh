@@ -5,18 +5,27 @@
 # SIG-R169: Cross-host Signature Trust Gate — Canonical verifier.
 #
 # This script is the SINGLE source of truth for commit signature verification.
-# The mirror workflow (.github/workflows/mirror-main-to-gitlab.yml) calls this
-# script directly. Runtime tests (v2/tests/ci/r169-signature-runtime.test.ts)
-# execute this same script against a local HTTP fixture server.
+# Runtime tests (v2/tests/ci/r169-signature-runtime.test.ts) execute this
+# same script against a local HTTP fixture server.
+#
+# DEPLOYMENT STATE (SIG-R3-TRUST-01, 2-phase bootstrap):
+#   Phase A (current): This script is published and tested, but NOT yet
+#     called by the mirror workflow. The mirror workflow remains in its
+#     pre-SIG-R169 state.
+#   Phase B (future PR): The mirror workflow will load this script from
+#     the immutable Phase A squash SHA (NOT from main, HEAD, or TARGET_SHA)
+#     and execute it before TARGET_SHA checkout.
 #
 # Trust boundary (SIG-R169-POLICY-01):
-#   - This script is loaded from a signed commit on the default branch.
+#   - Phase B: This script will be loaded from an immutable pinned
+#     Phase A squash SHA — NOT from a moving ref like main or HEAD.
 #   - It verifies TARGET_SHA via the GitHub REST API.
 #   - No checked-out repository code is executed before this gate.
 #   - A GitHub "verified" badge proves cryptographic provenance, NOT code safety.
-#   - The gate can still be modified by a future signed+merged PR; it is NOT
-#     immutable. It protects against: unsigned pushes, invalid signatures, and
-#     cryptographic identities GitHub does not recognize.
+#   - The gate protects against: unsigned pushes, invalid signatures, and
+#     cryptographic identities GitHub does not recognize. It does NOT prove
+#     absence of malicious code, sufficiency of human review, or immutability
+#     of the workflow itself.
 #
 # Env vars:
 #   TARGET_SHA (required)              — 40-char hex SHA to verify
@@ -255,8 +264,13 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
       # Capture Retry-After header (seconds) for 429 and secondary rate limits
       RETRY_AFTER=$(grep -i '^retry-after:' "$HEADER_FILE" 2>/dev/null | tr -d '\r' | awk '{print $2}' || true)
     fi
-    # SIG-R4-TEMP-01: cleanup is centralized in the trap. Clear the variable
-    # so the trap knows we've already processed this file's headers.
+    # SIG-R5-TEMP-01: Delete the temp file immediately after extracting headers,
+    # THEN clear the variable. The previous code cleared HEADER_FILE without
+    # deleting the file first, causing orphaned temp files on retries.
+    # The trap remains as a safety net for unexpected exits.
+    if [ -n "${HEADER_FILE:-}" ] && [ -f "$HEADER_FILE" ]; then
+      rm -f "$HEADER_FILE"
+    fi
     HEADER_FILE=""
 
     # SIG-AUD-04 + SIG-R3-RATE-01 + SIG-R4-RATE-01:
@@ -314,6 +328,13 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
       exit 1
     fi
   fi
+
+  # SIG-R5-TEMP-01: Clean up HEADER_FILE on the HTTP 200 path too.
+  # (The non-200 path already cleans up above before the retry/exit logic.)
+  if [ -n "${HEADER_FILE:-}" ] && [ -f "$HEADER_FILE" ]; then
+    rm -f "$HEADER_FILE"
+  fi
+  HEADER_FILE=""
 
   # SIG-AUD-07 + SIG-R169-SCHEMA-01 + SIG-R4-VERIFYAT-01 + SIG-R4-PARSER-01:
   # Strict JSON parsing respecting the REAL GitHub API contract.

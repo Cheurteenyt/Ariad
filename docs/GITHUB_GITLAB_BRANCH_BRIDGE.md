@@ -788,6 +788,37 @@ run in GitHub Actions (SIG-R3-CI-01). A dedicated test verifies that
 Child process has a 5s watchdog timer (SIG-R3-TESTTIME-01). Server is
 closed with a Promise to avoid orphan handles.
 
+Temp file cleanup is verified at runtime with a dedicated TMPDIR
+(SIG-R5-TEMP-01): tests confirm no orphaned temp files after 429-then-valid,
+500-permanent, 403-primary-exhausted, and 200-success scenarios.
+
+### CI ShellCheck validation (SIG-R4-CI-01, SIG-R5-CI-TEST-01)
+
+The Backend CI job includes a ShellCheck step for security-critical CI
+scripts. Configuration:
+
+```yaml
+- name: ShellCheck security-critical CI scripts
+  uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+  with:
+    severity: warning
+    scandir: ./scripts/ci
+    version: v0.10.0
+```
+
+- **Action pinned by SHA** (not tag): `00cae500b08a931fb5698e11e79bfbd38e612a38`
+  (verified via GitHub API as the real commit for tag 2.0.0)
+- **ShellCheck binary version pinned**: `v0.10.0` (not `stable`) for
+  reproducibility (SUPPLY-R5-01)
+- **Uses `scandir`** (not the non-existent `additional_paths` input) to
+  target `./scripts/ci`
+- **Step lives inside the Backend job** — no new required check
+- Verified: 2026-07-13
+
+Structural tests in `r169-signature-gate.test.ts` verify the CI YAML:
+action ref is a 40-char SHA, `additional_paths` is absent, `scandir`
+targets `scripts/ci`, version is explicit, step is in the Backend job.
+
 ### Script
 
 `scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.

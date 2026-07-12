@@ -313,3 +313,97 @@ describe("R169 SIG — Phase A bootstrap (SIG-R3-TRUST-01)", () => {
     expect(workflow).toContain("Run mirror state machine");
   });
 });
+
+// ─── CI ShellCheck configuration tests (SIG-R5-CI-TEST-01) ──────────────
+
+describe("R169 SIG — CI ShellCheck configuration (SIG-R5-CI-TEST-01)", () => {
+  const ciWorkflow = readWorkflow("ci.yml");
+
+  it("ShellCheck step exists in Backend job", () => {
+    expect(ciWorkflow).toContain("ShellCheck security-critical CI scripts");
+  });
+
+  it("ShellCheck action is pinned by 40-char SHA (not tag)", () => {
+    // Must use @<40-hex-sha>, not @tag or @branch
+    const match = ciWorkflow.match(/ludeeus\/action-shellcheck@([0-9a-f]{40})/);
+    expect(match).not.toBeNull();
+    expect(match![1]).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("ShellCheck action SHA is the real tag 2.0.0 SHA", () => {
+    // Verified via GitHub API: tag 2.0.0 → 00cae500b08a931fb5698e11e79bfbd38e612a38
+    expect(ciWorkflow).toContain("ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38");
+  });
+
+  it("ShellCheck does NOT use invalid 'additional_paths' input (SIG-R5-CI-SHELLCHECK-02)", () => {
+    // The action exposes 'additional_files' and 'scandir', NOT 'additional_paths'
+    expect(ciWorkflow).not.toContain("additional_paths");
+  });
+
+  it("ShellCheck uses scandir to target scripts/ci directory", () => {
+    expect(ciWorkflow).toContain("scandir: ./scripts/ci");
+  });
+
+  it("ShellCheck binary version is explicitly pinned (SUPPLY-R5-01)", () => {
+    // Must NOT use the default 'stable' — must pin a specific version
+    expect(ciWorkflow).not.toMatch(/version:\s*stable/);
+    expect(ciWorkflow).toMatch(/version:\s*v0\.\d+\.\d+/);
+  });
+
+  it("ShellCheck severity is set to warning", () => {
+    expect(ciWorkflow).toContain("severity: warning");
+  });
+
+  it("ShellCheck step is inside the Backend job (no new required check)", () => {
+    // The step should appear after the Test step in the backend job
+    const backendSection = ciWorkflow.substring(
+      ciWorkflow.indexOf("name: Backend (v2)"),
+      ciWorkflow.indexOf("name: Frontend (graph-ui)")
+    );
+    expect(backendSection).toContain("ShellCheck security-critical CI scripts");
+  });
+});
+
+// ─── HEADER_FILE cleanup tests (SIG-R5-TEMP-01) ─────────────────────────
+
+describe("R169 SIG — HEADER_FILE cleanup (SIG-R5-TEMP-01)", () => {
+  it("script deletes HEADER_FILE before clearing the variable on non-200 path", () => {
+    const script = readScript();
+    // The dangerous pattern is: HEADER_FILE="" inside the retry loop
+    // (after mktemp) WITHOUT a preceding rm -f. The initialization line
+    // (HEADER_FILE="" at the top) is fine — it's not clearing an existing file.
+    const lines = script.split("\n");
+    let foundDangerousPattern = false;
+    // Only check lines AFTER the mktemp line (inside the retry loop)
+    const mktempIdx = lines.findIndex((l) => l.includes("HEADER_FILE=$(mktemp)"));
+    expect(mktempIdx).toBeGreaterThan(-1);
+    for (let i = mktempIdx + 1; i < lines.length; i++) {
+      if (/^\s*HEADER_FILE=""\s*$/.test(lines[i])) {
+        // Check the 5 lines before this one for an rm -f
+        const context = lines.slice(Math.max(mktempIdx, i - 5), i).join("\n");
+        if (!context.includes("rm -f")) {
+          foundDangerousPattern = true;
+          break;
+        }
+      }
+    }
+    expect(foundDangerousPattern).toBe(false);
+  });
+
+  it("script cleans up HEADER_FILE on HTTP 200 path too", () => {
+    const script = readScript();
+    // After the non-200 block ends (fi), there should be a cleanup before parsing
+    const non200End = script.indexOf('fi\n  fi\n\n  # SIG-R5-TEMP-01: Clean up HEADER_FILE on the HTTP 200 path');
+    expect(non200End).toBeGreaterThan(-1);
+  });
+
+  it("script trap includes HEADER_FILE cleanup as safety net", () => {
+    const script = readScript();
+    const trapSection = script.substring(
+      script.indexOf("emit_final_outputs() {"),
+      script.indexOf("trap emit_final_outputs EXIT")
+    );
+    expect(trapSection).toContain("HEADER_FILE");
+    expect(trapSection).toContain("rm -f");
+  });
+});

@@ -1014,3 +1014,115 @@ describe("R169 SIG runtime — fixture request verification (SIG-R3-HTTPTEST-01)
     }
   });
 });
+
+// ─── Temp file cleanup tests (SIG-R5-TEMP-01) ───────────────────────────
+// Uses a dedicated TMPDIR to verify no orphaned temp files are left behind.
+
+describe("R169 SIG runtime — temp file cleanup (SIG-R5-TEMP-01)", () => {
+  function runWithDedicatedTmpdir(
+    port: number,
+    tmpdirPath: string
+  ): Promise<ScriptResult> {
+    return new Promise((resolve) => {
+      const outputFile = join(tmpdirPath, "outputs.json");
+      // SIG-R3-CI-01: Delete GITHUB_ACTIONS so test mode works in CI
+      const baseEnv = { ...process.env };
+      delete (baseEnv as any).GITHUB_ACTIONS;
+      const child = spawn("bash", [SCRIPT_PATH], {
+        env: {
+          ...baseEnv,
+          TARGET_SHA,
+          GITHUB_API_URL: `http://127.0.0.1:${port}`,
+          GITHUB_REPOSITORY: "test/repo",
+          GITHUB_TOKEN: "fake-token",
+          OUTPUT_FILE: outputFile,
+          SIGNATURE_RETRY_DELAY_SCALE: "0",
+          CBM_SIGNATURE_TEST_MODE: "1",
+          TMPDIR: tmpdirPath,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        let outputs: any = null;
+        try { outputs = JSON.parse(readFileSync(outputFile, "utf-8")); } catch {}
+        resolve({ exitCode: code ?? -1, stdout, stderr, outputs, timedOut: false });
+      });
+    });
+  }
+
+  function countTempFiles(tmpdirPath: string): number {
+    try {
+      const entries = require("node:fs").readdirSync(tmpdirPath);
+      // Exclude the outputs.json file we created
+      return entries.filter((e: string) => e !== "outputs.json").length;
+    } catch {
+      return -1;
+    }
+  }
+
+  it("429 then valid → no orphaned temp files", async () => {
+    const srv = await startServer([
+      { status: 429, body: JSON.stringify({ message: "rate limited" }) },
+      { status: 200, body: validBody(TARGET_SHA) },
+    ]);
+    const tmpdirPath = mkdtempSync(join(tmpdir(), "r169-tmp-429-"));
+    try {
+      await runWithDedicatedTmpdir(srv.port, tmpdirPath);
+      expect(countTempFiles(tmpdirPath)).toBe(0);
+    } finally {
+      await srv.close();
+      rmSync(tmpdirPath, { recursive: true, force: true });
+    }
+  });
+
+  it("500 permanent → no orphaned temp files", async () => {
+    const srv = await startServer([
+      { status: 500, body: JSON.stringify({ message: "error" }) },
+      { status: 500, body: JSON.stringify({ message: "error" }) },
+      { status: 500, body: JSON.stringify({ message: "error" }) },
+    ]);
+    const tmpdirPath = mkdtempSync(join(tmpdir(), "r169-tmp-500-"));
+    try {
+      await runWithDedicatedTmpdir(srv.port, tmpdirPath);
+      expect(countTempFiles(tmpdirPath)).toBe(0);
+    } finally {
+      await srv.close();
+      rmSync(tmpdirPath, { recursive: true, force: true });
+    }
+  });
+
+  it("403 primary exhausted → no orphaned temp files", async () => {
+    const srv = await startServer([
+      {
+        status: 403,
+        body: JSON.stringify({ message: "rate limit exceeded" }),
+        headers: { "x-ratelimit-remaining": "0" },
+      },
+    ]);
+    const tmpdirPath = mkdtempSync(join(tmpdir(), "r169-tmp-403-"));
+    try {
+      await runWithDedicatedTmpdir(srv.port, tmpdirPath);
+      expect(countTempFiles(tmpdirPath)).toBe(0);
+    } finally {
+      await srv.close();
+      rmSync(tmpdirPath, { recursive: true, force: true });
+    }
+  });
+
+  it("valid signature (200) → no orphaned temp files", async () => {
+    const srv = await startServer([{ status: 200, body: validBody(TARGET_SHA) }]);
+    const tmpdirPath = mkdtempSync(join(tmpdir(), "r169-tmp-200-"));
+    try {
+      await runWithDedicatedTmpdir(srv.port, tmpdirPath);
+      expect(countTempFiles(tmpdirPath)).toBe(0);
+    } finally {
+      await srv.close();
+      rmSync(tmpdirPath, { recursive: true, force: true });
+    }
+  });
+});
