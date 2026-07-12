@@ -43,7 +43,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 
 # Create a volume for the cache directory (SQLite DBs)
-VOLUME ["/root/.cache/codebase-memory-mcp"]
+RUN useradd -m -u 1000 cbm
+USER cbm
+VOLUME ["/home/cbm/.cache/codebase-memory-mcp"]
 
 # Default entrypoint — can be overridden for MCP mode
 ENTRYPOINT ["node", "dist/cli/index.js"]

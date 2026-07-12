@@ -7,7 +7,7 @@
 | Document | Description |
 |----------|-------------|
 | [V2_CURRENT_STATE.md](V2_CURRENT_STATE.md) | Authoritative snapshot of current product state, features, limitations |
-| [V2_ARCHITECTURE.md](V2_ARCHITECTURE.md) | System architecture: components, indexer, graph, CLI/MCP/UI, publication |
+| [V2_ARCHITECTURE.md.*System architecture (R168.3 rewrite — current): components, indexer, graph, CLI/MCP/UI, publication |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Complete CLI command reference |
 | [MCP_TOOLS.md](MCP_TOOLS.md) | MCP server tools documentation |
 | [INTELLIGENCE.md](INTELLIGENCE.md) | Graph status, freshness, SWR cache |

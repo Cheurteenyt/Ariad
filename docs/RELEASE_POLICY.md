@@ -52,8 +52,8 @@ A GitHub Release is a public distribution event. It requires:
 
 The first public release (a **pre-release**) should happen only after:
 
-- R168.2: packaging readiness (lockfiles, UI assets, Docker) ✓
-- R169: atomic generation publication
+- R168.2: packaging implementation landed (lockfiles, UI assets, Docker)
+- R168.3: packaging evidence required (npm pack smoke, Docker smoke)
 - R170: project lease/fencing
 
 Suggested first pre-release: `v0.8.0-alpha.1`.

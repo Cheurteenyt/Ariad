@@ -1,6 +1,6 @@
 {
   "name": "codebase-memory-v2",
-  "version": "0.74.0",
+  "version": "0.74.1",
   "description": "Codebase Memory V2 \u2014 hybrid code intelligence (native WASM indexer + human memory graph + Obsidian sync)",
   "type": "module",
   "main": "dist/cli/index.js",
@@ -19,7 +19,10 @@
     "prepublishOnly": "npm run typecheck && npm test",
     "bench:incremental": "tsx scripts/incremental-benchmark-r87.ts",
     "bench:incremental:smoke": "CBM_BENCH_SMOKE=1 tsx scripts/incremental-benchmark-r87.ts",
-    "bench:precision": "tsx scripts/precision-benchmark-r112.ts --project precision-bench --root ./src --sample 50"
+    "bench:precision": "tsx scripts/precision-benchmark-r112.ts --project precision-bench --root ./src --sample 50",
+    "build:backend": "npm run clean && tsc -p tsconfig.json",
+    "build:package": "node scripts/build-package.mjs",
+    "prepack": "npm run build:package"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
@@ -64,6 +67,7 @@
   "files": [
     "dist",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ]
 }
