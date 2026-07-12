@@ -238,3 +238,38 @@ TRUSTED_VERIFIER_SHA = f5d42688d921f04b4323a017586af4566c17e381
 
 This is a fail-closed behavior. GitHub remains canonical. GitLab
 remains at the last verified SHA. No data is lost.
+
+## 7. SIG-R169 Phase B first production run — wrapper syntax incident
+
+The first production run of the Phase B mirror workflow (commit `aa6486c`)
+failed in the `Verify GitHub commit signature` step with:
+
+```text
+syntax error near unexpected token `then'
+exit code 2
+```
+
+**What happened:**
+- GitHub API signature verification succeeded (HTTP 200, verified=true)
+- The wrapper shell block had an unclosed command substitution `$(`
+- Bash could not parse the `if ! STEP_OUTPUTS="$(... )"; then` construct
+- The step exited with code 2 before target checkout
+
+**What did NOT happen (fail-closed worked):**
+- No GitLab SSH key was materialized
+- No GitLab fetch or push was attempted
+- GitLab remained at the last valid SHA
+- No manual GitLab push was needed
+
+**Recovery:**
+- A hotfix PR (`hotfix/sig-r169-gate-wrapper-syntax`) fixed the syntax
+- No manual mirror bypass was used
+- The new workflow fast-forwarded GitLab from Phase A to the hotfix SHA
+- The Phase B commit `aa6486c` was included as an ancestor
+
+**Runbook — when an inline GitHub Actions Bash step fails:**
+1. Do not re-run the old workflow if the workflow source is defective
+2. Fix through a new PR
+3. Wait for push/main CI to pass
+4. Let the new workflow mirror the new main SHA
+5. Verify exact GitHub/GitLab parity
