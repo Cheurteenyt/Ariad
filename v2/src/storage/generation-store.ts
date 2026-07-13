@@ -448,7 +448,7 @@ export interface AtomicFileOps {
  * the generation store reads. This keeps the injectable interface
  * narrow and makes fault injection simpler in tests.
  */
-const PROD_OPS: AtomicFileOps = {
+export const PROD_OPS: AtomicFileOps = {
   openSync: (p, f, m) => openSync(p, f as string, m),
   readSync: (fd, b, o, l, p) => readSync(fd, b, o, l, p),
   writeSync: (fd, b, o, l, p) => writeSync(fd, b, o, l, p),
@@ -2689,10 +2689,16 @@ export function ensureGenerationStoreLayoutDurable(
   project: string,
   options?: GenerationStoreOptions,
 ): { created: string[] } {
-  const phase = "ensureGenerationStoreLayoutDurable";
+  return ensureGenerationStoreLayoutDurableInternal(project, options, PROD_OPS);
+}
+
+export function ensureGenerationStoreLayoutDurableInternal(
+  project: string,
+  options: GenerationStoreOptions | undefined,
+  ops: AtomicFileOps,
+): { created: string[] } {
+  const phase = "ensureGenerationStoreLayoutDurableInternal";
   const cacheRoot = options?.cacheRoot ?? getCacheRoot();
-  // R169A-FIX-R6: Access ops via arguments for test injection
-  const ops = arguments.length > 2 ? arguments[2] : undefined;
   const opImpl = ops ?? PROD_OPS;
 
   // R169A-FIX-R2 (SEC-R169A-R2-01): Validate the trust root BEFORE
@@ -3634,7 +3640,7 @@ function writeProjectJsonAtomicallyInternal(
   //    happen BEFORE the write so the directory entries are durable by
   //    the time the temp file is created.
   // R169A-FIX-R6: Pass ops via arguments trick for test injection
-  (ensureGenerationStoreLayoutDurable as any)(project, options, opImpl);
+  ensureGenerationStoreLayoutDurableInternal(project, options, opImpl);
 
   // 8. R169A-FIX-R3 (SEC-R169A-R3-01): Test hook — inject a race here.
   if (hook?.afterLayoutBeforeOpen) {
@@ -3739,21 +3745,15 @@ export function writeIndexStateAtomically(
   state: IndexAttemptStateV1,
   options?: GenerationStoreOptions,
 ): void {
-  // R169A-FIX-R6 (API-R169A-R6-01): Tests cast this function to pass
-  // optional 4th/5th args (ops, hook). Access them via arguments to
-  // keep the public type signature at exactly 3 params while still
-  // forwarding test injection. Production callers never pass args 4/5.
-  const ops = arguments.length > 3 ? arguments[3] : PROD_OPS;
-  const hook = arguments.length > 4 ? arguments[4] : undefined;
-  writeIndexStateAtomicallyInternal(project, state, options, ops, hook);
+  writeIndexStateAtomicallyInternal(project, state, options, PROD_OPS, undefined);
 }
 
 /**
- * R169A-FIX-R6 (API-R169A-R6-01): Internal function with ops/hook for
- * test fault/race injection. NOT exported. Tests access it via a local
- * cast of the public function.
+ * R169A-FIX-R7 (API-R169A-R7-01): Internal function with ops/hook for
+ * test fault/race injection. Exported from the module but NOT part of
+ * the public API contract. Tests import it directly.
  */
-function writeIndexStateAtomicallyInternal(
+export function writeIndexStateAtomicallyInternal(
   project: string,
   state: IndexAttemptStateV1,
   options: GenerationStoreOptions | undefined,

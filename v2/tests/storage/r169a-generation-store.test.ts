@@ -105,26 +105,21 @@ import {
   parseGenerationManifest,
   resolveActiveCodeDb,
   writeIndexStateAtomically,
+  writeIndexStateAtomicallyInternal,
   ensureGenerationStoreLayoutDurable,
+  ensureGenerationStoreLayoutDurableInternal,
   listProjectStoreKeys,
   MAX_GENERATION_MANIFEST_BYTES,
   GenerationStoreError,
   type AtomicFileOps,
+  PROD_OPS,
   type GenerationStoreOptions,
   type WriterTestHook,
 } from "../../src/storage/generation-store.js";
 
-// R169A-FIX-R6 (API-R169A-R6-01): The public writeIndexStateAtomically
-// has exactly 3 params. Tests that need ops/hook cast to the internal
-// signature. This cast is test-only and does NOT affect the .d.ts.
-type WriteIndexStateInternal = (
-  project: string,
-  state: any,
-  options: any,
-  ops?: any,
-  hook?: any,
-) => void;
-const writeIndexStateInternal = writeIndexStateAtomically as unknown as WriteIndexStateInternal;
+// R169A-FIX-R7 (API-R169A-R7-01): Tests import the internal function
+// directly. The public function has exactly 3 params and does NOT
+// accept ops/hook at runtime. No cast, no arguments trick.
 
 import {
   MANIFEST_V1_KEYS,
@@ -169,7 +164,7 @@ function writeStateAtomically(
   ops?: AtomicFileOps,
   hook?: WriterTestHook,
 ): void {
-  writeIndexStateInternal(project, makeValidIndexState(project, state), { cacheRoot }, ops, hook);
+  writeIndexStateAtomicallyInternal(project, makeValidIndexState(project, state), { cacheRoot }, ops, hook);
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -1769,7 +1764,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
     const newState = makeValidIndexState(project, { lastAttemptId: OTHER_UUID });
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_WRITE_FAILED");
@@ -1790,7 +1785,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
     const ops = new TestOps();
     ops.shortFirstWrite = true;
 
-    writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+    writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
 
     // The file must contain exactly the right JSON, despite the partial
     // first write.
@@ -1826,7 +1821,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_WRITE_FAILED");
@@ -1846,7 +1841,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_FSYNC_FAILED");
@@ -1866,7 +1861,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     // Close failure is wrapped as ATOMIC_WRITE_FAILED.
@@ -1887,7 +1882,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_RENAME_FAILED");
@@ -1906,7 +1901,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_DURABILITY_UNKNOWN");
@@ -1926,7 +1921,7 @@ describe("R169A-FIX — Atomic JSON writer (DUR-R169A-01/02)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, newState, { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, newState, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("ATOMIC_DURABILITY_UNKNOWN");
@@ -2781,7 +2776,7 @@ describe("R169A-FIX-R2 — Layout durability (DUR-R169A-R2-01)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("STORE_LAYOUT_CREATE_FAILED");
@@ -2793,7 +2788,7 @@ describe("R169A-FIX-R2 — Layout durability (DUR-R169A-R2-01)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("STORE_LAYOUT_DURABILITY_UNKNOWN");
@@ -2805,7 +2800,7 @@ describe("R169A-FIX-R2 — Layout durability (DUR-R169A-R2-01)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("STORE_LAYOUT_DURABILITY_UNKNOWN");
@@ -3249,7 +3244,7 @@ describe("R169A-FIX-R2 — Exact error code checks (TEST-R169A-R2-01)", () => {
       ops.failAtLayoutMkdir = true;
       let err: unknown;
       try {
-        writeIndexStateInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
+        writeIndexStateAtomicallyInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
       } catch (e) { err = e; }
       expect(err).toBeInstanceOf(GenerationStoreError);
       const code = (err as GenerationStoreError).code;
@@ -3267,7 +3262,7 @@ describe("R169A-FIX-R2 — Exact error code checks (TEST-R169A-R2-01)", () => {
       ops.failAtLayoutDirFsync = true;
       let err: unknown;
       try {
-        writeIndexStateInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
+        writeIndexStateAtomicallyInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
       } catch (e) { err = e; }
       expect(err).toBeInstanceOf(GenerationStoreError);
       const code = (err as GenerationStoreError).code;
@@ -3285,7 +3280,7 @@ describe("R169A-FIX-R2 — Exact error code checks (TEST-R169A-R2-01)", () => {
       ops.failAtLayoutParentFsync = true;
       let err: unknown;
       try {
-        writeIndexStateInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
+        writeIndexStateAtomicallyInternal("p", makeValidIndexState("p"), { cacheRoot }, ops);
       } catch (e) { err = e; }
       expect(err).toBeInstanceOf(GenerationStoreError);
       const code = (err as GenerationStoreError).code;
@@ -3325,7 +3320,7 @@ describe("R169A-FIX-R3 — Race symlink in writer (SEC-R169A-R3-01)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("PATH_TRAVERSAL_REJECTED");
@@ -3356,7 +3351,7 @@ describe("R169A-FIX-R3 — Race symlink in writer (SEC-R169A-R3-01)", () => {
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("PATH_TRAVERSAL_REJECTED");
@@ -3461,7 +3456,7 @@ describe("R169A-FIX-R3 — Existing directory revalidation (SEC-R169A-R3-02 + SE
     // normal path is exercised.
     const ops = new TestOps();
     // No fault injection — just verify the normal path works.
-    const result = ensureGenerationStoreLayoutDurable(project, { cacheRoot }, ops);
+    const result = ensureGenerationStoreLayoutDurableInternal(project, { cacheRoot }, ops);
     expect(result.created.length).toBe(5);
   });
 
@@ -3488,7 +3483,7 @@ describe("R169A-FIX-R3 — Existing directory revalidation (SEC-R169A-R3-02 + SE
 
     let err: unknown;
     try {
-      ensureGenerationStoreLayoutDurable(project, { cacheRoot }, ops);
+      ensureGenerationStoreLayoutDurableInternal(project, { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("STORE_LAYOUT_PERMISSIONS_INSECURE");
@@ -3855,7 +3850,7 @@ describe("R169A-FIX-R5 — Cleanup after directory swap (SEC-R169A-R5-01)", () =
 
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, undefined, hook);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     expect((err as GenerationStoreError).code).toBe("PATH_TRAVERSAL_REJECTED");
@@ -4071,7 +4066,7 @@ describe("R169A-FIX-R5 — fd leak in openDirectoryNoFollow (QUAL-R169A-R5-01)",
     const ops = new FdLeakOps();
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     // The error is wrapped as STORE_LAYOUT_DURABILITY_UNKNOWN because
@@ -4132,11 +4127,107 @@ describe("R169A-FIX-R5 — fd leak in openDirectoryNoFollow (QUAL-R169A-R5-01)",
     const ops = new FdLeakOps2();
     let err: unknown;
     try {
-      writeIndexStateInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
+      writeIndexStateAtomicallyInternal(project, makeValidIndexState(project), { cacheRoot }, ops);
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(GenerationStoreError);
     // closeSync MUST have been called at least once after the fstat
     // failure — verifying no fd leak.
     expect(ops.closedFds.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── R169A-FIX-R7: Runtime API surface tests (API-R169A-R7-01) ──────────
+
+describe("R169A-FIX-R7 — Runtime API surface (API-R169A-R7-01)", () => {
+  it("writeIndexStateAtomically ignores extra ops argument at runtime", () => {
+    // Pass a fake ops as 4th arg via cast. The public function MUST
+    // ignore it and use PROD_OPS internally.
+    const fakeOps = {
+      ...PROD_OPS,
+      openSync: () => {
+        throw new Error("FAKE_OPS_MUST_NOT_BE_CALLED");
+      },
+    };
+
+    const project = "test-project";
+    const state = makeValidIndexState(project);
+    const cacheRoot = mkdtempSync(join(tmpdir(), "r169a-api-"));
+
+    try {
+      // This should succeed — fakeOps must NOT be used
+      (writeIndexStateAtomically as any)(project, state, { cacheRoot }, fakeOps);
+      // If we get here, the fake ops was NOT called
+      expect(true).toBe(true);
+    } catch (e) {
+      expect.fail(`Public function should not use injected ops: ${(e as Error).message}`);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("writeIndexStateAtomically ignores extra hook argument at runtime", () => {
+    const maliciousHook: any = {
+      afterLayoutBeforeOpen: () => {
+        throw new Error("MALICIOUS_HOOK_MUST_NOT_BE_CALLED");
+      },
+    };
+
+    const project = "test-project";
+    const state = makeValidIndexState(project);
+    const cacheRoot = mkdtempSync(join(tmpdir(), "r169a-api-"));
+
+    try {
+      (writeIndexStateAtomically as any)(project, state, { cacheRoot }, undefined, maliciousHook);
+      expect(true).toBe(true);
+    } catch (e) {
+      expect.fail(`Public function should not use injected hook: ${(e as Error).message}`);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ensureGenerationStoreLayoutDurable ignores extra ops argument at runtime", () => {
+    const fakeOps = {
+      ...PROD_OPS,
+      mkdirSync: () => {
+        throw new Error("FAKE_OPS_MUST_NOT_BE_CALLED");
+      },
+    };
+
+    const project = "test-project";
+    const cacheRoot = mkdtempSync(join(tmpdir(), "r169a-api-"));
+
+    try {
+      (ensureGenerationStoreLayoutDurable as any)(project, { cacheRoot }, fakeOps);
+      expect(true).toBe(true);
+    } catch (e) {
+      expect.fail(`Public function should not use injected ops: ${(e as Error).message}`);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("source inspection: no arguments[ or arguments.length in generation-store.ts", () => {
+    const src = readFileSync(
+      join(__dirname, "..", "..", "src", "storage", "generation-store.ts"),
+      "utf-8",
+    );
+    expect(src).not.toContain("arguments[");
+    expect(src).not.toContain("arguments.length");
+  });
+
+  it("source inspection: no 'as any' casts for API extension", () => {
+    const src = readFileSync(
+      join(__dirname, "..", "..", "src", "storage", "generation-store.ts"),
+      "utf-8",
+    );
+    // Allow "as any" in comments but not in code
+    const lines = src.split("\n");
+    for (const line of lines) {
+      if (line.trim().startsWith("//") || line.trim().startsWith("*")) continue;
+      if (line.includes("as any")) {
+        expect.fail(`Found 'as any' in production code: ${line.trim()}`);
+      }
+    }
   });
 });
