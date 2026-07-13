@@ -532,6 +532,96 @@ export interface ResolvedMissingDb {
  *     PATH_TRAVERSAL_REJECTED (the swap was detected); the warning
  *     explains that the temp file is intentionally NOT cleaned up.
  */
+// ─── R169B warning taxonomy (§10 of the R169B report) ───────────────────
+//
+// R169B-STEP1 introduces a WARNING taxonomy distinct from the ERROR
+// taxonomy. Warnings describe non-fatal anomalies that the publisher /
+// GC / reader may surface in diagnostics (sidecar `warnings` array,
+// logs, or returned metadata) WITHOUT aborting the operation. Errors
+// always raise; warnings always carry on.
+//
+// The split is necessary because R169A conflated the two: the
+// `ATOMIC_TEMP_ORPHANED` "code" is documented as a WARNING that is
+// surfacing in an error message, not as a separate thrown error. R169B
+// formalizes that pattern by giving warnings their own type and code
+// set. The R169A `ATOMIC_TEMP_ORPHANED` is kept in the ERROR taxonomy
+// for backward compatibility (existing tests assert its presence in
+// error messages); the new `GenerationStoreWarningCode` is the
+// forward-looking taxonomy that R169B+ publishers SHOULD use when
+// surfacing non-fatal anomalies as structured warnings.
+
+/**
+ * R169B-STEP1: Structured warning codes for the generation store.
+ *
+ * Warnings describe non-fatal anomalies that do NOT abort the
+ * operation but MUST be surfaced to the operator / caller. They are
+ * distinct from `GenerationStoreErrorCode` (errors always raise).
+ *
+ *   - `ATOMIC_TEMP_ORPHANED` — the atomic writer detected that the
+ *     target directory was swapped between temp-create and rename. The
+ *     temp file may be orphaned in the ORIGINAL directory and MUST NOT
+ *     be unlinked by path. The publisher surfaces this as a structured
+ *     warning (in addition to the R169A error-message warning) so the
+ *     caller can schedule a `tmp/` sweep.
+ *   - `STAGING_ALIAS_CLEANUP_DEFERRED` — a staging alias (symlink,
+ *     hardlink, or bind-mount) was detected during staging-create and
+ *     could not be cleaned up synchronously (e.g. because the alias
+ *     points to a path owned by another process). The cleanup is
+ *     deferred to the next GC pass.
+ *   - `GC_DELETE_FAILED` — a GC pass attempted to delete a stale
+ *     generation or temp file and the deletion failed (e.g. EBUSY on
+ *     Windows, EPERM on a read-only filesystem). GC is best-effort;
+ *     the failure is surfaced as a warning and the next GC pass will
+ *     retry.
+ */
+export type GenerationStoreWarningCode =
+  | "ATOMIC_TEMP_ORPHANED"
+  | "STAGING_ALIAS_CLEANUP_DEFERRED"
+  | "GC_DELETE_FAILED";
+
+/**
+ * R169B-STEP1: A structured warning record. Carried alongside a
+ * successful operation (or in the `warnings` array of a
+ * `PreparedGeneration` / `PublicationResult`) to surface non-fatal
+ * anomalies. The `message` is human-readable; the `code` is
+ * machine-readable.
+ */
+export interface GenerationStoreWarning {
+  readonly code: GenerationStoreWarningCode;
+  readonly message: string;
+}
+
+// ─── R169B error codes (§10 of the R169B report) ────────────────────────
+//
+// R169B-STEP1 introduces a forward-looking set of error codes that the
+// R169B publisher primitives (staging, validation, CAS, GC) will raise
+// as they are implemented in subsequent R169B steps. The codes are
+// added to the union NOW so that subsequent steps can throw them
+// without further changes to the type. No R169A code path raises any
+// of these yet — R169B remains FOUNDATION / INACTIVE.
+//
+// Grouping (informal — the union is a flat list, the grouping here is
+// only to aid review):
+//
+//   Staging (create / open / integrity):
+//     STAGING_CREATE_FAILED, STAGING_TARGET_INVALID, STAGING_DB_BUSY,
+//     STAGING_DB_INTEGRITY_FAILED, STAGING_DB_SCHEMA_INVALID,
+//     STAGING_DB_PROJECT_MISMATCH, STAGING_DB_STATE_INVALID,
+//     STAGING_DB_WAL_DIRTY
+//
+//   Generation (hash / promote / durability):
+//     GENERATION_HASH_FAILED, GENERATION_PROMOTION_CONFLICT,
+//     GENERATION_PROMOTION_FAILED, GENERATION_PROMOTION_DURABILITY_UNKNOWN,
+//     GENERATION_METADATA_INVALID
+//
+//   Publication (token + CAS + verify):
+//     PUBLICATION_TOKEN_INVALID, PUBLICATION_TOKEN_CONSUMED,
+//     PUBLICATION_CAS_BUSY, PUBLICATION_CAS_MISMATCH,
+//     PUBLICATION_CAS_STATE_CORRUPT, PUBLICATION_VERIFY_FAILED
+//
+//   GC (plan + safety):
+//     GC_PLAN_STALE, GC_SAFETY_REFUSAL
+
 export type GenerationStoreErrorCode =
   | "GENERATION_STORE_CONFIG_ERROR"
   | "MANIFEST_PARSE_ERROR"
@@ -561,23 +651,65 @@ export type GenerationStoreErrorCode =
   | "INDEX_STATE_UNSUPPORTED_VERSION"
   | "PATH_TRAVERSAL_REJECTED"
   | "PROJECT_KEY_INVALID"
-  | "ATOMIC_TEMP_ORPHANED";
+  | "ATOMIC_TEMP_ORPHANED"
+  // R169B-STEP1 (§10): staging-create / open / integrity codes.
+  | "STAGING_CREATE_FAILED"
+  | "STAGING_TARGET_INVALID"
+  | "STAGING_DB_BUSY"
+  | "STAGING_DB_INTEGRITY_FAILED"
+  | "STAGING_DB_SCHEMA_INVALID"
+  | "STAGING_DB_PROJECT_MISMATCH"
+  | "STAGING_DB_STATE_INVALID"
+  | "STAGING_DB_WAL_DIRTY"
+  // R169B-STEP1 (§10): generation hash / promote / durability codes.
+  | "GENERATION_HASH_FAILED"
+  | "GENERATION_PROMOTION_CONFLICT"
+  | "GENERATION_PROMOTION_FAILED"
+  | "GENERATION_PROMOTION_DURABILITY_UNKNOWN"
+  | "GENERATION_METADATA_INVALID"
+  // R169B-STEP1 (§10): publication token + CAS + verify codes.
+  | "PUBLICATION_TOKEN_INVALID"
+  | "PUBLICATION_TOKEN_CONSUMED"
+  | "PUBLICATION_CAS_BUSY"
+  | "PUBLICATION_CAS_MISMATCH"
+  | "PUBLICATION_CAS_STATE_CORRUPT"
+  | "PUBLICATION_VERIFY_FAILED"
+  // R169B-STEP1 (§10): GC plan + safety codes.
+  | "GC_PLAN_STALE"
+  | "GC_SAFETY_REFUSAL";
 
 export class GenerationStoreError extends Error {
   readonly code: GenerationStoreErrorCode;
   readonly phase: string;
   readonly project: string;
+  /**
+   * R169B-STEP1 (§10): Optional generation UUID carried by errors that
+   * are scoped to a specific generation (staging, promotion,
+   * publication, GC). R169A errors do not set this field (it defaults
+   * to `undefined`); the R169B publisher primitives set it when the
+   * error originates from a context that already has a `generationId`
+   * (e.g. a `PreparedGeneration` mid-promotion). Downstream tooling can
+   * read `err.generationId` to route the failure to the right
+   * generation's diagnostics sidecar.
+   */
+  readonly generationId?: string;
 
   constructor(
     code: GenerationStoreErrorCode,
     phase: string,
     project: string,
     message: string,
+    generationId?: string,
   ) {
-    super(`[${code}] ${phase}: ${message} (project=${project})`);
+    super(
+      generationId !== undefined
+        ? `[${code}] ${phase}: ${message} (project=${project}, generationId=${generationId})`
+        : `[${code}] ${phase}: ${message} (project=${project})`,
+    );
     this.name = "GenerationStoreError";
     this.code = code;
     this.phase = phase;
     this.project = project;
+    this.generationId = generationId;
   }
 }

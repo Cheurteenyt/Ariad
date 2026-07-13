@@ -1,5 +1,205 @@
 # Changelog — Codebase Memory V2
 
+## 0.75.0 — R169B-STEP1 (2026-07-13) Durable Generation Publisher — Step 1: Module Cycle Break + R169B Type/Warning Taxonomy + Doc Fixes
+
+**R169B remains FOUNDATION / INACTIVE.** This step does NOT activate
+any production code path. It (1) breaks the R169A module cycle between
+`generation-store.ts` and `internal/generation-store-io.ts`, (2) adds
+the R169B type and warning taxonomy to `generation-types.ts`, (3) adds
+regression tests for the module split, and (4) fixes contradictions in
+the R169A documentation. No production behavior change; the indexer and
+readers still use the legacy `<project>.db` path.
+
+### Module cycle break (§4.1 of the R169B report)
+
+The R169A module split (R169A-FIX-R8) extracted the internal I/O
+harness into `v2/src/storage/internal/generation-store-io.ts` but kept
+the path helpers, validators, and trust-root checks in the public
+facade `v2/src/storage/generation-store.ts`. The internal module then
+imported those symbols back from the public facade — creating a module
+cycle:
+
+```
+generation-store.ts -> internal/generation-store-io.ts (PROD_OPS, *Internal)
+internal/generation-store-io.ts -> generation-store.ts (paths, validators, trust-root checks)
+```
+
+R169B-STEP1 breaks the cycle by extracting the shared helpers into two
+new leaf modules:
+
+- **`v2/src/storage/generation-paths.ts`** (NEW) — pure path helpers
+  (`getCacheRoot`, `cbmCacheDir`, `generationStoreRoot`,
+  `projectStorageKey`, `projectStoreDir`, `generationsDir`, `tmpDir`,
+  `activeManifestPath`, `indexStatePath`, `legacyCodeDbPath`,
+  `isLexicallyInside`, `isPathInside`) plus the layout constants
+  (`CBM_CACHE_SUBDIR`, `PROJECTS_SUBDIR`, `MANIFEST_FILENAME`,
+  `INDEX_STATE_FILENAME`, `GENERATIONS_SUBDIR`, `TMP_SUBDIR`) and the
+  `GenerationStoreOptions` interface. Depends only on
+  `./generation-types.ts` and the Node standard library.
+- **`v2/src/storage/generation-validation.ts`** (NEW) — validators
+  (`validateGenerationManifest`, `validateIndexAttemptState`,
+  `parseGenerationManifest`), path-safety checks
+  (`assertPathInsideNoSymlinks`, `assertNotSymlink`,
+  `assertTrustedRootNoSymlinks`, `assertGenerationStoreRootTrusted`,
+  `assertLayoutDirPermissions` — moved here from the internal I/O
+  module), size/length bounds (`MAX_GENERATION_MANIFEST_BYTES`, etc.),
+  and the `O_NOFOLLOW` / `O_DIRECTORY` platform flags (consolidated
+  here from the public facade and internal module). Depends on
+  `./generation-types.ts` and `./generation-paths.ts`.
+
+New acyclic dependency direction:
+
+```
+types -> paths/validation -> internal I/O -> public facades
+```
+
+The internal I/O module no longer imports from the public facade. The
+public facade re-exports the path helpers, validators, and trust-root
+checks for backward compatibility — every R169A export from
+`generation-store.ts` is still present (verified by the new regression
+tests in `v2/tests/storage/r169b-module-split.test.ts`).
+
+### R169B type and warning taxonomy (§10 of the R169B report)
+
+`v2/src/storage/generation-types.ts` now defines:
+
+- `GenerationStoreWarningCode` type: `"ATOMIC_TEMP_ORPHANED" |
+  "STAGING_ALIAS_CLEANUP_DEFERRED" | "GC_DELETE_FAILED"`.
+- `GenerationStoreWarning` interface: `{ code, message }` — non-fatal
+  anomalies surfaced alongside a successful operation.
+- 21 new R169B error codes added to `GenerationStoreErrorCode`:
+  staging (8), generation (5), publication (6), GC (2). No R169A code
+  path raises any of these yet; they are added now so subsequent R169B
+  steps can throw them without further changes to the type.
+- `GenerationStoreError` now optionally carries a `generationId?: string`
+  (R169A errors do not set it; R169B publisher primitives will set it
+  for errors scoped to a specific generation).
+
+### Regression tests for the module split
+
+`v2/tests/storage/r169b-module-split.test.ts` (NEW, 33 tests) verifies:
+
+- No circular imports: static analysis builds the import graph and
+  runs DFS cycle detection; a `node --input-type=module` smoke test
+  loads all five modules and verifies all expected exports are defined.
+- All R169A exports still work from `generation-store.ts` (function
+  exports, const exports, internal symbols still NOT exported).
+- `.d.ts` surface unchanged for R169A public API (public facade
+  functions, const exports, types are present; internal symbols are
+  NOT declared; `writeIndexStateAtomically` has EXACTLY 3 parameters).
+- The new R169B types and warning taxonomy are present in
+  `generation-types.ts`.
+- Module-split source inspection: the public facade re-exports paths
+  and validators from the new leaf modules; the internal I/O module
+  imports from paths and validation (NOT from the public facade); the
+  leaf modules do not import from the internal I/O module or the
+  public facade.
+
+### Documentation fixes (§3 of the R169B report)
+
+Fixed contradictions in the R169A documentation across four files:
+
+- `docs/ATOMIC_GENERATION_PUBLICATION.md`:
+  - Status phrasing "implemented candidate — inactive, pending review"
+    replaced with "R169A is merged and remains FOUNDATION / INACTIVE.
+    No production path uses the generation store."
+  - Public API description corrected:
+    `writeIndexStateAtomically(project, state, options?)` is the ONLY
+    public writer; `writeProjectJsonAtomically` is NOT public (it
+    lives in the internal I/O module as
+    `writeProjectJsonAtomicallyInternal`); `writeGenerationManifestAtomically`
+    is internal (R169A-FIX-R4 DATA-R169A-R4-02).
+  - Low-level writer location corrected: it lives in
+    `v2/src/storage/internal/generation-store-io.ts`, receives a
+    `Buffer` (not a JSON-serializable value), and is not exported.
+  - Error code `LEGACY_SOURCE_INVALID` (the `LEGACY_SOURCE_OPEN_FAILED`
+    name is retained only as a historical note; active references to
+    the old name are removed).
+  - Symlink error codes corrected: `MANIFEST_SYMLINK_REJECTED` (for
+    `active-generation.json`), `PROJECT_STATE_SYMLINK_REJECTED` (for
+    `index-state.json`), `GENERATION_TARGET_SYMLINK_REJECTED` (for
+    the generation DB file).
+  - Hardcoded error code counts removed — replaced with "See
+    `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`,
+    the source of truth."
+  - C05 crash matrix row corrected: "GC may remove or quarantine the
+    stale temp artifact. GC never promotes staging content — promotion
+    is a separate publication act."
+  - New §12.1 documents cross-directory promotion durability (fsync
+    destination, fsync source, result when either fails).
+- `docs/V2_ARCHITECTURE.md`:
+  - Status header and §15 status block corrected (same phrasing as
+    above).
+  - §15.5.3 corrected: `writeProjectJsonAtomically` is INTERNAL
+    (renamed to `writeProjectJsonAtomicallyInternal` in R169A-FIX-R3);
+    `writeJsonAtomically` is also internal; the ONLY public writer is
+    `writeIndexStateAtomically(project, state, options?)`.
+  - §15.7 legacy migration table: `LEGACY_SOURCE_OPEN_FAILED` replaced
+    with `LEGACY_SOURCE_INVALID` (old name kept as historical note).
+  - §15.8 failure taxonomy: hardcoded "24 codes" count replaced with
+    "See `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`,
+    the source of truth."
+  - §14 Limitations: Node version corrected to `>=20.0.0` (from
+    `v2/package.json`); CI uses Node 20; no Node 22/24 matrix is
+    certified.
+  - §15.14 roadmap table: R169A status updated.
+- `docs/V2_CURRENT_STATE.md`:
+  - Status header and §R169A section header corrected.
+  - Authoritative sources table: Node version corrected to
+    `>=20.0.0`; "Tested on Node 22/24" corrected to "Tested on Node 20".
+  - `PKG-CARRY-01` is now CLOSED (lockfiles committed, Docker Smoke
+    closed, Package Smoke closed).
+  - Hardcoded "20 codes" count replaced with reference to
+    `GenerationStoreErrorCode` source of truth.
+  - `LEGACY_SOURCE_OPEN_FAILED` in §What R169A delivers replaced with
+    `LEGACY_SOURCE_INVALID` (old name kept as historical note).
+  - DATA-CARRY-01 blocker row and roadmap R169A entry updated.
+- `v2/CHANGELOG.md` (this entry):
+  - Adds the R169B-STEP1 entry at the top.
+  - The existing R169A entry (below) is unchanged — it is a historical
+    record of the R169A merge. Active references in it to
+    `LEGACY_SOURCE_OPEN_FAILED` are part of the historical narrative
+    (they describe the R169A-FIX-R2 rename) and are retained.
+
+### What R169B-STEP1 does NOT deliver
+
+- The R169B publisher primitives themselves (staging, validation, CAS,
+  GC) — those land in subsequent R169B steps.
+- Indexer integration — R169C scope.
+- Reader cutover — R169D scope.
+- Crash matrix replay, performance verification, activation gating —
+  R169E scope.
+- Multi-host fencing / lease — R170 scope.
+
+`DATA-CARRY-01` (P1) remains **OPEN until R169E**.
+
+### No production behavior change
+
+- The indexer still writes to the legacy `<project>.db` path.
+- Readers still open the legacy DB directly.
+- No production code imports `generation-store.js` at startup.
+- The new modules (`generation-paths.ts`, `generation-validation.ts`)
+  are only imported by `generation-store.ts` and
+  `internal/generation-store-io.ts`, which are themselves only
+  imported by tests.
+- No `fsync`, no `mkdir`, no `lstat` is performed on the hot path.
+
+### Version
+
+- Package: 0.75.0 (unchanged — R169B-STEP1 is a non-semantic refactor
+  + type addition + doc fix; no public API contract change).
+- Extractor semantics: 8 (unchanged).
+- Discovery policy: 2 (unchanged).
+- Manifest format: 1 (unchanged).
+
+### Test count
+
+- Baseline: 1583/1583 tests, TypeScript clean, benchmark clean.
+- After R169B-STEP1: 1618/1618 tests (35 new tests: 33 in
+  `r169b-module-split.test.ts`, 2 new source-inspection tests in
+  `r169a-generation-store.test.ts` for the new paths/validation modules).
+
+
 ## 0.75.0 — R169A (2026-07-13) Atomic Generation Publication Foundation
 
 **Generation store foundation: path helpers, manifest V1 types, resolver,

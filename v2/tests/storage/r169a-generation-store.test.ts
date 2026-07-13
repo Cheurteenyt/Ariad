@@ -3731,7 +3731,19 @@ describe("R169A-FIX-R8 — internal symbols NOT exported from public module (API
     expect(src).toMatch(/\bPROD_OPS\b/);
     expect(src).toMatch(/\bwriteIndexStateAtomicallyInternal\b/);
     expect(src).toMatch(/\bensureGenerationStoreLayoutDurableInternal\b/);
-    expect(src).toMatch(/\bassertLayoutDirPermissions\b/);
+    // R169B-STEP1: The public facade MUST import paths and validation
+    // symbols from the new leaf modules (not from the internal module
+    // or via re-export from the public facade).
+    expect(src).toMatch(/from\s+["']\.\/generation-paths\.js["']/);
+    expect(src).toMatch(/from\s+["']\.\/generation-validation\.js["']/);
+    // R169B-STEP1: `assertLayoutDirPermissions` was MOVED to
+    // `generation-validation.ts`. It is an INTERNAL symbol (was internal
+    // in R169A, remains internal in R169B-STEP1). The public facade
+    // does NOT import or re-export it; the name MUST NOT appear in the
+    // production code of generation-store.ts (only in comments). The
+    // `INTERNAL_SYMBOLS` list still includes it, and the runtime +
+    // source-inspection tests below verify it is not exported.
+    expect(src).not.toMatch(/^\s*(?:export|import)\b[^\n]*\bassertLayoutDirPermissions\b/m);
   });
 
   it("source inspection: internal module exports all internal symbols", () => {
@@ -3752,7 +3764,75 @@ describe("R169A-FIX-R8 — internal symbols NOT exported from public module (API
     expect(src).toMatch(/export\s+function\s+prepareGenerationManifestForWrite\b/);
     expect(src).toMatch(/export\s+function\s+prepareIndexStateForWrite\b/);
     expect(src).toMatch(/export\s+function\s+openDirectoryNoFollow\b/);
+    // R169B-STEP1: `assertLayoutDirPermissions` was MOVED to
+    // `generation-validation.ts` to break the module cycle. The internal
+    // module IMPORTS it from validation (no longer defines it locally).
+    // Assert it no longer has `export function assertLayoutDirPermissions`.
+    expect(src).not.toMatch(/export\s+function\s+assertLayoutDirPermissions\b/);
+    // The internal module MUST import `assertLayoutDirPermissions` from
+    // the validation module.
+    expect(src).toMatch(/from\s+["']\.\.\/generation-validation\.js["']/);
+    expect(src).toMatch(/\bassertLayoutDirPermissions\b/);
+    // The internal module MUST NOT import from the public facade
+    // (`../generation-store.js`). The cycle is broken.
+    expect(src).not.toMatch(/from\s+["']\.\.\/generation-store\.js["']/);
+  });
+
+  it("source inspection: validation module exports the symbols moved out of the internal module (R169B-STEP1)", () => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const src = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "storage", "generation-validation.ts"),
+      "utf-8",
+    );
+    // R169B-STEP1: `assertLayoutDirPermissions` was MOVED here from the
+    // internal I/O module. The validation module MUST export it.
     expect(src).toMatch(/export\s+function\s+assertLayoutDirPermissions\b/);
+    // The validation module MUST also export the other validators and
+    // trust-root checks that the internal module / public facade depend on.
+    expect(src).toMatch(/export\s+function\s+validateGenerationManifest\b/);
+    expect(src).toMatch(/export\s+function\s+validateIndexAttemptState\b/);
+    expect(src).toMatch(/export\s+function\s+parseGenerationManifest\b/);
+    expect(src).toMatch(/export\s+function\s+assertPathInsideNoSymlinks\b/);
+    expect(src).toMatch(/export\s+function\s+assertNotSymlink\b/);
+    expect(src).toMatch(/export\s+function\s+assertTrustedRootNoSymlinks\b/);
+    expect(src).toMatch(/export\s+function\s+assertGenerationStoreRootTrusted\b/);
+    // The validation module MUST export O_NOFOLLOW and O_DIRECTORY
+    // (consolidated here from the public facade and internal module).
+    expect(src).toMatch(/export\s+const\s+O_NOFOLLOW\b/);
+    expect(src).toMatch(/export\s+const\s+O_DIRECTORY\b/);
+    // The validation module MUST NOT import from the internal I/O module
+    // or the public facade — that would re-create the cycle.
+    expect(src).not.toMatch(/from\s+["']\.\.\/internal\/generation-store-io\.js["']/);
+    expect(src).not.toMatch(/from\s+["']\.\/generation-store\.js["']/);
+    expect(src).not.toMatch(/from\s+["']\.\.\/generation-store\.js["']/);
+  });
+
+  it("source inspection: paths module exports all path helpers (R169B-STEP1)", () => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const src = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "storage", "generation-paths.ts"),
+      "utf-8",
+    );
+    // The paths module MUST export each path helper.
+    expect(src).toMatch(/export\s+function\s+getCacheRoot\b/);
+    expect(src).toMatch(/export\s+function\s+cbmCacheDir\b/);
+    expect(src).toMatch(/export\s+function\s+generationStoreRoot\b/);
+    expect(src).toMatch(/export\s+function\s+projectStorageKey\b/);
+    expect(src).toMatch(/export\s+function\s+projectStoreDir\b/);
+    expect(src).toMatch(/export\s+function\s+generationsDir\b/);
+    expect(src).toMatch(/export\s+function\s+tmpDir\b/);
+    expect(src).toMatch(/export\s+function\s+activeManifestPath\b/);
+    expect(src).toMatch(/export\s+function\s+indexStatePath\b/);
+    expect(src).toMatch(/export\s+function\s+legacyCodeDbPath\b/);
+    expect(src).toMatch(/export\s+function\s+isLexicallyInside\b/);
+    expect(src).toMatch(/export\s+const\s+isPathInside\b/);
+    // The paths module MUST NOT import from validation, the internal I/O
+    // module, or the public facade — it is a leaf module.
+    expect(src).not.toMatch(/from\s+["']\.\/generation-validation\.js["']/);
+    expect(src).not.toMatch(/from\s+["']\.\/internal\/generation-store-io\.js["']/);
+    expect(src).not.toMatch(/from\s+["']\.\/generation-store\.js["']/);
   });
 
   it("generated .d.ts inspection: dist/storage/generation-store.d.ts does NOT contain internal symbols", () => {
