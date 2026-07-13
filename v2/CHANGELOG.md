@@ -1,5 +1,709 @@
 # Changelog — Codebase Memory V2
 
+## 0.75.0 — R169A (2026-07-13) Atomic Generation Publication Foundation
+
+**Generation store foundation: path helpers, manifest V1 types, resolver,
+atomic JSON writer. Feature inactive — no production behavior change.**
+
+### TEST-R169A-CI-01 — Umask-independent permission fixtures
+
+The first GitHub PR CI run exposed two permission tests whose fixtures
+assumed that `mkdirSync(..., { mode })` applied the requested mode
+unchanged. On POSIX systems, creation modes are filtered by the process
+umask, so requested `0777` and `0770` could become accepted compatibility
+modes such as `0755` and `0750`.
+
+The fixtures now create the directory, apply the exact intended mode with
+`chmodSync`, and assert the effective mode before invoking the generation
+store validation.
+
+No production permission policy, runtime behavior, schema, package
+version, semantics version, discovery policy, or manifest format changed.
+
+R169A lands the **non-active foundation** for atomic generation
+publication. The foundation is an implemented candidate — inactive,
+pending review — and tested, but no production code path calls it. The
+indexer still writes to the legacy `<project>.db` path; readers still
+open the legacy DB directly. `DATA-CARRY-01` (P1) remains **OPEN until
+R169E** — after the crash matrix (C01–C20), concurrency analysis,
+performance verification, and activation gating have all passed. R169B
+and R169C are necessary preconditions, not sufficient. Activation is
+staged across R169B–R169E per the validated roadmap; multi-host fencing
+is R170.
+
+### Foundation code (implemented candidate, tested, inert — pending review)
+
+- **`v2/src/storage/generation-store.ts`** — path helpers
+  (`projectStorageKey` = SHA-256 of project name, `projectStoreDir`,
+  `generationsDir`, `tmpDir`, `activeManifestPath`, `indexStatePath`,
+  `legacyCodeDbPath`), manifest parser and strict validator
+  (`validateGenerationManifest`, `parseGenerationManifest`), fail-closed
+  read-only resolver (`resolveActiveCodeDb`) with component-by-component
+  `lstat` symlink chain detection and `realpath` containment, atomic
+  JSON writer (`writeJsonAtomically`: serialize-before-write →
+  `fsync file → rename → fsync dir`, with directory-fsync failure
+  raising `ATOMIC_DURABILITY_UNKNOWN` instead of silent success),
+  `listProjectStoreKeys` helper (filtered to `^[0-9a-f]{64}$`,
+  lexicographically sorted, fail-closed on `EACCES`/`EIO`/`ENOTDIR`).
+- **`v2/src/storage/generation-types.ts`** — manifest V1 types
+  (`GenerationManifestV1`, `MANIFEST_V1_KEYS`), `IndexAttemptStateV1`
+  sidecar type, `ResolvedCodeDb` discriminated union
+  (`generation | legacy | missing`), `GenerationStoreError` with
+  structured `GenerationStoreErrorCode` taxonomy (20 codes — 15
+  original plus 5 added by the audit fix: `MANIFEST_TARGET_NOT_REGULAR`,
+  `MANIFEST_DBFILE_NOT_CANONICAL`, `ATOMIC_DURABILITY_UNKNOWN`,
+  `ATOMIC_SERIALIZATION_FAILED`, `ATOMIC_SHORT_WRITE`).
+- **`v2/tests/storage/r169a-generation-store.test.ts`** — full test
+  matrix: path safety (normal, Unicode, spaces, traversal, absolute,
+  long, deterministic), manifest valid (V1 exact, zero counts, Unicode,
+  sha lowercase, timestamp timezone, calendar-valid dates including
+  leap years, safe integers up to `MAX_SAFE_INTEGER`), manifest invalid
+  (null, array, missing key, extra key, future version, negative
+  version, project mismatch, invalid UUID, non-canonical dbFile,
+  dbFile with `..`, dbFile with backslash, invalid timestamp including
+  calendar-invalid dates, non-safe-integer counts, float count,
+  negative count, Infinity, NaN, invalid sha, multiline field),
+  resolver fail-closed (valid → generation; no manifest + no legacy →
+  missing; no manifest + legacy → legacy; invalid manifest → fail
+  closed; target missing → fail closed; project mismatch → fail
+  closed; symlink manifest → rejected; symlink target → rejected;
+  manifest parent symlink → rejected; `generations/` parent symlink →
+  rejected; target directory → `MANIFEST_TARGET_NOT_REGULAR`; legacy
+  DB directory → `LEGACY_SOURCE_INVALID` (R169A-FIX-R2: renamed from `LEGACY_SOURCE_OPEN_FAILED`); legacy DB symlink →
+  `LEGACY_SOURCE_INVALID`), atomic writer 10-case fault-injection
+  matrix (serialize fail → no temp; exclusive-open fail; short-write
+  recoverable; mid-payload write fail; temp fsync fail; close fail;
+  rename fail; directory open fail → `ATOMIC_DURABILITY_UNKNOWN`;
+  directory fsync fail → `ATOMIC_DURABILITY_UNKNOWN`; success),
+  no production behavior change (defaultCodeDbPath still importable,
+  legacyCodeDbPath == defaultCodeDbPath,
+  CURRENT_GENERATION_MANIFEST_VERSION == 1, no writes to real HOME
+  cache — back-compat verified with injected cacheRoot), source
+  inspection (Node.js directory walk, no `child_process` spawn) that
+  no new `defaultCodeDbPath` consumers have appeared.
+
+### R169A-FIX-R2 — GPT 5.6 pass 2 audit fixes
+
+The GPT 5.6 pass 2 audit identified eight findings against the pass 1
+fix. All eight are addressed in this re-fix; no production behavior
+changes (the generation store remains inert — no production code path
+calls it). Version remains `0.75.0`; semantics=8, discovery=2,
+manifest=1 unchanged.
+
+**SEC-R169A-R2-01 — Trust root symlink bypass (P1).**
+`assertPathInsideNoSymlinks(root, candidate)` only walked components
+UNDER `root`; it never `lstat`'d `root` itself. If `projects/` (or any
+of its parents) was a symlink, both `realpath(root)` and
+`realpath(candidate)` followed the same symlink and the containment
+check passed. New `assertTrustedRootNoSymlinks(cacheRoot, project,
+phase)` lstat's `cacheRoot` itself and walks `codebase-memory-mcp`,
+`projects`, `<project-key>` — ANY symlink in this chain raises
+`PATH_TRAVERSAL_REJECTED`. Only `ENOENT` is tolerated; `EACCES` /
+`EIO` / `ENOTDIR` / `ELOOP` fail closed. The resolver AND the writer
+call this BEFORE checking the manifest / legacy / target.
+
+**SEC-R169A-R2-02 — Atomic writer path safety (P1).**
+`writeJsonAtomically(targetPath, value)` accepted an arbitrary
+`targetPath` with no containment check, no symlink rejection, and did
+`mkdir -p` which could create directories via parent symlinks. New
+public wrapper `writeProjectJsonAtomically(project, target, value,
+options?, ops?)` derives the target path from `project` + `target`
+type (`"manifest"` or `"index-state"`), validates the trust root,
+validates the target via `assertPathInsideNoSymlinks`, rejects
+symlinked targets, ensures layout durability (DUR-R169A-R2-01), and
+delegates to the internal `writeJsonAtomically`. Temp file mode
+`0600`, temp directory mode `0700`. The internal `writeJsonAtomically`
+is no longer exported.
+
+**DUR-R169A-R2-01 — Directory creation durability (P1).**
+`mkdirSync(dir, { recursive: true })` + `fsync(dir)` did NOT
+guarantee the directory ENTRY in the parent survived a crash if the
+directory was just created. New `ensureGenerationStoreLayoutDurable`
+walks the FULL layout chain (`cbm` → `projects` → `projectStore` →
+`generations`, `tmp`); for each directory: `mkdir 0700` (skip if
+exists), `fsync` the directory, `fsync` the PARENT if newly created.
+New error codes: `STORE_LAYOUT_CREATE_FAILED` (mkdir fault) and
+`STORE_LAYOUT_DURABILITY_UNKNOWN` (dir or parent fsync fault).
+
+**VALID-R169A-R2-01 — Manifest hardening (P2).**
+Four hardenings:
+
+- `MAX_GENERATION_MANIFEST_BYTES = 64 * 1024`. Before reading,
+  `parseGenerationManifest` stats the file; if `size > max`, raises
+  `MANIFEST_TOO_LARGE` and does NOT read the file into memory.
+- `rootFingerprint` validation: `trim().length > 0`, max 1024 chars,
+  no C0 control chars (charCode 0–31, including NUL and tab).
+- `project` field validation: same safe-string rules as
+  `rootFingerprint`, applied BEFORE the equality check.
+- Immutable key authority: `MANIFEST_V1_KEYS` is now a readonly tuple
+  (`as const`), NOT a mutable `Set`. The validator uses a private
+  `MANIFEST_V1_KEY_SET` (module-scoped). New public helper
+  `isManifestV1Key(key)`.
+
+**API-R169A-R2-01 — Legacy contract rename (P2).**
+`LEGACY_SOURCE_OPEN_FAILED` renamed to `LEGACY_SOURCE_INVALID`. R169A
+validates path + regular-file identity only; actual SQLite open
+validation occurs in R169D reader cutover. The old name implied an
+open was attempted, which was misleading.
+
+**DOC-R169A-R2-01 — R169B/R169C boundary (P2).**
+Documentation now clarifies: R169B implements independent publisher
+primitives and test harnesses with NO production indexer caller; R169C
+wires those primitives into `indexProjectWasm` and outcome paths.
+Updated in `docs/ATOMIC_GENERATION_PUBLICATION.md` and
+`docs/V2_ARCHITECTURE.md`.
+
+**QUAL-R169A-R2-01 — Structured errors (P3).**
+All filesystem operations in the generation store are now wrapped in
+try/catch that produces `GenerationStoreError` with the project name.
+Specifically: `mkdirSync`, `statSync`/`lstatSync`, `readFileSync`,
+`readdirSync` (the layout helper, the resolver, the manifest parser,
+and the listing helper all wrap their fs calls).
+
+**TEST-R169A-R2-01 — Test coverage (P1/P2).**
++43 new tests covering all eight findings:
+
+- Trust root symlinks (cacheRoot, cbmCacheDir, projects, project-key)
+- Writer path safety (parent symlink, target outside root, target
+  symlink, file mode 0600, directory mode 0700, no file outside trust
+  root)
+- Layout durability (mkdir fault, dir fsync fault, parent fsync fault,
+  idempotent, success)
+- Manifest oversize (> 64 KiB → MANIFEST_TOO_LARGE)
+- rootFingerprint whitespace / NUL / tab / max length
+- Immutable key set regression (mutating MANIFEST_V1_KEYS does not
+  affect validation)
+- Exact error codes (regex match, not just instanceof)
+- No writes to real HOME cache (writeProjectJsonAtomically and
+  ensureGenerationStoreLayoutDurable with injected cacheRoot)
+
+Total tests: 1463 (+43 from pass 1's 1420).
+
+### R169A-FIX-R3 — GPT 5.6 pass 3 audit fixes
+
+The GPT 5.6 pass 3 audit identified ten findings against the pass 2
+fix. All ten are addressed in this re-fix; no production behavior
+changes (the generation store remains inert — no production code path
+calls it). Version remains `0.75.0`; semantics=8, discovery=2,
+manifest=1 unchanged.
+
+**API-R169A-R3-01 — Manifest writer must validate before I/O (P1).**
+`writeProjectJsonAtomically` is now internal (renamed to
+`writeProjectJsonAtomicallyInternal`; not exported). The public writers
+are typed, validating wrappers:
+- `writeGenerationManifestAtomically(project, manifest, options?, ops?, hook?)` —
+  calls `validateGenerationManifest(manifest, project)` BEFORE any
+  filesystem I/O. If validation fails, NO temp / layout / target is
+  created.
+- `writeIndexStateAtomically(project, state, options?, ops?, hook?)` —
+  calls `validateIndexAttemptState(state, project)` BEFORE any I/O.
+Tests that previously wrote `{ version: 1 }` as a manifest now write a
+valid `GenerationManifestV1` via `makeValidManifest()`; tests that
+wrote `{ v: 1 }` as index-state now write a valid `IndexAttemptStateV1`
+via `makeValidIndexState()`. The serialize-fail test uses
+`TestOps.failAtSerialize` (since the typed wrapper validates BEFORE
+I/O, `undefined` can no longer reach the serializer).
+
+**API-R169A-R3-02 — IndexAttemptState contract alignment (P1/P2).**
+`IndexRecoveryAction` aligned with the existing indexer contract:
+`retry_incremental` and `fix_filesystem` (was `incremental_retry`).
+Added `manifest_repair` and `legacy_migration`. New structured
+`IndexAttemptStaleReasonV1` interface (matches the indexer's existing
+`IndexResult.staleReason` shape): `{ code, message, paths, totalPaths?,
+pathsTruncated? }`. `IndexAttemptStateV1.staleReason` is now
+`IndexAttemptStaleReasonV1 | null` (was `string | null`).
+`INDEX_STATE_V1_KEYS` exported as `Object.freeze([...]) as const`.
+New `validateIndexAttemptState(value, expectedProject)` with exact key
+set, formatVersion, project equality, UUID validation, ISO-8601
+timestamp validation, outcome + recovery enum checks, coherence rules
+(SUCCESS / SUCCESS_WITH_WARNINGS / FAILED / STALE), structured
+staleReason validation, safe-integer checks, no C0 control chars,
+string length bounds. New error codes: `INDEX_STATE_SCHEMA_ERROR`,
+`INDEX_STATE_PROJECT_MISMATCH`, `INDEX_STATE_UNSUPPORTED_VERSION`.
+
+**SEC-R169A-R3-01 — Race symlink in writer (P1).** The internal writer
+no longer calls `mkdirSync` — the parent must already exist (created by
+`ensureGenerationStoreLayoutDurable`). A concurrent process could
+replace a directory with a symlink between validation and mkdir, and
+`mkdir -p` would silently follow the symlink. Immediately before
+`openSync(tmpPath, "wx", 0o600)`, the writer re-runs
+`assertTrustedRootNoSymlinks` + `assertPathInsideNoSymlinks` so a
+symlink race between layout and temp-open is rejected. New
+`WriterTestHook.afterLayoutBeforeOpen` lets tests inject the race.
+
+**SEC-R169A-R3-02 — EEXIST accepted without revalidation (P1).** In
+`ensureGenerationStoreLayoutDurable`, EEXIST from mkdir is no longer
+silently accepted. On EEXIST: `lstatSync(dirPath)` — reject if symlink,
+reject if not directory (`STORE_LAYOUT_CREATE_FAILED`); re-run
+`assertTrustedRootNoSymlinks` and `assertPathInsideNoSymlinks`; check
+permissions (mode & 0o077 !== 0 → `STORE_LAYOUT_PERMISSIONS_INSECURE`).
+When `O_DIRECTORY | O_NOFOLLOW` are available (Linux, macOS), the
+layout dir is opened with those flags for fsync.
+
+**SEC-R169A-R3-03 — Manifest stat/open TOCTOU (P1/P2).**
+`parseGenerationManifest` no longer does `statSync(path)` then
+`openSync(path, "r")` (TOCTOU window where a symlink can be swapped
+between the two calls). It opens with `O_RDONLY | O_NOFOLLOW` (when
+available) and `fstatSync`s the SAME fd. Fallback (no `O_NOFOLLOW`):
+`lstatSync → openSync → fstatSync → compare dev+ino` between lstat and
+fstat; mismatch → `MANIFEST_SYMLINK_REJECTED`.
+
+**OPS-R169A-R3-01 — listProjectStoreKeys trust root (P2).**
+`listProjectStoreKeys()` validates the trust root (cacheRoot → cbm →
+projects) BEFORE `readdirSync`. If `projects/` (or any parent) is a
+symlink → `PATH_TRAVERSAL_REJECTED`. New helper
+`assertGenerationStoreRootTrusted(cacheRoot, phase)` validates the
+chain WITHOUT a specific project key.
+
+**SEC-R169A-R3-04 — Existing directory permissions (P2).** In
+`ensureGenerationStoreLayoutDurable`, existing directories must satisfy
+`mode & 0o077 === 0` (no group/other permissions). Failure →
+`STORE_LAYOUT_PERMISSIONS_INSECURE` (new error code). On POSIX, the
+directory's uid is best-effort checked against `process.getuid()`.
+
+**VALID-R169A-R3-01 — Key authority mutability (P2).** `MANIFEST_V1_KEYS`
+is now wrapped with `Object.freeze` so consumers cannot `.push()` /
+`.splice()` to add keys at runtime. `Object.isFrozen(MANIFEST_V1_KEYS)`
+returns `true`. The private `MANIFEST_V1_KEY_SET` is unchanged. Dead
+placeholder code in the manifest validator (the
+`missingKeys = actualKeys.filter((k) => !isManifestV1Key(k) ? false : false)`
+line that always returned `[]`) is removed.
+
+**QUAL-R169A-R3-01 — Runtime target validation + error codes (P3).**
+`writeProjectJsonAtomicallyInternal` validates the `target` parameter
+at runtime (must be `"manifest"` or `"index-state"`; else
+`GENERATION_STORE_CONFIG_ERROR`). Symlink codes are now per-target:
+`MANIFEST_SYMLINK_REJECTED` for `active-generation.json`,
+`PROJECT_STATE_SYMLINK_REJECTED` (new code) for `index-state.json`,
+`GENERATION_TARGET_SYMLINK_REJECTED` for the generation DB file.
+
+**DOC-R169A-R3-01 — Documentation contradictions (P2).** Fixed in
+`docs/ATOMIC_GENERATION_PUBLICATION.md` and `docs/V2_ARCHITECTURE.md`:
+- "When R169B activates the writer" → "When R169C integrates the R169B
+  publisher primitives" (R169B implements primitives with NO production
+  caller; R169C wires them in).
+- "legacy DB cannot be opened" → "legacy source identity invalid
+  (path/symlink/regular-file check only; SQLite open validation
+  deferred to R169D)".
+- "GC never deletes a DB opened by a reader because the OS holds the
+  handle" → "GC retains generations by policy/pinning, not by OS handle
+  — POSIX allows unlink of open files".
+- R170 fencing: "Fencing token is required for publication
+  authorization. The token may live in a sidecar CAS/lease state, not
+  necessarily in the manifest V1 content. The exact location will be
+  decided in R170."
+
+**TEST-R169A-R3-01 — Test coverage (P1/P2/P3).** +55 new tests
+covering all 10 findings:
+
+- `validateIndexAttemptState` valid matrix (9 tests: V1 exact, null
+  activeGenerationId, all outcomes, all recoveries, structured
+  staleReason, empty paths, optional fields)
+- `validateIndexAttemptState` invalid matrix (20 tests: null, array,
+  missing key, extra key, future version, project mismatch, invalid
+  UUID, invalid timestamp, invalid outcome, invalid recovery (old
+  `incremental_retry` name), coherence violations for all 4 outcomes,
+  staleReason extra/missing keys, non-string paths, C0 control chars)
+- Typed writer validation-before-I/O (2 tests: invalid manifest and
+  invalid index-state both rejected before any layout / temp / target)
+- EEXIST revalidation matrix (7 tests: symlink, regular file, 0777,
+  0750, 0700 accepted, normal path, EEXIST race with statOverrideOnce)
+- Manifest TOCTOU (4 tests: regular file, symlink, directory, ENOENT)
+- listProjectStoreKeys root trust (3 tests: symlinked cacheRoot,
+  symlinked projects dir, clean chain)
+- Race symlink injection (2 tests: project-key dir and projects dir
+  replaced with symlink between layout and temp open via
+  WriterTestHook)
+- Frozen keys (3 tests: `Object.isFrozen(MANIFEST_V1_KEYS)`,
+  `Object.isFrozen(INDEX_STATE_V1_KEYS)`, push/splice throw in strict
+  mode)
+- Per-target symlink codes (1 test: `PROJECT_STATE_SYMLINK_REJECTED`
+  for index-state.json)
+- AtomicFileOps interface additions: `fstatSync`, `serializeJson`,
+  `statOverrideOnce`, numeric flags in `openSync`, `failAtSerialize`.
+
+Total tests: 1518 (+55 from pass 2's 1463).
+
+### R169A-FIX-R5 — GPT 5.6 pass 5 audit fixes (FINAL pass)
+
+The GPT 5.6 pass 5 audit identified eight findings against the pass 4
+fix. All eight are addressed in this FINAL re-fix; no production
+behavior changes (the generation store remains inert — no production
+code path calls it). Version remains `0.75.0`; semantics=8,
+discovery=2, manifest=1 unchanged. This is the FINAL pass — after
+this, the PR is opened.
+
+**API-R169A-R5-01 — Remove `__test__` export (P1).** The `__test__`
+export made the manifest writer accessible to production code. It is
+REMOVED entirely. The manifest writer
+`writeGenerationManifestAtomically` and the `prepare*ForWrite` helpers
+are NOT exported. A new test-only fixture file
+`v2/tests/helpers/r169-generation-fixtures.ts` exports:
+- `writeManifestFixture(cacheRoot, project, manifest)` — writes a
+  manifest via `node:fs.writeFileSync` directly (NOT the atomic
+  writer). Used by tests that need a manifest on disk for the
+  resolver to read.
+- `makeValidManifest(project, overrides?)` — builds a valid
+  `GenerationManifestV1` for tests.
+- `makeValidIndexState(project, overrides?)` — builds a valid
+  `IndexAttemptStateV1` for tests.
+- `writeIndexStateFixture`, `writeGenerationDbFixture`,
+  `writeLegacyDbFixture` — additional writeFileSync-based fixtures.
+These helpers are NOT compiled with the package (the `tests/`
+directory is excluded from the build). Atomic writer mechanic tests
+(fault injection, race injection) use `writeIndexStateAtomically`
+(the only public writer) which exercises the same internal writer
+code path. A source-inspection test verifies `__test__` and
+`writeGenerationManifestAtomically` are NOT exported.
+
+**STATE-R169A-R5-01 — `publicationState` enum (P1).** The R4
+`published: boolean` field could not represent no-op SUCCESS (nothing
+published but success) or DURABILITY_UNKNOWN (rename succeeded but
+dir fsync failed). It is REPLACED by a 4-value enum:
+```ts
+type IndexPublicationState =
+  | "PUBLISHED"          // manifest swap was durable
+  | "NOT_NEEDED"         // indexer no-op (no candidate to publish)
+  | "NOT_PUBLISHED"      // publication did not complete
+  | "DURABILITY_UNKNOWN"; // rename succeeded but dir fsync failed (FAILED only)
+```
+`INDEX_STATE_V1_KEYS` updated: `published` → `publicationState`
+(still 11 keys). Coherence rules tightened:
+- SUCCESS / SUCCESS_WITH_WARNINGS + PUBLISHED: `activeGenerationId`
+  non-null, `candidateGenerationId == activeGenerationId`,
+  `failure=null`, `staleReason=null`, `recovery="none"`.
+- SUCCESS / SUCCESS_WITH_WARNINGS + NOT_NEEDED:
+  `candidateGenerationId=null`, `failure=null`, `staleReason=null`,
+  `recovery="none"`.
+- PARTIAL: `publicationState="NOT_PUBLISHED"`, `failure` non-null.
+- FAILED: `publicationState="NOT_PUBLISHED"` or
+  `"DURABILITY_UNKNOWN"`, `failure` non-null.
+- STALE: `publicationState="NOT_PUBLISHED"`, `staleReason` non-null,
+  `recovery != "none"`.
+
+**STATE-R169A-R5-02 — Coherence completeness (P1/P2).**
+- SUCCESS_WITH_WARNINGS follows the same active/candidate rules as
+  SUCCESS (was previously under-checked).
+- `pathsTruncated` validation tightened:
+  - `pathsTruncated=true` → `totalPaths` MUST be present AND
+    `totalPaths > paths.length`.
+  - `pathsTruncated=false` → `totalPaths` absent OR
+    `totalPaths == paths.length`.
+  - `pathsTruncated` absent → `totalPaths` absent OR
+    `totalPaths == paths.length`.
+
+**SEC-R169A-R5-01 — Cleanup after directory swap (P1/P2).** After
+the pre-rename identity check detects a directory swap (dev/ino
+mismatch or symlink), the catch block previously called
+`unlinkSync(tmpPath)` which may target the wrong directory (the
+replacement, not the original). Fix:
+- Add `directoryIdentityStillValid = true` before the write.
+- Set `directoryIdentityStillValid = false` when dev/ino mismatch or
+  symlink detected.
+- In the catch block, only `unlinkSync(tmpPath)` if
+  `directoryIdentityStillValid` is true.
+- If not valid: don't unlink; append `WARNING: ATOMIC_TEMP_ORPHANED`
+  to the error message about the possible orphaned temp file.
+New error code `ATOMIC_TEMP_ORPHANED` added to the taxonomy (raised
+as a WARNING in the error message, not as a separate thrown error).
+Test: hook replaces directory after temp fsync → error mentions
+orphan, no file deleted in replacement directory.
+
+**SEC-R169A-R5-02 — Permission policy in resolver/listing (P1/P2).**
+Permission/ownership checks were only in
+`ensureGenerationStoreLayoutDurable`, not in the resolver or listing.
+Fix: `assertTrustedRootNoSymlinks` and
+`assertGenerationStoreRootTrusted` now check permissions on EXISTING
+directories using the same two-tier policy
+(R169A-FIX-R4 COMPAT-R169A-R4-01):
+- Compatibility roots (cacheRoot, codebase-memory-mcp): require
+  `mode & 0o022 === 0` (no group/other WRITE).
+- Private R169 dirs (projects, project-key): require
+  `mode === 0o700` exactly.
+- On POSIX: `stat.uid === process.getuid()` (best-effort, wrapped in
+  try/catch).
+The resolver and listing automatically get permission checks via the
+trust root validation. Tests: resolver with 0777 projects dir →
+`STORE_LAYOUT_PERMISSIONS_INSECURE`; resolver with 0755 cbm →
+accepted.
+
+**QUAL-R169A-R5-01 — fd leak in `openDirectoryNoFollow` (P2).** If
+`fstatSync(fd)` fails after a successful `openSync`, the fd leaked.
+Fix:
+```ts
+const fd = ops.openSync(path, flags);
+try {
+  const st = ops.fstatSync(fd);
+  return { fd, dev: st.dev, ino: st.ino };
+} catch (e) {
+  try { ops.closeSync(fd); } catch {}
+  throw e;
+}
+```
+Same pattern applied to the fallback path (no `O_NOFOLLOW`).
+Fault-injection test: open succeeds, fstat fails → fd closed exactly
+once.
+
+**API-R169A-R5-02 — `ops` / `hook` marked `@internal` (P2).**
+`writeIndexStateAtomically` exposes `ops` and `hook` parameters
+which are test mechanisms. They remain on the function signature
+(for test fault/race injection) but are marked `@internal` in JSDoc
+and are NOT part of the public API contract. Production callers MUST
+omit them. The simplest working approach was chosen over a separate
+internal module (which would require test-only build configuration).
+A source-inspection test verifies the public API surface does not
+include `__test__` or `writeGenerationManifestAtomically`.
+
+**PORT-R169A-R5-01 — macOS support (P2).** Documentation updated:
+"Linux certified. macOS planned — verification deferred to R169E.
+Windows legacy/inactive." The R169A foundation is Linux certified
+— every code path is exercised by the test matrix on Linux. macOS
+primitives (`O_NOFOLLOW`, `O_DIRECTORY`, `fsync(fd)`, `fchmod`,
+lstat + dev/ino) are POSIX and available, but the test matrix was
+run on Linux only. R169E will repeat the full matrix on macOS.
+Windows is legacy / inactive (`O_NOFOLLOW` / `O_DIRECTORY` not
+available; fallback path exercised by unit tests but NOT certified).
+
+**Test coverage.** +31 new R5-specific tests (240 total in the
+storage test file, was 209):
+- 8 tests verifying `__test__` and `writeGenerationManifestAtomically`
+  are NOT exported (API-R169A-R5-01).
+- 10 tests for `pathsTruncated` coherence (STATE-R169A-R5-02):
+  pathsTruncated=true + totalPaths present/absent/equal/less;
+  pathsTruncated=false + totalPaths absent/equal/greater;
+  pathsTruncated absent + totalPaths absent/equal/greater.
+- 5 tests for SUCCESS_WITH_WARNINGS coherence (STATE-R169A-R5-02).
+- 1 test for directory swap orphan case (SEC-R169A-R5-01).
+- 5 tests for permission checks in resolver/listing
+  (SEC-R169A-R5-02).
+- 2 tests for fd leak in `openDirectoryNoFollow` (QUAL-R169A-R5-01).
+- (Existing tests updated: PARTIAL with staleReason instead of
+  failure now expects INDEX_STATE_SCHEMA_ERROR per the tightened
+  R5 coherence rule.)
+
+**Files changed.**
+- `v2/src/storage/generation-types.ts` — `IndexPublicationState`
+  type added; `IndexAttemptStateV1.publicationState` field;
+  `INDEX_STATE_V1_KEYS` updated; `ATOMIC_TEMP_ORPHANED` error code
+  added to the taxonomy.
+- `v2/src/storage/generation-store.ts` — `__test__` export REMOVED;
+  `writeGenerationManifestAtomically` is internal (NOT exported);
+  `validateIndexAttemptState` updated for `publicationState` enum
+  and tightened coherence rules; `assertTrustedRootNoSymlinks` and
+  `assertGenerationStoreRootTrusted` now check permissions on
+  existing dirs; `openDirectoryNoFollow` closes fd on fstatSync
+  failure; `writeJsonAtomically` tracks
+  `directoryIdentityStillValid` and does NOT unlink by path if the
+  directory was swapped (appends ATOMIC_TEMP_ORPHANED warning);
+  `writeIndexStateAtomically` `ops`/`hook` marked `@internal`.
+- `v2/tests/storage/r169a-generation-store.test.ts` — updated to
+  use the test-only fixture helper; +31 R5-specific tests; existing
+  tests fixed to set mode 0o700 on layout dirs (R5 permission check
+  rejects the default 0o775 from umask 0o002 on shared CI runners).
+- `v2/tests/helpers/r169-generation-fixtures.ts` — NEW test-only
+  fixture file. Exports `writeManifestFixture`,
+  `makeValidManifest`, `makeValidIndexState`,
+  `writeIndexStateFixture`, `writeGenerationDbFixture`,
+  `writeLegacyDbFixture`. NOT compiled with the package.
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` — §4.4 Index-state schema
+  V1 added; §6.3 trust root permission policy updated; §6.6 Public
+  API surface, §6.7 Cleanup after directory swap, §6.8 fd leak in
+  openDirectoryNoFollow added; §9 failure taxonomy updated with
+  R3 + R5 codes; §15.1 Platform support added (Linux certified,
+  macOS planned, Windows legacy/inactive).
+- `v2/CHANGELOG.md` — this entry.
+
+
+### What R169A does NOT deliver
+
+- **R169B — Durable Staging Publisher + Validator + fsync + CAS + GC
+  primitives.** Implement independent publisher primitives and test
+  harnesses — NO production indexer caller. The primitives include the
+  staging-DB publisher, CAS dedup table, manifest writer
+  (`writeGenerationManifestAtomically` / `writeIndexStateAtomically`),
+  and GC primitives. All tested in isolation; no production code path
+  calls them yet.
+- **R169C — Indexer Integration + Outcome Contract.** Wire those
+  primitives into `indexProjectWasm` and outcome paths. The
+  publication pipeline is not yet wired into the indexer end-to-end;
+  the publication outcome is not yet propagated through `IndexResult`.
+- **R169D — Reader Cutover + Legacy Migration + Project Lifecycle.**
+  Readers do not yet call `resolveActiveCodeDb`; the legacy DB write
+  path is not yet removed; project lifecycle is not yet wired through
+  the generation store.
+- **R169E — Crash Matrix + Performance + Activation + Version.** The
+  C01–C20 crash matrix has not been replayed against the integrated
+  pipeline; performance and concurrency analysis is not complete;
+  `DATA-CARRY-01` (P1) is **NOT closed** until R169E passes all four
+  (crash matrix + concurrency + performance + activation).
+- **R170 — Multi-host fencing / lease** (out of scope for R169).
+
+### Security
+
+- Project names are NEVER used directly as paths. A deterministic
+  SHA-256 key is used instead.
+- All paths are containment-checked against the injected cache root
+  (`cacheRoot`), unified across generation and legacy paths.
+- **Canonical `dbFile`.** The manifest field `dbFile` must equal
+  exactly `generations/generation-<generationId>.db`, where
+  `<generationId>` is the manifest's own `generationId`. Any other
+  form (`.`, `active-generation.json`, `tmp/foo.db`, a different UUID,
+  absolute path, backslash separator, or any `..` segment) is rejected
+  with `MANIFEST_DBFILE_NOT_CANONICAL`. This is strictly stronger than
+  the previous relative-path check.
+- **Symlink chain security.** The resolver walks every path component
+  from a higher-trust root (`generationStoreRoot`) down to both the
+  manifest path and the generation DB path, performing `lstat` on each
+  component and rejecting ANY symlink in the chain — not just the
+  final hop. The final candidate is verified with
+  `realpathSync.native` and containment-checked against the trust
+  root. `ENOENT` on a component is treated as "absent" (silent
+  return); `EACCES`, `EIO`, `ENOTDIR`, `ELOOP` fail closed with
+  `PATH_TRAVERSAL_REJECTED`. A manifest parent that is a symlink, a
+  `generations/` directory that is a symlink, or a generation DB that
+  is a symlink are ALL rejected.
+- **Legacy DB validation.** When the resolver falls back to the legacy
+  `<cbmCacheDir>/<project>.db`, it does NOT silently open whatever is
+  on disk. The legacy path is checked for project-key containment (no
+  empty/absolute/`..`/separator project), walked with the same
+  component-by-component `lstat` chain (any symlink →
+  `PATH_TRAVERSAL_REJECTED`), and `lstat`-verified to be a regular
+  file (directory / symlink / special file →
+  `LEGACY_SOURCE_INVALID` (R169A-FIX-R2: renamed from `LEGACY_SOURCE_OPEN_FAILED`)). For ordinary project names with the
+  real cache root, this produces the same path as `defaultCodeDbPath`
+  in `v2/src/bridge/sqlite-ro.ts` — back-compat is preserved on the
+  happy path.
+- Atomic writer uses exclusive-create (`wx`) temp files with mode
+  `0o600` to prevent collision and permission leakage.
+
+### Durability ordering
+
+```
+serialize  →  fsync file  →  rename  →  fsync dir
+```
+
+Implemented in `writeJsonAtomically`. Three properties:
+
+- **Serialization happens BEFORE any filesystem mutation.** If
+  `JSON.stringify` throws (BigInt, circular references) or returns a
+  non-string (`undefined`, functions, symbols), the writer raises
+  `ATOMIC_SERIALIZATION_FAILED` and **no temp file is created**.
+- **Short writes are accounted for.** The write loop tracks an offset
+  and continues from the new offset on partial writes. If `writeSync`
+  returns `<= 0`, the writer raises `ATOMIC_SHORT_WRITE` and cleans up
+  the temp file. Partial writes never reach the rename step.
+- **Directory fsync failure is NOT silent.** If the directory cannot be
+  opened or if `fsync` on the directory fails (post-rename), the
+  writer raises `ATOMIC_DURABILITY_UNKNOWN`. By the time this step
+  runs, `rename` has already happened, so the new target MAY be in
+  place, but we cannot guarantee durability without the directory
+  fsync. The caller (indexer) MUST re-read the target and diagnose.
+  Silent success on directory-fsync failure would let the indexer
+  believe the new generation is durable when in fact it may be rolled
+  back by a power loss — exactly the kind of partial-publication
+  outcome R169 is meant to eliminate.
+
+The temp file is created with `openSync(tmpPath, "wx", 0o600)` so two
+concurrent writers cannot clobber each other's temp file. On any
+failure path before rename, the temp file is cleaned up. A
+`renameSucceeded` flag prevents cleanup from trying to `unlink` a temp
+file that was already renamed to the target.
+
+### Performance contract
+
+Zero overhead when unused. No production code imports
+`generation-store.js` at startup; no `fsync`, `mkdir`, or `lstat` runs
+on the hot path. Verified by the `R169A — No production behavior change`
+test block.
+
+### Documentation
+
+- **`docs/ATOMIC_GENERATION_PUBLICATION.md`** (new) — full target
+  architecture: storage layout, manifest schema V1, state machine,
+  durability ordering, reader contract, legacy migration, failure
+  taxonomy, GC policy, recovery, crash matrix C01–C20, performance
+  contract, R170 boundary. Status: FOUNDATION / INACTIVE.
+- **`docs/V2_CURRENT_STATE.md`** — header updated to R169A; R169A
+  section added (foundation implemented as a candidate, inactive,
+  pending review, publication NOT active); limitations fixed (lockfiles
+  ARE committed, Node minimum from package.json `engines`); R144–R148
+  roadmap replaced with the validated R169A–E + R170 plan and the four
+  new contracts (canonical `dbFile`, symlink chain security, directory
+  fsync → `ATOMIC_DURABILITY_UNKNOWN`, legacy validation);
+  `PKG-CARRY-01` lockfile gap marked closed.
+- **`docs/V2_ARCHITECTURE.md`** — header status marked FOUNDATION /
+  INACTIVE; new section 15 added documenting the generation store
+  target architecture. Existing sections describing current behavior
+  left unchanged.
+- **`v2/CHANGELOG.md`** — this entry.
+
+### Files changed
+
+- `v2/src/storage/generation-store.ts` (new; updated by R169A-FIX pass 1
+  and pass 2 — adds `assertTrustedRootNoSymlinks`,
+  `ensureGenerationStoreLayoutDurable`, `writeProjectJsonAtomically`;
+  makes `writeJsonAtomically` internal; adds manifest size bound and
+  safe-string field validation)
+- `v2/src/storage/generation-types.ts` (new; updated by R169A-FIX pass 1
+  and pass 2 — adds `MANIFEST_TOO_LARGE`, `STORE_LAYOUT_CREATE_FAILED`,
+  `STORE_LAYOUT_DURABILITY_UNKNOWN`; renames `LEGACY_SOURCE_OPEN_FAILED`
+  → `LEGACY_SOURCE_INVALID`; changes `MANIFEST_V1_KEYS` from `Set` to
+  readonly tuple; adds `isManifestV1Key` helper)
+- `v2/tests/storage/r169a-generation-store.test.ts` (new; updated by
+  R169A-FIX pass 1 and pass 2 — 146 tests covering all eight R2 findings)
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` (new; updated by R169A-FIX
+  pass 1 and pass 2 — adds §6.3 trust root, §6.4 layout durability,
+  §6.5 project-aware writer)
+- `docs/V2_CURRENT_STATE.md` (updated)
+- `docs/V2_ARCHITECTURE.md` (updated; adds §15.5.2 trust root,
+  §15.5.3 project-aware writer, §15.5.4 layout durability, §15.5.5
+  manifest hardening)
+- `v2/CHANGELOG.md` (this entry)
+
+### Semantics versions NOT bumped
+
+- `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 8` (unchanged)
+- `CURRENT_DISCOVERY_POLICY_VERSION = 2` (unchanged)
+- `CURRENT_GENERATION_MANIFEST_VERSION = 1` (new constant, set to 1)
+
+### Package version
+
+- `v2/package.json` remains at `0.75.0`. R169A is a documentation +
+  foundation release (implemented candidate, pending review); no
+  production behavior change, no semver bump.
+
+### Next: R169B — Durable Staging Publisher + Validator + fsync + CAS + GC primitives
+
+The validated R169A→R169E roadmap. Each round activates one piece with
+its own tests and audit; there is no "big bang" activation.
+
+- **R169A** — Generation Store Contract + Resolver Foundation (this
+  release; implemented candidate, inactive, pending review).
+- **R169B** — Durable Staging Publisher + Validator + fsync + CAS + GC
+  primitives. Implement independent publisher primitives and test
+  harnesses — NO production indexer caller. The primitives include the
+  staging-DB publisher (build in `tmp/`, validate, fsync, atomically
+  rename into `generations/`), the CAS dedup table, the manifest
+  writer (`writeProjectJsonAtomically`), and the GC primitives.
+- **R169C** — Indexer Integration + Outcome Contract. Wire those
+  primitives into `indexProjectWasm` and outcome paths. The
+  publication outcome (`SUCCESS | SUCCESS_WITH_WARNINGS | STALE |
+  PARTIAL | FAILED`) is propagated through `IndexResult`.
+- **R169D** — Reader Cutover + Legacy Migration + Project Lifecycle.
+  Readers switch from `legacyCodeDbPath` to `resolveActiveCodeDb`;
+  legacy DB write is removed for projects that have at least one
+  published generation; project lifecycle is wired through the
+  generation store.
+- **R169E** — Crash Matrix + Performance + Activation + Version. The
+  C01–C20 crash matrix is replayed against the integrated pipeline;
+  performance and concurrency analysis are completed; the legacy read
+  fallback is removed for re-indexed projects. **`DATA-CARRY-01` (P1)
+  closes only at the end of R169E**, after crash matrix + concurrency
+  + performance + activation have all passed.
+- **R170** — Multi-host lease / fencing (out of scope for R169;
+  single-host contract only).
+
+
 ## 0.73.1 — Round 168.1 (2026-07-12) Operational Closure
 
 **93rd round (infrastructure closure).** No code semantics change.
