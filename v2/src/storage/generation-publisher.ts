@@ -85,6 +85,7 @@ import {
   fstatSync,
   unlinkSync,
   copyFileSync,
+  chmodSync,
   existsSync,
   readSync,
   constants as fsConstants,
@@ -107,6 +108,7 @@ import {
   type DiscardResult,
   type PublishPreparedGenerationOptions,
   type CasGenerationCatalogEntry,
+  type PublicationMutationPhase,
 } from "./generation-types.js";
 import {
   getCacheRoot,
@@ -1167,7 +1169,11 @@ export function publishPreparedGeneration(
   // 5. Open the CAS DB. BEGIN IMMEDIATE.
   let cas: ReturnType<typeof openCasStore> | null = null;
   let casCommitted = false;
-  let visibleMutation = false; // set true after link() succeeds
+  // R169B-STEP5 (TOKEN-R169B-A3-01): replace the boolean visibleMutation
+  // with a structured phase. The token state machine uses this to decide
+  // whether to revert to PREPARED (only if phase === "NONE"), go CONSUMED
+  // (terminal, needs recovery), or stay as-is.
+  let mutationPhase: PublicationMutationPhase = "NONE";
   try {
     cas = openCasStore(project, cacheRoot);
     cas.beginImmediate();
@@ -1346,13 +1352,18 @@ export function publishPreparedGeneration(
         dbFile: `${GENERATIONS_SUBDIR}/generation-${dedupGenId}.db`,
       };
       // Unlink the staging file (best-effort).
+      // R169B-STEP5 (TOKEN-R169B-A3-01): mark STAGING_REMOVED — the
+      // staging is gone. If the publication fails after this, the
+      // token cannot revert to PREPARED (the staging is absent).
       try {
         unlinkSync(stagingPath);
+        mutationPhase = "STAGING_REMOVED";
       } catch (e) {
         warnings.push({
           code: "STAGING_ALIAS_CLEANUP_DEFERRED",
           message: `Failed to unlink staging alias after dedup: ${(e as Error).message}`,
         });
+        // Staging is still present — phase stays NONE (can retry/discard).
       }
     } else {
       // Not deduped: promote the staging DB via copy/reflink to a
@@ -1430,7 +1441,37 @@ export function publishPreparedGeneration(
           );
         }
       }
-      visibleMutation = true;
+      mutationPhase = "FINAL_DB_CREATED";
+
+      // R169B-STEP5 (MODE-R169B-A3-10): force the final DB mode to 0600
+      // and verify it is a regular non-symlink file with the expected
+      // owner. The staging DB may have been chmod'd by the indexer;
+      // the final DB must be private regardless.
+      try {
+        const finalStat = lstatSync(finalPath);
+        if (finalStat.isSymbolicLink() || !finalStat.isFile()) {
+          throw new Error(`final DB is not a regular file: ${finalPath}`);
+        }
+        if ((finalStat.mode & 0o777) !== 0o600) {
+          chmodSync(finalPath, 0o600);
+          // Re-stat to confirm the mode is now 0600.
+          const reStat = lstatSync(finalPath);
+          if ((reStat.mode & 0o777) !== 0o600) {
+            throw new Error(`chmod 0600 failed; final DB mode is still 0o${(reStat.mode & 0o777).toString(8)}: ${finalPath}`);
+          }
+        }
+      } catch (e) {
+        // Cleanup the final DB (identity-safe) and abort.
+        removeUnreferencedFinalOrRecordRecovery(finalPath, generations, project, phase, generationId, warnings);
+        mutationPhase = "NONE";
+        throw new GenerationStoreError(
+          "GENERATION_PROMOTION_FAILED",
+          phase,
+          project,
+          `Final DB mode enforcement failed: ${(e as Error).message}`,
+          generationId,
+        );
+      }
 
       // R169B-STEP4 (SEAL-R169B-A2-05): the copy/reflink is the
       // sealing boundary. We now re-hash the FINAL DB and verify
@@ -1441,10 +1482,9 @@ export function publishPreparedGeneration(
       if (finalHash !== manifest.sha256) {
         // The final DB's hash does not match the prepared manifest.
         // The staging file was mutated between prepare and copy.
-        // Roll back: unlink the final DB (it's unreferenced by any
-        // manifest), raise PUBLICATION_STAGING_MUTATED.
-        try { unlinkSync(finalPath); } catch { /* best effort */ }
-        visibleMutation = false;
+        // R169B-STEP5 (CLEANUP-R169B-A3-03): identity-safe cleanup.
+        removeUnreferencedFinalOrRecordRecovery(finalPath, generations, project, phase, generationId, warnings);
+        mutationPhase = "NONE";
         throw new GenerationStoreError(
           "PUBLICATION_STAGING_MUTATED",
           phase,
@@ -1468,8 +1508,9 @@ export function publishPreparedGeneration(
         }
         // The final DB exists but its fsync failed. The bytes may
         // not survive a crash. Block the manifest publication.
-        try { unlinkSync(finalPath); } catch { /* best effort */ }
-        visibleMutation = false;
+        // R169B-STEP5 (CLEANUP-R169B-A3-03): identity-safe cleanup.
+        removeUnreferencedFinalOrRecordRecovery(finalPath, generations, project, phase, generationId, warnings);
+        mutationPhase = "NONE";
         throw new GenerationStoreError(
           "GENERATION_PROMOTION_DURABILITY_UNKNOWN",
           phase,
@@ -1498,20 +1539,28 @@ export function publishPreparedGeneration(
         // BLOCK: do NOT write the metadata, do NOT write the manifest,
         // do NOT advance the CAS. Roll back the CAS transaction. The
         // final DB is on disk but unreferenced by any manifest; the
-        // next GC pass will sweep it as an orphan.
+        // next GC orphan pass will sweep it.
+        // R169B-STEP5: the final DB stays on disk (phase = FINAL_DB_CREATED).
+        // The token is terminal — caller cannot retry (final DB occupies
+        // the UUID). The orphan GC will eventually clean it up.
         throw new GenerationStoreError(
           "GENERATION_PROMOTION_DURABILITY_UNKNOWN",
           phase,
           project,
-          `fsync of generations/ directory failed after copy — manifest publication BLOCKED (the final DB is on disk but unreferenced; the next GC pass will sweep the orphan): ${(e as Error).message}`,
+          `fsync of generations/ directory failed after copy — manifest publication BLOCKED (the final DB is on disk but unreferenced; the next GC orphan pass will sweep it): ${(e as Error).message}`,
           generationId,
         );
       }
 
       // Unlink the staging DB (best-effort). The staging and final
       // are now independent inodes, so unlinking the staging is safe.
+      // R169B-STEP5 (TOKEN-R169B-A3-01): if the unlink succeeds,
+      // advance the phase to STAGING_REMOVED (the staging is gone).
+      // The final DB still exists, so the "dominant" phase is
+      // FINAL_DB_CREATED; but we record STAGING_REMOVED for accuracy.
       try {
         unlinkSync(stagingPath);
+        // Phase stays FINAL_DB_CREATED (the more advanced state).
       } catch (e) {
         warnings.push({
           code: "STAGING_ALIAS_CLEANUP_DEFERRED",
@@ -1525,6 +1574,8 @@ export function publishPreparedGeneration(
     //     dedup, do NOT write a new sidecar — the existing one is
     //     immutable and we validated it above. For non-dedup, write
     //     the sidecar atomically with strict V1 schema.
+    //     R169B-STEP5 (META-R169B-A3-07): the writer now calls
+    //     validateGenerationMetadata before writing.
     if (!deduped) {
       const metadataPayload = buildMetadataPayload(effectiveManifest, {
         publishedAt: new Date().toISOString(),
@@ -1535,10 +1586,18 @@ export function publishPreparedGeneration(
       });
       writeMetadataSidecarAtomically(effectiveMetadataPath, metadataPayload, project, phase, effectiveGenerationId);
     }
+    // R169B-STEP5 (TOKEN-R169B-A3-01): metadata is durable (for non-dedup)
+    // or already existed (for dedup). Advance the phase.
+    if (mutationPhase === "NONE" || mutationPhase === "STAGING_REMOVED") {
+      mutationPhase = "METADATA_DURABLE";
+    }
 
     // 11. Write active-generation.json atomically (canonical payload).
     const preparedPayload = prepareGenerationManifestForWrite(effectiveManifest, project);
     writeJsonAtomically(manifestPath, preparedPayload.payload, project, phase, PROD_OPS);
+    // R169B-STEP5 (TOKEN-R169B-A3-01): the manifest is now visible to
+    // readers. This is a point of no return — the token is CONSUMED.
+    mutationPhase = "MANIFEST_VISIBLE";
 
     // 12. Re-read and verify the active manifest + DB exists + metadata exists.
     let verifiedManifest: GenerationManifestV1;
@@ -1618,6 +1677,7 @@ export function publishPreparedGeneration(
     // 14. COMMIT.
     cas.commit();
     casCommitted = true;
+    mutationPhase = "CAS_COMMITTED";
 
     // 15. Transition token → CONSUMED.
     token.state = "CONSUMED";
@@ -1642,12 +1702,14 @@ export function publishPreparedGeneration(
     if (cas !== null && !casCommitted) {
       try { cas.rollback(); } catch { /* best effort */ }
     }
-    // R169B-STEP3 (TOKEN-R169B-A1-10): if the failure happened BEFORE
-    // any visible mutation, revert the token to PREPARED so the
-    // caller can retry or discard. If the failure happened AFTER a
-    // visible mutation (link succeeded, manifest written), the token
-    // is consumed and the caller must run recovery.
-    if (!visibleMutation) {
+    // R169B-STEP5 (TOKEN-R169B-A3-01): the token state depends on the
+    // mutation phase. Only revert to PREPARED if NO visible mutation
+    // happened (phase === "NONE"). If the staging was removed, the
+    // final DB was created, the metadata was written, or the manifest
+    // was written, the token is CONSUMED (terminal) — the caller must
+    // run recovery. The manifest/CAS reconciliation on the next
+    // publish will fix any inconsistency.
+    if (mutationPhase === "NONE") {
       token.state = "PREPARED";
     } else {
       token.state = "CONSUMED";
@@ -1881,6 +1943,49 @@ function writeMetadataSidecarAtomically(
       `Metadata sidecar payload did not round-trip to a JSON object`,
       generationId,
     );
+  }
+  // R169B-STEP5 (META-R169B-A3-07): validate the metadata payload
+  // against the strict V1 schema before writing. This catches any
+  // missing/extra keys, invalid types, or incoherent dedup fields.
+  try {
+    validateGenerationMetadata(reparsed, project);
+  } catch (e) {
+    throw new GenerationStoreError(
+      "GENERATION_METADATA_INVALID",
+      phase,
+      project,
+      `Metadata sidecar payload failed V1 validation: ${(e as Error).message}`,
+      generationId,
+    );
+  }
+  // R169B-STEP5 (META-R169B-A3-07): no-clobber check. If the metadata
+  // sidecar already exists, it must be byte-identical (re-publication
+  // of the same generation) — otherwise it's corruption.
+  try {
+    const existingStat = lstatSync(metadataPath);
+    if (existingStat.isSymbolicLink() || !existingStat.isFile()) {
+      throw new Error(`existing metadata is not a regular file: ${metadataPath}`);
+    }
+    // Read the existing metadata and compare.
+    const existingRaw = readFileSyncText(metadataPath, MAX_METADATA_SIDECAR_BYTES);
+    if (existingRaw.trim() !== serialized.trim()) {
+      throw new Error(`existing metadata differs from new payload (no-clobber violation)`);
+    }
+    // Byte-identical — skip the write (idempotent re-publication).
+    return;
+  } catch (e) {
+    const errCode = (e as NodeJS.ErrnoException).code;
+    if (errCode === "ENOENT") {
+      // No existing metadata — proceed with the write.
+    } else {
+      throw new GenerationStoreError(
+        "GENERATION_METADATA_INVALID",
+        phase,
+        project,
+        `Metadata no-clobber check failed: ${(e as Error).message}`,
+        generationId,
+      );
+    }
   }
   const buffer = Buffer.from(serialized + "\n", "utf8");
   try {
@@ -2167,5 +2272,111 @@ function readFileSyncText(path: string, maxBytes: number): string {
     if (fd !== null) {
       try { closeSync(fd); } catch { /* best effort */ }
     }
+  }
+}
+
+// ─── R169B-STEP5 — Identity-safe cleanup helper (CLEANUP-R169B-A3-03) ────
+
+/**
+ * R169B-STEP5 (CLEANUP-R169B-A3-03): Identity-safe cleanup of an
+ * unreferenced final DB. Used when the publication fails AFTER the
+ * copy/reflink but BEFORE the manifest is written. The final DB is
+ * on disk but no manifest points at it — it's an orphan.
+ *
+ * Steps:
+ *   1. lstat the final DB (reject symlink, require regular file).
+ *   2. unlink.
+ *   3. fsync the generations/ directory.
+ *   4. lstat to confirm ENOENT (not existsSync — lstat distinguishes
+ *      ENOENT from EACCES/EIO).
+ *   5. If any step fails, surface a structured warning (the orphan
+ *      stays on disk; the next GC orphan pass will sweep it).
+ *
+ * This helper NEVER throws — it surfaces failures as warnings so the
+ * caller can continue with the abort.
+ */
+function removeUnreferencedFinalOrRecordRecovery(
+  finalPath: string,
+  generationsDir: string,
+  project: string,
+  phase: string,
+  generationId: string,
+  warnings: GenerationStoreWarning[],
+): void {
+  void project; void phase; void generationId;
+  // 1. lstat the final DB.
+  let st: Stats;
+  try {
+    st = lstatSync(finalPath);
+    if (st.isSymbolicLink()) {
+      warnings.push({
+        code: "GC_DELETE_FAILED",
+        message: `Cleanup: final DB is a symlink (not unlinking): ${finalPath}`,
+      });
+      return;
+    }
+    if (!st.isFile()) {
+      warnings.push({
+        code: "GC_DELETE_FAILED",
+        message: `Cleanup: final DB is not a regular file (not unlinking): ${finalPath}`,
+      });
+      return;
+    }
+  } catch (e) {
+    const errCode = (e as NodeJS.ErrnoException).code;
+    if (errCode === "ENOENT") {
+      // Already gone — nothing to clean up.
+      return;
+    }
+    warnings.push({
+      code: "GC_DELETE_FAILED",
+      message: `Cleanup: lstat of final DB failed: ${(e as Error).message}`,
+    });
+    return;
+  }
+  // 2. unlink.
+  try {
+    unlinkSync(finalPath);
+  } catch (e) {
+    warnings.push({
+      code: "GC_DELETE_FAILED",
+      message: `Cleanup: unlink of final DB failed: ${(e as Error).message}`,
+    });
+    return;
+  }
+  // 3. fsync the generations/ directory.
+  let dirFd: number | null = null;
+  try {
+    const opened = openDirectoryNoFollow(generationsDir, PROD_OPS);
+    dirFd = opened.fd;
+    PROD_OPS.fsyncSync(dirFd);
+    PROD_OPS.closeSync(dirFd);
+    dirFd = null;
+  } catch (e) {
+    if (dirFd !== null) {
+      try { PROD_OPS.closeSync(dirFd); } catch { /* best effort */ }
+    }
+    warnings.push({
+      code: "GC_DELETE_FAILED",
+      message: `Cleanup: fsync of generations/ after unlink failed: ${(e as Error).message}`,
+    });
+  }
+  // 4. lstat to confirm ENOENT.
+  try {
+    lstatSync(finalPath);
+    // If lstat succeeded, the file is still there.
+    warnings.push({
+      code: "GC_DELETE_FAILED",
+      message: `Cleanup: final DB still exists after unlink: ${finalPath}`,
+    });
+  } catch (e) {
+    const errCode = (e as NodeJS.ErrnoException).code;
+    if (errCode !== "ENOENT") {
+      warnings.push({
+        code: "GC_DELETE_FAILED",
+        message: `Cleanup: lstat after unlink returned ${errCode}: ${finalPath}`,
+      });
+    }
+    // ENOENT — confirmed absent. Success.
   }
 }

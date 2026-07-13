@@ -873,7 +873,14 @@ export interface PublicationResult {
   readonly manifestPath: string;
   readonly metadataPath: string;
   readonly manifest: GenerationManifestV1;
-  readonly publicationState: "PUBLISHED" | "DURABILITY_UNKNOWN";
+  /**
+   * R169B-STEP5 (API-R169B-A3-12): the only possible value is now
+   * "PUBLISHED". The "DURABILITY_UNKNOWN" variant was removed because
+   * the publisher raises `GENERATION_PROMOTION_DURABILITY_UNKNOWN`
+   * instead of returning a result with that state. The type is kept
+   * as a literal (not a union) for forward compatibility.
+   */
+  readonly publicationState: "PUBLISHED";
   readonly warnings: readonly GenerationStoreWarning[];
   readonly cas: {
     readonly revision: number;
@@ -881,6 +888,35 @@ export interface PublicationResult {
     readonly previousActiveGenerationId: string | null;
   };
 }
+
+/**
+ * R169B-STEP5 (TOKEN-R169B-A3-01): the publication mutation phase.
+ * Replaces the boolean `visibleMutation` with a structured phase that
+ * tracks exactly how far the publication progressed. The token state
+ * machine uses this to decide whether to revert to PREPARED, go
+ * CONSUMED (terminal, needs recovery), or stay as-is.
+ *
+ *   - "NONE": no visible mutation yet. Token can revert to PREPARED.
+ *   - "STAGING_REMOVED": the staging DB was unlinked (dedup path or
+ *     non-dedup cleanup). The staging is gone; retry would need a new
+ *     reservation. Token is terminal (needs recovery / new reservation).
+ *   - "FINAL_DB_CREATED": the final DB was created (copy/reflink). The
+ *     final DB exists but no manifest points at it. Token is terminal.
+ *   - "METADATA_DURABLE": the metadata sidecar was written. Token is
+ *     terminal.
+ *   - "MANIFEST_VISIBLE": the active manifest was written. Readers can
+ *     see the new generation. The CAS may not yet reflect it. Token is
+ *     CONSUMED; reconciliation on next publish will fix the CAS.
+ *   - "CAS_COMMITTED": the CAS transaction committed. Publication
+ *     complete. Token is CONSUMED.
+ */
+export type PublicationMutationPhase =
+  | "NONE"
+  | "STAGING_REMOVED"
+  | "FINAL_DB_CREATED"
+  | "METADATA_DURABLE"
+  | "MANIFEST_VISIBLE"
+  | "CAS_COMMITTED";
 
 /**
  * R169B-STEP2: Result of `discardPreparedGeneration`.
@@ -1028,7 +1064,7 @@ export interface CasPublicationHistoryEntry {
   readonly generationId: string;
   readonly project: string;
   readonly publishedAt: string;
-  readonly action: "PUBLISH" | "UNPUBLISH" | "DELETE" | "PIN" | "UNPIN" | "MARK_DELETING";
+  readonly action: "PUBLISH" | "UNPUBLISH" | "DELETE" | "PIN" | "UNPIN" | "MARK_DELETING" | "RECOVER";
   readonly previousActiveGenerationId: string | null;
   readonly casRevision: number;
 }

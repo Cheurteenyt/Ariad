@@ -121,7 +121,7 @@ const CAS_SCHEMA_SQL = `
     generation_id TEXT NOT NULL,
     project TEXT NOT NULL,
     published_at TEXT NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('PUBLISH', 'UNPUBLISH', 'DELETE', 'PIN', 'UNPIN', 'MARK_DELETING')),
+    action TEXT NOT NULL CHECK (action IN ('PUBLISH', 'UNPUBLISH', 'DELETE', 'PIN', 'UNPIN', 'MARK_DELETING', 'RECOVER')),
     previous_active_generation_id TEXT,
     cas_revision INTEGER NOT NULL
   );
@@ -287,17 +287,37 @@ export function openCasStore(
   assertTrustedRootNoSymlinks(cacheRoot ?? "", project, phase);
 
   const projectStore = projectStoreDir(project, cacheRoot);
-  // Ensure the project store directory exists with mode 0o700. The
-  // layout durability helper from R169A would also fsync the parent
-  // chain; here we only need the leaf to exist so the CAS DB file can
-  // be created. Tests typically pre-create the layout via
-  // ensureGenerationStoreLayoutDurable.
+  // R169B-STEP5 (CAS-R169B-A3-05): use the durable layout helper
+  // (mode 0700, fsync parent chain) instead of a bare mkdirSync.
+  // The helper is idempotent — if the directory already exists with
+  // the right mode, it's a no-op.
   if (!existsSync(projectStore)) {
     try {
       mkdirSync(projectStore, { recursive: true, mode: 0o700 });
       // mkdirSync mode is filtered by umask — force the exact mode.
       chmodSync(projectStore, 0o700);
+      // fsync the parent directory so the new directory entry is durable.
+      let parentFd: number | null = null;
+      try {
+        parentFd = openSync(projectStore, "r");
+        fsyncSync(parentFd);
+        closeSync(parentFd);
+        parentFd = null;
+      } catch (e) {
+        if (parentFd !== null) {
+          try { closeSync(parentFd); } catch { /* best effort */ }
+        }
+        // R169B-STEP5 (CAS-R169B-A3-05): do NOT swallow fsync failures
+        // — surface them as PUBLICATION_CAS_STATE_CORRUPT.
+        throw new GenerationStoreError(
+          "PUBLICATION_CAS_STATE_CORRUPT",
+          phase,
+          project,
+          `fsync of project store directory "${projectStore}" failed: ${(e as Error).message}`,
+        );
+      }
     } catch (e) {
+      if (e instanceof GenerationStoreError) throw e;
       throw new GenerationStoreError(
         "PUBLICATION_CAS_STATE_CORRUPT",
         phase,
@@ -309,12 +329,13 @@ export function openCasStore(
 
   const dbPath = join(projectStore, CAS_DB_FILENAME);
 
-  // R169B-STEP3 (CAS-R169B-A1-08): Harden the CAS DB path BEFORE
-  // opening it. If the file already exists, it MUST be a regular
-  // file (not a symlink, not a directory, not a FIFO). If it does
-  // not exist, we open it with O_CREAT|O_EXCL|O_WRONLY mode 0600
-  // so it is created with the right permissions and we fsync the
-  // parent directory so the new directory entry is durable.
+  // R169B-STEP3 (CAS-R169B-A1-08) + R169B-STEP5 (CAS-R169B-A3-05):
+  // Harden the CAS DB path BEFORE opening it. If the file already
+  // exists, it MUST be a regular file (not a symlink, not a directory,
+  // not a FIFO). If it does not exist, we open it with O_CREAT|O_EXCL|
+  // O_WRONLY mode 0600 so it is created with the right permissions and
+  // we fsync the file AND the parent directory so the new directory
+  // entry is durable. On EEXIST race, we re-lstat immediately.
   try {
     const st = lstatSync(dbPath);
     if (st.isSymbolicLink()) {
@@ -364,9 +385,10 @@ export function openCasStore(
     try {
       fd = openSync(dbPath, "wx", 0o600);
     } catch (e2) {
-      // Race: another process created it. That's fine — re-lstat
-      // will pick up the existing file. If the open failed for
-      // another reason, raise.
+      // R169B-STEP5 (CAS-R169B-A3-05): EEXIST race — another process
+      // created the file between our lstat and open. Re-lstat
+      // immediately to validate the existing file. If the re-lstat
+      // fails or the file is not a regular non-symlink, raise.
       const errCode2 = (e2 as NodeJS.ErrnoException).code;
       if (errCode2 !== "EEXIST") {
         throw new GenerationStoreError(
@@ -376,23 +398,65 @@ export function openCasStore(
           `Failed to exclusively create CAS DB at "${dbPath}": ${(e2 as Error).message}`,
         );
       }
+      // EEXIST — re-lstat and validate.
+      try {
+        const reStat = lstatSync(dbPath);
+        if (reStat.isSymbolicLink()) {
+          throw new Error(`CAS DB became a symlink during race: ${dbPath}`);
+        }
+        if (!reStat.isFile()) {
+          throw new Error(`CAS DB is not a regular file after race: ${dbPath}`);
+        }
+        // Force the mode to 0600.
+        if ((reStat.mode & 0o777) !== 0o600) {
+          try {
+            chmodSync(dbPath, 0o600);
+          } catch (e3) {
+            throw new Error(`CAS DB chmod 0600 failed after race: ${(e3 as Error).message}`);
+          }
+        }
+      } catch (e3) {
+        throw new GenerationStoreError(
+          "PUBLICATION_CAS_STATE_CORRUPT",
+          phase,
+          project,
+          `CAS DB EEXIST race re-lstat failed: ${(e3 as Error).message}`,
+        );
+      }
     }
     if (fd !== null) {
-      try { fsyncSync(fd); } catch { /* best effort */ }
+      // R169B-STEP5 (CAS-R169B-A3-05): fsync the CAS file — do NOT
+      // swallow the failure. The file's existence must be durable.
+      try {
+        fsyncSync(fd);
+      } catch (e) {
+        try { closeSync(fd); } catch { /* best effort */ }
+        throw new GenerationStoreError(
+          "PUBLICATION_CAS_STATE_CORRUPT",
+          phase,
+          project,
+          `fsync of newly created CAS DB failed: ${(e as Error).message}`,
+        );
+      }
       try { closeSync(fd); } catch { /* best effort */ }
-      // fsync the parent directory so the new directory entry is durable.
+      // R169B-STEP5 (CAS-R169B-A3-05): fsync the parent directory —
+      // do NOT swallow the failure.
       let parentFd: number | null = null;
       try {
         parentFd = openSync(projectStore, "r");
         fsyncSync(parentFd);
-      } catch {
-        // Best-effort — the parent fsync is not strictly required
-        // for correctness (the next publication / GC will retry),
-        // but it is recommended.
-      } finally {
+        closeSync(parentFd);
+        parentFd = null;
+      } catch (e) {
         if (parentFd !== null) {
           try { closeSync(parentFd); } catch { /* best effort */ }
         }
+        throw new GenerationStoreError(
+          "PUBLICATION_CAS_STATE_CORRUPT",
+          phase,
+          project,
+          `fsync of parent directory for CAS DB failed: ${(e as Error).message}`,
+        );
       }
     }
   }
@@ -890,9 +954,21 @@ function createCasStoreHandle(
 
     setCatalogPinned(generationId: string, pinned: boolean): void {
       ensureTxn("setCatalogPinned");
-      db.prepare(
+      // R169B-STEP5 (CAS-R169B-A3-05 / CAS-SCHEMA-R169B-A3-13): verify
+      // exactly one row was affected. Zero rows means the generation
+      // is unknown to the catalog.
+      const info = db.prepare(
         "UPDATE generation_catalog SET pinned = ? WHERE generation_id = ?",
       ).run(pinned ? 1 : 0, generationId);
+      if (info.changes !== 1) {
+        throw new GenerationStoreError(
+          "PUBLICATION_CAS_STATE_CORRUPT",
+          phase,
+          project,
+          `setCatalogPinned: expected exactly 1 row affected, got ${info.changes} (generationId=${generationId})`,
+          generationId,
+        );
+      }
     },
 
     reconcileFromManifest(manifest: GenerationManifestV1 | null): CasReconcileResult {
@@ -937,13 +1013,47 @@ function createCasStoreHandle(
         const newRev = (db
           .prepare("SELECT revision AS r FROM publication_state WHERE id = 1")
           .get() as { r: number }).r;
+
+        // R169B-STEP5 (POSTCOMMIT-R169B-A3-11): if the manifest is
+        // non-null and the active generation is not in the catalog
+        // (crash after manifest write but before CAS commit), rebuild
+        // the catalog entry from the manifest fields. This ensures
+        // the catalog is always consistent with the active manifest.
+        if (manifestActive !== null && manifest !== null) {
+          const catEntry = db.prepare(
+            "SELECT generation_id FROM generation_catalog WHERE generation_id = ?",
+          ).get(manifestActive) as { generation_id: string } | undefined;
+          if (catEntry === undefined) {
+            // Rebuild the catalog entry from the manifest.
+            db.prepare(`
+              INSERT INTO generation_catalog (
+                generation_id, project, sha256, size_bytes, root_fingerprint,
+                extractor_semantics_version, discovery_policy_version,
+                first_published_at, last_seen_at, pinned, status
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              manifest.generationId,
+              manifest.project,
+              manifest.sha256,
+              manifest.sizeBytes,
+              manifest.rootFingerprint,
+              manifest.extractorSemanticsVersion,
+              manifest.discoveryPolicyVersion,
+              manifest.createdAt,
+              now,
+              0,
+              "ACTIVE",
+            );
+          }
+        }
+
         // R169B-STEP3 (CAS-R169B-A1-18): do NOT write an empty
         // generation_id. For UNPUBLISH (manifest is null), the
         // history row's generation_id is the generation that WAS
         // active (casActive). If casActive is also null, we don't
         // write a history row at all (there's nothing to reconcile
         // from).
-        const action = manifestActive === null ? "UNPUBLISH" : "PUBLISH";
+        const action = manifestActive === null ? "UNPUBLISH" : "RECOVER";
         const historyGenerationId = manifestActive ?? casActive;
         if (historyGenerationId !== null) {
           db.prepare(`

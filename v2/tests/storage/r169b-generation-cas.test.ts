@@ -512,9 +512,11 @@ describe("R169B-STEP2 CAS — reconcileFromManifest", () => {
     const manifest = validManifest({ generationId: "gen-2" });
     cas.reconcileFromManifest(manifest);
     const history = cas.listPublicationHistory(PROJECT);
-    // The reconcile should have appended a "PUBLISH" entry (because
-    // manifest is non-null and CAS was divergent).
-    expect(history.some((h) => h.action === "PUBLISH" && h.generationId === "gen-2")).toBe(true);
+    // R169B-STEP5 (POSTCOMMIT-R169B-A3-11): the reconcile now appends
+    // a "RECOVER" entry (was "PUBLISH") when the manifest is non-null
+    // and CAS was divergent. This distinguishes CAS-only reconciliation
+    // from an actual publication.
+    expect(history.some((h) => h.action === "RECOVER" && h.generationId === "gen-2")).toBe(true);
     cas.close();
   });
 });

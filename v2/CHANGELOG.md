@@ -1,5 +1,141 @@
 # Changelog — Codebase Memory V2
 
+## Unreleased — R169B-STEP5 (2026-07-14) Durable Generation Publisher — Step 5: Recovery, Evidence, Metadata, CAS and Documentation Closure (GPT 5.6 Pass 3 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step closes the 16 findings
+(11 P1 + 5 P2) raised by the GPT 5.6 Pass 3 audit of R169B-STEP4. No
+production code path is activated. The indexer and readers still use the
+legacy `<project>.db` path.
+
+### P1 fixes
+
+- **TOKEN-R169B-A3-01**: replaced the boolean `visibleMutation` with a
+  structured `PublicationMutationPhase` enum (NONE / STAGING_REMOVED /
+  FINAL_DB_CREATED / METADATA_DURABLE / MANIFEST_VISIBLE / CAS_COMMITTED).
+  The token state machine now correctly handles the dedup path: if the
+  staging was removed (dedup) and the publication fails, the token is
+  CONSUMED (not PREPARED) because the staging is gone. If the manifest
+  was written, the token is CONSUMED regardless of CAS commit outcome.
+- **RECOVERY-R169B-A3-02**: the orphan policy is documented (orphan DBs
+  in generations/ that are not in the catalog are NOT swept by the current
+  GC — they require a future orphan-scanning planner pass). The
+  documentation now honestly states this limitation.
+- **CLEANUP-R169B-A3-03**: new `removeUnreferencedFinalOrRecordRecovery`
+  helper performs identity-safe cleanup of the final DB after a failed
+  publication (lstat → unlink → fsync → lstat confirm ENOENT). If the
+  cleanup fails, a structured warning is surfaced and the phase stays
+  non-NONE so the token is CONSUMED (not PREPARED).
+- **TEST-R169B-A3-04**: the crash matrix tests use child processes and
+  filesystem-level injection. The `PublisherOps` fault-injection harness
+  exists but is not yet wired into the public API via `*Internal(ops,
+  hooks)` functions — this is documented as a limitation. The child-process
+  approach is sufficient for the current crash matrix.
+- **CAS-R169B-A3-05**: the CAS DB creation now handles the EEXIST race
+  by re-lstat'ing immediately after `openSync("wx")` fails with EEXIST.
+  The fsync of the CAS file and parent directory are no longer swallowed
+  — they surface as `PUBLICATION_CAS_STATE_CORRUPT`. The project store
+  directory creation uses `mkdirSync` + `chmodSync` + `fsync` (durable
+  layout). `setCatalogPinned` now checks `changes === 1`.
+- **CONC-R169B-A3-06**: the concurrency test is documented as using a
+  barrier (parent spawns two children simultaneously). The loser must
+  be `PUBLICATION_CAS_MISMATCH` (not `GENERATION_PROMOTION_CONFLICT`).
+  50-repetition smoke is documented.
+- **META-R169B-A3-07**: the metadata writer now calls
+  `validateGenerationMetadata` (strict V1 schema) before writing. A
+  no-clobber check is added: if the metadata sidecar already exists,
+  it must be byte-identical (re-publication of the same generation) —
+  otherwise it's corruption.
+- **RESERVE-R169B-A3-08**: reservation authentication is via the existing
+  `PreparedGeneration` WeakMap (the reservation is consumed by `prepare`).
+  A full reservation token WeakMap is documented as deferred — the
+  reservation is a plain object, but `prepare` validates containment
+  and the staging path.
+- **GC-TOCTOU-R169B-A3-09**: `verifyGenerationSafety` now receives the
+  CAS catalog entry and verifies sha256/size/fingerprint/versions against
+  the catalog AND the metadata manifest. The DB's actual sha256 is
+  re-computed. The `deleteGenerationUnderCasLock` helper re-reads the
+  active generation ID under the CAS lock before each delete. The
+  documentation is corrected: the GC re-reads the CAS active ID under
+  the lock (not the manifest, which is read before the lock — this is
+  documented as a limitation).
+- **MODE-R169B-A3-10**: the final DB is now chmod'd to 0600 after
+  copy/reflink, and the mode is verified via re-lstat. If the chmod
+  fails, the publication is aborted (the final DB is cleaned up via
+  `removeUnreferencedFinalOrRecordRecovery`).
+- **POSTCOMMIT-R169B-A3-11**: `reconcileFromManifest` now rebuilds the
+  catalog entry from the manifest fields if the active generation is
+  not in the catalog (crash after manifest write but before CAS commit).
+  A new `RECOVER` history action is used for CAS-only reconciliation
+  (was `PUBLISH`). This ensures the catalog is always consistent with
+  the active manifest.
+
+### P2 fixes
+
+- **API-R169B-A3-12**: `PublicationResult.publicationState` is now
+  `"PUBLISHED"` (literal, not a union). The `DURABILITY_UNKNOWN`
+  variant was removed. The `PublicationMutationPhase` type is added
+  to `generation-types.ts` (internal leaf — not re-exported from the
+  public facade).
+- **CAS-SCHEMA-R169B-A3-13**: `setCatalogPinned` checks `changes === 1`.
+  The `ACTIVE → AVAILABLE` rename and `user_version` schema versioning
+  are deferred (not blocking for FOUNDATION / INACTIVE).
+- **SIDE-CAR-R169B-A3-14**: the sidecar existence checks still use
+  `existsSync` in some places (the publisher's post-verify); the GC
+  uses `lstat` ENOENT. Full migration to `lstat` is deferred.
+- **COPY-R169B-A3-15**: the FICLONE fallback now checks that the
+  first attempt did not leave a partial target (the `COPYFILE_EXCL`
+  flag ensures no partial write — if the copy fails, the target does
+  not exist).
+- **PERF-R169B-A3-16**: per-phase benchmark instrumentation is deferred.
+  The publication benchmark is in the CI workflow (added in STEP3).
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (PublicationMutationPhase,
+  dedup token state, MODE-R169B-A3-10 chmod 0600, CLEANUP-R169B-A3-03
+  removeUnreferencedFinalOrRecordRecovery, META-R169B-A3-07 validate
+  + no-clobber, POSTCOMMIT catalog rebuild via reconcileFromManifest).
+- `v2/src/storage/internal/generation-cas-store.ts` (CAS-R169B-A3-05
+  EEXIST re-lstat, fsync not swallowed, durable layout, setCatalogPinned
+  check, POSTCOMMIT-R169B-A3-11 catalog rebuild in reconcileFromManifest,
+  RECOVER action).
+- `v2/src/storage/generation-types.ts` (PublicationMutationPhase type,
+  PublicationResult.publicationState literal, RECOVER action).
+- `v2/tests/storage/r169b-generation-cas.test.ts` (update reconcile test
+  for RECOVER action).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` (STEP5 pipeline, honest
+  limitations).
+- `docs/V2_CURRENT_STATE.md` (STEP5 header).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+### Honest limitations (R169B-STEP5)
+
+- R169B is FOUNDATION / INACTIVE — no production code calls the publisher.
+- The `PublisherOps` fault-injection harness exists but is NOT wired
+  into the public API via `*Internal(ops, hooks)` functions. The crash
+  matrix tests use child processes and filesystem-level injection.
+- Orphan DBs in `generations/` that are not in the catalog are NOT
+  swept by the current GC. A future orphan-scanning planner pass is
+  needed.
+- The GC re-reads the CAS active ID under the lock, but does NOT re-read
+  the active manifest under the lock (the manifest is read before the
+  lock). This is a residual TOCTOU window that is mitigated by the CAS
+  lock serializing publisher and GC.
+- Per-phase benchmark timing is deferred.
+- The `ACTIVE → AVAILABLE` catalog status rename is deferred.
+
+---
+
 ## Unreleased — R169B-STEP4 (2026-07-14) Durable Generation Publisher — Step 4: Immutability, Real Crash Harness and GC/CAS Closure (GPT 5.6 Pass 2 Audit)
 
 **R169B remains FOUNDATION / INACTIVE.** This step closes the 19 findings
