@@ -98,6 +98,7 @@ import {
   type GenerationGcResult,
   type GenerationManifestV1,
   type CasGenerationCatalogEntry,
+  type GenerationDeletionProof,
 } from "./generation-types.js";
 import {
   getCacheRoot,
@@ -842,6 +843,8 @@ function verifyGenerationSafety(
   // Metadata sha256 is expensive to compute (would require reading the
   // full file twice); we use dev/ino/size which is sufficient to detect
   // replacement. The metadata content was already validated above.
+  // R169B (§13): use the public GenerationDeletionProof interface
+  // (FileIdentity & { sha256 } for db/metadata, catalogRevision: number).
   const proof: GenerationDeletionProof = {
     db: {
       dev: dbStat.dev,
@@ -855,33 +858,20 @@ function verifyGenerationSafety(
       size: metaStat.size,
       sha256: "",  // not recomputed — dev/ino/size is sufficient
     },
-    catalogSha256: catalogEntry.sha256,
+    catalogRevision: 0,  // not tracked here; the catalog hash is verified separately
   };
   return { ok: true, proof };
 }
 
 /**
- * R169B-STEP10 (§10 POST-PUSH): A deletion proof captured by the safety
- * check (outside the CAS lock) and verified under the lock. Contains
- * dev/ino/size/sha256 for the DB and dev/ino/size for the metadata.
- * If any field changed between the safety check and the lock, the
- * deletion is refused (the file was replaced).
+ * R169B (§13 GATE): GenerationDeletionProof is now defined ONCE in
+ * generation-types.ts (the public type). The internal duplicate was
+ * removed to avoid contract drift. The public interface has:
+ *   db: FileIdentity & { sha256 }
+ *   metadata: FileIdentity & { sha256 }
+ *   catalogRevision: number
+ * FileIdentity = { dev, ino, size }.
  */
-interface GenerationDeletionProof {
-  readonly db: {
-    readonly dev: number;
-    readonly ino: number;
-    readonly size: number;
-    readonly sha256: string;
-  };
-  readonly metadata: {
-    readonly dev: number;
-    readonly ino: number;
-    readonly size: number;
-    readonly sha256: string;  // empty if not recomputed
-  };
-  readonly catalogSha256: string;
-}
 
 /**
  * R169B-STEP4: Compute SHA-256 of a file using O_NOFOLLOW + fstat
@@ -1743,8 +1733,48 @@ export function applyGenerationOrphanRecovery(
               continue;
             }
           }
-          unlinkSync(canonicalPath);
-          deletedTempPaths.push(canonicalPath);
+          // R169B (§11 GATE): acquire the CAS lock before unlinking.
+          // The publisher holds the same lock during promotion (between
+          // fsync(temp) and link(temp, final)). By acquiring the lock
+          // here, we serialize with the publisher — if a publisher is
+          // mid-promotion, we wait; if the publisher committed or
+          // crashed, the lock is free and we can safely delete the temp.
+          const casForTemp = openCasStore(project, cacheRoot);
+          try {
+            casForTemp.beginImmediate();
+            // Re-validate age under the lock (the temp might have been
+            // touched by a publisher that just started).
+            const stLocked = lstatSync(canonicalPath);
+            if (stLocked.isSymbolicLink() || !stLocked.isFile()) {
+              casForTemp.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp not a regular file under lock: ${canonicalPath}` });
+              retainedOrphans.push(orphan);
+              continue;
+            }
+            if (orphan.identity) {
+              if (stLocked.dev !== orphan.identity.dev ||
+                  stLocked.ino !== orphan.identity.ino ||
+                  stLocked.size !== orphan.identity.size ||
+                  stLocked.mtimeMs !== orphan.identity.mtimeMs) {
+                casForTemp.rollback();
+                warnings.push({
+                  code: "GC_DELETE_FAILED",
+                  message: `Orphan temp identity changed under lock — file was replaced, refusing to delete: ${canonicalPath}`,
+                });
+                retainedOrphans.push(orphan);
+                continue;
+              }
+            }
+            unlinkSync(canonicalPath);
+            casForTemp.commit();
+            deletedTempPaths.push(canonicalPath);
+          } catch (e) {
+            try { casForTemp.rollback(); } catch { /* best effort */ }
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete orphan temp under CAS lock: ${(e as Error).message}` });
+            retainedOrphans.push(orphan);
+          } finally {
+            casForTemp.close();
+          }
         } catch (e) {
           warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete orphan temp: ${(e as Error).message}` });
           retainedOrphans.push(orphan);
@@ -1833,15 +1863,66 @@ export function applyGenerationOrphanRecovery(
             warnings.push({ code: "GC_DELETE_FAILED", message: `Active manifest != metadata.manifest (sha256/size/fingerprint/versions mismatch)` });
             retainedOrphans.push(orphan); continue;
           }
-          // All disk checks passed. Recover the CAS under lock.
+          // All disk checks passed. Build an ActiveRecoveryProof.
+          // R169B (§12 GATE): capture dev/ino/size/sha256 for DB and
+          // dev/ino/size for metadata BEFORE the lock. Under the lock,
+          // re-lstat and compare. If anything changed, refuse recovery.
+          const recoveryProof = {
+            db: { dev: dbStat.dev, ino: dbStat.ino, size: dbStat.size, sha256: actualHash },
+            metadata: { dev: metaStat.dev, ino: metaStat.ino, size: metaStat.size },
+            manifestSha256: m.sha256,
+            manifestSizeBytes: m.sizeBytes,
+          };
+          // Recover the CAS under lock.
           const cas = openCasStore(project, cacheRoot);
           try {
             cas.beginImmediate();
+            // R169B (§12): revalidate under lock.
+            // Re-read the active manifest under lock.
+            let lockedManifest: GenerationManifestV1 | null;
+            try {
+              lockedManifest = readOptionalGenerationManifest(manifestPathForRecovery, project);
+            } catch {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: manifest corrupt under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            if (!lockedManifest || lockedManifest.generationId !== gid) {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: manifest no longer points at ${gid} under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            // Re-lstat DB under lock, compare to proof.
+            const lockedDbStat = lstatSync(dbPath);
+            if (lockedDbStat.isSymbolicLink() || !lockedDbStat.isFile()) {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: DB not regular under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            if (lockedDbStat.dev !== recoveryProof.db.dev ||
+                lockedDbStat.ino !== recoveryProof.db.ino ||
+                lockedDbStat.size !== recoveryProof.db.size) {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: DB identity changed under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            // Re-lstat metadata under lock, compare to proof.
+            const lockedMetaStat = lstatSync(metaPath);
+            if (lockedMetaStat.isSymbolicLink() || !lockedMetaStat.isFile()) {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: metadata not regular under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            if (lockedMetaStat.dev !== recoveryProof.metadata.dev ||
+                lockedMetaStat.ino !== recoveryProof.metadata.ino ||
+                lockedMetaStat.size !== recoveryProof.metadata.size) {
+              cas.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery: metadata identity changed under lock` });
+              retainedOrphans.push(orphan); continue;
+            }
+            // All revalidation passed. Rebuild the catalog.
             const now = new Date().toISOString();
             const existing = cas.getGenerationCatalogEntry(gid);
-            // R169B-STEP10 (§9): preserve pinned from metadata if the
-            // metadata's pinned field is set. The metadata V1 schema
-            // may carry a `pinned` boolean; if so, honor it.
             const pinnedFromMeta = (metaValidated as { pinned?: boolean }).pinned === true;
             const pinned = existing?.pinned ?? pinnedFromMeta;
             if (!existing) {

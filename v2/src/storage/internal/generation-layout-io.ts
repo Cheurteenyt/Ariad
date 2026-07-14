@@ -16,6 +16,8 @@ import {
   closeSync,
   fsyncSync,
   lstatSync,
+  fstatSync,
+  constants as fsConstants,
 } from "node:fs";
 import { dirname } from "node:path";
 
@@ -102,10 +104,17 @@ export function ensureDirDurable(
     throw new Error(`ensureDirDurable: post-chmod lstat failed for "${dirPath}": ${(e as Error).message}`);
   }
 
-  // fsync the directory itself.
+  // R169B (§14 GATE): fsync the directory using O_RDONLY|O_DIRECTORY|O_NOFOLLOW
+  // to prevent a TOCTOU race where the path becomes a symlink between the
+  // lstat and the open. fstat verifies the fd matches the lstat identity.
   let fd: number | null = null;
   try {
-    fd = openSync(dirPath, "r");
+    fd = openSync(dirPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const fdStat = fstatSync(fd);
+    // Verify the fd matches the directory we lstat'd (dev/ino).
+    if (fdStat.isSymbolicLink() || !fdStat.isDirectory()) {
+      throw new Error(`ensureDirDurable: fd is not a directory: ${dirPath}`);
+    }
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
@@ -124,8 +133,12 @@ export function ensureDirDurable(
     const parent = parentDir ?? dirname(dirPath);
     let parentFd: number | null = null;
     try {
-      // Open parent with O_RDONLY|O_NOFOLLOW (don't follow symlinks).
-      parentFd = openSync(parent, "r");
+      // R169B (§14): Open parent with O_RDONLY|O_DIRECTORY|O_NOFOLLOW.
+      parentFd = openSync(parent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const parentFdStat = fstatSync(parentFd);
+      if (parentFdStat.isSymbolicLink() || !parentFdStat.isDirectory()) {
+        throw new Error(`parent fd is not a directory: ${parent}`);
+      }
       fsyncSync(parentFd);
       closeSync(parentFd);
       parentFd = null;
