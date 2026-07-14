@@ -1,31 +1,32 @@
 /**
- * R169B-STEP3 — Concurrency barrier test (GPT 5.6 §15 — C1).
+ * R169B — CAS stale-expected-active stability test.
  *
  * STATUS: FOUNDATION / INACTIVE
  *
- * Validates the CAS barrier stability across MANY iterations:
+ * RENAMED from r169b-concurrency-barrier.test.ts (GPT 5.6 deep audit §13):
+ * this test does NOT prove true simultaneous concurrency. It proves the
+ * stability of the CAS stale-expected-active guard over 50 iterations.
  *
- *   - 50 iterations of (winner publishes, then loser publishes with
- *     expectedActive=null).
- *   - The winner MUST succeed and the loser MUST fail with the STRICT
- *     error code `PUBLICATION_CAS_MISMATCH` (never BUSY, never
- *     PROMOTION_CONFLICT, never anything else).
- *   - The active manifest MUST point at the winner's generationId.
- *   - The CAS catalog MUST contain exactly ONE ACTIVE entry — the
- *     winner's. The loser's UUID MUST NOT appear in the catalog.
- *   - The CAS revision MUST strictly increase per successful
- *     publication (loser failure MUST NOT increase it).
- *   - No state leakage between iterations: each iteration uses a
- *     fresh cacheRoot and fresh UUIDs.
+ * What this test proves:
+ *   - A publisher that starts AFTER the previous winner has committed
+ *     will deterministically get PUBLICATION_CAS_MISMATCH (not BUSY).
+ *   - The CAS revision strictly increases per successful publication.
+ *   - A failed publication does NOT bump the revision.
+ *   - No state leakage between iterations.
+ *   - No staging DB files leak in tmp/.
+ *   - generations/ contains exactly N .db files (one per winner).
  *
- * The loser is started AFTER the winner has fully committed. This is
- * intentional: we want the loser to observe the post-commit state and
- * thus deterministically hit CAS_MISMATCH (not BUSY, which would only
- * happen if the loser's BEGIN IMMEDIATE collided with the winner's
- * still-open transaction). For the multi-process race that exercises
- * the BUSY path, see `r169b-publication-concurrency.test.ts` test #2.
+ * What this test does NOT prove:
+ *   - Two publishers starting simultaneously (true race).
+ *   - PUBLICATION_CAS_BUSY under contention.
  *
- * 50 iterations × ~10ms per iteration = ~500ms total. Cheap.
+ * For true simultaneous concurrency, see
+ * `r169b-publication-concurrency.test.ts` test #2 (multi-process race
+ * via spawn, which CAN produce CAS_BUSY when BEGIN IMMEDIATE collides).
+ *
+ * Note: with busy_timeout=0, a true simultaneous loser may legitimately
+ * receive PUBLICATION_CAS_BUSY (not CAS_MISMATCH). This test avoids
+ * that by running the loser strictly AFTER the winner commits.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -103,7 +104,7 @@ function runPublisherOnce(opts: { expectedActive: string | null }): PublisherRun
 
 // ─── Tests ─────────────────────────────────────────────────────────────
 
-describe("R169B-STEP3 — concurrency barrier (C1: 50 iterations, strict CAS_MISMATCH)", () => {
+describe("R169B — CAS stale-expected-active stability (50 iterations)", () => {
   it("across 50 iterations, the loser ALWAYS gets PUBLICATION_CAS_MISMATCH (strict)", () => {
     const failures: string[] = [];
     let lastWinnerId: string | null = null;

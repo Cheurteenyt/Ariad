@@ -2296,12 +2296,17 @@ export function publishPreparedGeneration(
   }
 }
 
-// ─── R169B-STEP3 (C3): publishPreparedGenerationInternal ─────────────────
+// ─── R169B (C3): publishPreparedGenerationInternal ──────────────────────
 //
 // Test-facing wrapper around `publishPreparedGeneration` that injects
 // a faultable PublisherOps and a barrier callback for the crash
-// harness. The injection is scoped to a single call via try/finally
-// so a thrown error does NOT leak the injection to subsequent calls.
+// harness. The injection is scoped to a single call via AsyncLocalStorage
+// so concurrent calls do NOT interfere.
+//
+// @internal — NOT part of the public API. Not re-exported from
+// generation-store.ts. Not used by any production code path. Only
+// imported by tests/storage/r169b-crash-harness.test.ts and
+// scripts/publication-benchmark-r169b.ts.
 //
 // Production code NEVER calls this — it calls the public
 // `publishPreparedGeneration` directly. Only the crash harness tests
