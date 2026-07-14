@@ -52,6 +52,13 @@ const N_FILES = N_NODES;
 
 const PROJECT = "r169b-bench-project";
 
+interface PhaseTimings {
+  reserveMs: number[];
+  populateMs: number[];
+  prepareMs: number[];
+  publishMs: number[];
+}
+
 interface BenchResult {
   scenario: string;
   wallMs: number;
@@ -62,6 +69,16 @@ interface BenchResult {
   catalogActive: number;
   catalogDeleted: number;
   dedupedRepub: boolean;
+  phases: {
+    reserveAvgMs: number;
+    populateAvgMs: number;
+    prepareAvgMs: number;
+    publishAvgMs: number;
+    reserveTotalMs: number;
+    populateTotalMs: number;
+    prepareTotalMs: number;
+    publishTotalMs: number;
+  };
   invariants: {
     manifestValid: boolean;
     dbExists: boolean;
@@ -130,18 +147,32 @@ function runBenchmark(): BenchResult {
   const publishedIds: string[] = [];
   let dedupedRepub = false;
 
+  const phases: PhaseTimings = {
+    reserveMs: [],
+    populateMs: [],
+    prepareMs: [],
+    publishMs: [],
+  };
+
   const start = nowMs();
 
   try {
     for (let i = 0; i < N_GENERATIONS; i++) {
       // RESERVE
+      const t0 = nowMs();
       const reservation = reserveGenerationStaging(PROJECT, { cacheRoot });
+      const t1 = nowMs();
+      phases.reserveMs.push(t1 - t0);
 
       // POPULATE
       populateStagingDb(reservation.stagingPath, i);
+      const t2 = nowMs();
+      phases.populateMs.push(t2 - t1);
 
       // PREPARE
       const prepared = prepareGenerationForPublication(reservation);
+      const t3 = nowMs();
+      phases.prepareMs.push(t3 - t2);
 
       // PUBLISH
       const result = publishPreparedGeneration(
@@ -149,6 +180,8 @@ function runBenchmark(): BenchResult {
         { expectedActiveGenerationId: i === 0 ? null : publishedIds[publishedIds.length - 1] },
         { cacheRoot },
       );
+      const t4 = nowMs();
+      phases.publishMs.push(t4 - t3);
 
       // Verify CAS revision is monotonic.
       if (result.cas.revision <= lastRevision) {
@@ -234,6 +267,10 @@ function runBenchmark(): BenchResult {
     // ignore
   }
 
+  // Compute per-phase averages.
+  const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0);
+
   return {
     scenario: SMOKE ? "publication-smoke" : "publication-full",
     wallMs,
@@ -244,6 +281,16 @@ function runBenchmark(): BenchResult {
     catalogActive,
     catalogDeleted,
     dedupedRepub,
+    phases: {
+      reserveAvgMs: Math.round(avg(phases.reserveMs) * 100) / 100,
+      populateAvgMs: Math.round(avg(phases.populateMs) * 100) / 100,
+      prepareAvgMs: Math.round(avg(phases.prepareMs) * 100) / 100,
+      publishAvgMs: Math.round(avg(phases.publishMs) * 100) / 100,
+      reserveTotalMs: Math.round(sum(phases.reserveMs)),
+      populateTotalMs: Math.round(sum(phases.populateMs)),
+      prepareTotalMs: Math.round(sum(phases.prepareMs)),
+      publishTotalMs: Math.round(sum(phases.publishMs)),
+    },
     invariants: {
       manifestValid,
       dbExists,
@@ -259,6 +306,16 @@ function formatResult(r: BenchResult): string {
   lines.push(`R169B publication benchmark — ${r.scenario}`);
   lines.push(`  generations: ${r.generations} (× ${r.nodesPerGen} nodes each)`);
   lines.push(`  wall time:   ${r.wallMs} ms`);
+  lines.push(``);
+  lines.push(`  per-phase timing (avg / total over ${r.generations} generations):`);
+  lines.push(`    RESERVE   ${r.phases.reserveAvgMs.toFixed(2)} ms/gen avg  ${r.phases.reserveTotalMs} ms total`);
+  lines.push(`    POPULATE  ${r.phases.populateAvgMs.toFixed(2)} ms/gen avg  ${r.phases.populateTotalMs} ms total`);
+  lines.push(`    PREPARE   ${r.phases.prepareAvgMs.toFixed(2)} ms/gen avg  ${r.phases.prepareTotalMs} ms total`);
+  lines.push(`    PUBLISH   ${r.phases.publishAvgMs.toFixed(2)} ms/gen avg  ${r.phases.publishTotalMs} ms total`);
+  const phaseSum = r.phases.reserveTotalMs + r.phases.populateTotalMs + r.phases.prepareTotalMs + r.phases.publishTotalMs;
+  lines.push(`    ────────`);
+  lines.push(`    SUM       ${phaseSum} ms (wall ${r.wallMs} ms, overhead ${r.wallMs - phaseSum} ms)`);
+  lines.push(``);
   lines.push(`  CAS revision: ${r.casRevision}`);
   lines.push(`  CAS catalog:  ACTIVE=${r.catalogActive}, DELETED=${r.catalogDeleted}`);
   lines.push(`  active gen:   ${r.activeGenerationId ?? "(none)"}`);
