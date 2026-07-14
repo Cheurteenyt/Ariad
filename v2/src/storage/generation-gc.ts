@@ -131,6 +131,21 @@ const DEFAULT_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  */
 const planTokens: WeakMap<GenerationGcPlan, true> = new WeakMap();
 
+/**
+ * R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): A private WeakMap that
+ * authenticates orphan recovery plans produced by
+ * `planGenerationOrphanRecovery`. The applier rejects plans not in
+ * this WeakMap (GC_PLAN_UNAUTHENTICATED). A literal object, spread,
+ * or JSON clone produces a new reference that is NOT in the WeakMap.
+ *
+ * Without this authentication, a caller could forge a
+ * `GenerationOrphanPlan` with an arbitrary `path` field and trick the
+ * applier into deleting an arbitrary regular file (the applier was
+ * using `orphan.path` directly as the unlink target for
+ * PROMOTION_TEMP orphans).
+ */
+const orphanPlanTokens: WeakMap<GenerationOrphanPlan, true> = new WeakMap();
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
@@ -1280,7 +1295,21 @@ export function planGenerationOrphanRecovery(
     orphans.push({ path: manifestPath, kind: "ACTIVE_NOT_IN_CATALOG", generationId: activeGenerationId, observedAt: now, reason: "Active manifest generation not in CAS catalog" });
   }
 
-  return { project, cacheRoot, orphans, activeGenerationId, casRevision };
+  const plan: GenerationOrphanPlan = {
+    project,
+    cacheRoot,
+    orphans,
+    activeGenerationId,
+    casRevision,
+  };
+  // R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): Freeze the plan and all
+  // its nested arrays/entries so a caller cannot mutate them in place.
+  Object.freeze(plan);
+  Object.freeze(plan.orphans);
+  for (const e of plan.orphans) Object.freeze(e);
+  // Register the plan in the WeakMap so the applier can authenticate it.
+  orphanPlanTokens.set(plan, true);
+  return plan;
 }
 
 export interface GenerationOrphanResult {
@@ -1299,6 +1328,31 @@ export function applyGenerationOrphanRecovery(
   const project = plan.project;
   const cacheRoot = options?.cacheRoot ?? plan.cacheRoot ?? getCacheRoot();
 
+  // R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): Authenticate the plan via
+  // the private WeakMap. A literal, spread, or JSON clone produces a
+  // new reference that is NOT in the WeakMap → GC_PLAN_UNAUTHENTICATED.
+  if (!orphanPlanTokens.has(plan)) {
+    throw new GenerationStoreError(
+      "GC_PLAN_UNAUTHENTICATED",
+      phase,
+      project,
+      `Orphan plan is not authentic (not in the private WeakMap). Plans MUST be produced by planGenerationOrphanRecovery in the same process; spread/JSON-clone/literal objects are rejected.`,
+    );
+  }
+
+  // R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): Verify cacheRoot/project
+  // consistency. The applier NEVER trusts the plan's cacheRoot field
+  // as authority — it re-derives from options or getCacheRoot(), and
+  // verifies it matches the plan's cacheRoot.
+  if (cacheRoot !== plan.cacheRoot) {
+    throw new GenerationStoreError(
+      "GC_PLAN_UNAUTHENTICATED",
+      phase,
+      project,
+      `cacheRoot mismatch: options/plan.cacheRoot="${plan.cacheRoot}" but resolved cacheRoot="${cacheRoot}" (the applier re-derives cacheRoot and rejects mismatches)`,
+    );
+  }
+
   assertTrustedRootNoSymlinks(cacheRoot, project, phase);
 
   const projectStore = projectStoreDir(project, cacheRoot);
@@ -1308,18 +1362,44 @@ export function applyGenerationOrphanRecovery(
   const retainedOrphans: GenerationOrphanEntry[] = [];
   let casRecovered = false;
 
+  // R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): Derive the canonical
+  // promotion-temp path from the basename. The applier NEVER uses
+  // orphan.path as authority for unlink — it extracts the basename,
+  // validates it matches the promotion-temp pattern, and re-joins
+  // with the canonical generations/ dir. This prevents path traversal
+  // and arbitrary-file deletion.
+  const PROMOTION_TEMP_RE = /^\.publish-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[0-9a-f-]+\.db$/;
+
   for (const orphan of plan.orphans) {
     switch (orphan.kind) {
       case "PROMOTION_TEMP": {
         try {
-          const st = lstatSync(orphan.path);
-          if (st.isSymbolicLink() || !st.isFile()) {
-            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp not a regular file: ${orphan.path}` });
+          // R169B-STEP10 (P0): Re-derive the path from the basename.
+          // Extract the basename from orphan.path, validate it matches
+          // the promotion-temp pattern, and re-join with generations/.
+          const basename = orphan.path.split("/").pop() ?? "";
+          if (!PROMOTION_TEMP_RE.test(basename)) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp basename does not match canonical pattern: ${basename}` });
             retainedOrphans.push(orphan);
             continue;
           }
-          unlinkSync(orphan.path);
-          deletedTempPaths.push(orphan.path);
+          const canonicalPath = join(generations, basename);
+          // Verify the canonical path is inside generations/ (containment).
+          try {
+            assertPathInsideNoSymlinks(generations, canonicalPath, project, phase);
+          } catch (e) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp path containment check failed: ${(e as Error).message}` });
+            retainedOrphans.push(orphan);
+            continue;
+          }
+          const st = lstatSync(canonicalPath);
+          if (st.isSymbolicLink() || !st.isFile()) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp not a regular file: ${canonicalPath}` });
+            retainedOrphans.push(orphan);
+            continue;
+          }
+          unlinkSync(canonicalPath);
+          deletedTempPaths.push(canonicalPath);
         } catch (e) {
           warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete orphan temp: ${(e as Error).message}` });
           retainedOrphans.push(orphan);
@@ -1329,6 +1409,9 @@ export function applyGenerationOrphanRecovery(
       case "ACTIVE_NOT_IN_CATALOG": {
         if (!orphan.generationId) { retainedOrphans.push(orphan); continue; }
         const gid = orphan.generationId;
+        // R169B-STEP10 (P0): Re-derive paths from generationId — never
+        // trust orphan.path for ACTIVE_NOT_IN_CATALOG (it points at the
+        // manifest, which we don't delete; we only recover the CAS).
         const dbPath = deriveDbPath(projectStore, gid);
         const metaPath = deriveMetadataPath(projectStore, gid);
         try {
