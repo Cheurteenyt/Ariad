@@ -2070,7 +2070,32 @@ export function publishPreparedGeneration(
       // Read + validate metadata.
       const candidateMetaRaw = readFileSyncText(effectiveMetadataPath, MAX_METADATA_SIDECAR_BYTES);
       const candidateMetaParsed = JSON.parse(candidateMetaRaw);
-      validateGenerationMetadata(candidateMetaParsed, project);
+      const candidateMetaValidated = validateGenerationMetadata(candidateMetaParsed, project);
+      // R169B (§5 GATE): compare ALL 13 manifest fields between the
+      // metadata's manifest and the effectiveManifest. A metadata from
+      // a different generation (valid schema, same project) must NOT
+      // pass candidate verify — otherwise it becomes visible when the
+      // manifest is written, opening a reader window.
+      const cm = candidateMetaValidated.manifest;
+      const em = effectiveManifest;
+      if (cm.formatVersion !== em.formatVersion ||
+          cm.project !== em.project ||
+          cm.generationId !== em.generationId ||
+          cm.dbFile !== em.dbFile ||
+          cm.createdAt !== em.createdAt ||
+          cm.rootFingerprint !== em.rootFingerprint ||
+          cm.extractorSemanticsVersion !== em.extractorSemanticsVersion ||
+          cm.discoveryPolicyVersion !== em.discoveryPolicyVersion ||
+          cm.nodeCount !== em.nodeCount ||
+          cm.edgeCount !== em.edgeCount ||
+          cm.fileCount !== em.fileCount ||
+          cm.sizeBytes !== em.sizeBytes ||
+          cm.sha256 !== em.sha256) {
+        throw new Error(
+          `candidate metadata.manifest does not match effectiveManifest ` +
+          `(differs on one or more of the 13 required fields)`,
+        );
+      }
     } catch (e) {
       if (e instanceof GenerationStoreError) throw e;
       throw new GenerationStoreError("PUBLICATION_VERIFY_FAILED", phase, project,
@@ -2804,6 +2829,29 @@ function writeMetadataSidecarAtomically(
       const n = writeSync(metaTempFd, metadataBuffer, offset, metadataBuffer.length - offset, null);
       if (n <= 0) throw new Error("zero-progress write on metadata temp");
       offset += n;
+    }
+    // R169B (§6 GATE): fchmod(metaTempFd, 0600) + fstat verify.
+    // The openSync with mode 0o600 is filtered by umask. fchmod forces
+    // the exact mode regardless of umask. fstat verifies owner + mode.
+    try {
+      fs_fchmodSync(metaTempFd, 0o600);
+      const modeStat = fstatSync(metaTempFd);
+      if ((modeStat.mode & 0o777) !== 0o600) {
+        throw new Error(`metadata temp mode is 0o${(modeStat.mode & 0o777).toString(8)} after fchmod (expected 0600)`);
+      }
+      if (typeof process.getuid === "function" && modeStat.uid !== process.getuid()) {
+        throw new Error(`metadata temp owner uid=${modeStat.uid} != process uid=${process.getuid()}`);
+      }
+    } catch (e) {
+      try { closeSync(metaTempFd); } catch {}
+      try { unlinkSync(metadataTempPath); } catch {}
+      throw new GenerationStoreError(
+        "GENERATION_METADATA_INVALID",
+        phase,
+        project,
+        `fchmod/fstat on metadata temp failed: ${(e as Error).message}`,
+        generationId,
+      );
     }
     // fsync the temp.
     fsyncSync(metaTempFd);
