@@ -277,6 +277,7 @@ After any modification to GitHub repository settings:
 - [CI_CONTINUITY.md](CI_CONTINUITY.md) — Operational resilience plan
 - [RELEASE_POLICY.md](RELEASE_POLICY.md) — Release governance
 - [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) — Development workflow and conventions
+- [RESTRICTED_ENVIRONMENT_GIT_TRANSPORT.md](RESTRICTED_ENVIRONMENT_GIT_TRANSPORT.md) — SSH wrapper for environments without native OpenSSH
 
 ## 16. Cross-host Signature Trust Boundary (SIG-R169)
 
