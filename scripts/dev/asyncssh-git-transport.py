@@ -123,8 +123,8 @@ def validate_command(cmd: str) -> str:
     except ValueError as e:
         raise ValueError(f"shlex parse failed: {e}")
 
-    if len(parts) < 2:
-        raise ValueError(f"expected 'git-<verb> <repo>', got: {cmd}")
+    if len(parts) != 2:
+        raise ValueError(f"expected exactly 'git-<verb> <repo>' (2 tokens), got {len(parts)} tokens: {cmd}")
 
     verb = parts[0]
     repo = parts[1]
@@ -167,11 +167,16 @@ def validate_key_file(path: str) -> str:
     if not p.is_file():
         raise ValueError(f"client key is not a regular file: {path}")
 
-    mode = p.stat().st_mode
-    # Check that no group/other read bits are set (0600 or stricter).
-    if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
+    # R169B (§21 SSH-03): use lstat, refuse symlink, check owner + mode.
+    st = p.lstat()
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(f"client key is a symlink: {path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"client key is not a regular file: {path}")
+    # Mode must be 0600 or stricter — no group/other access.
+    if (st.st_mode & 0o077) != 0:
         raise ValueError(
-            f"client key {path} is group/other accessible (mode {oct(mode & 0o777)}); "
+            f"client key {path} is group/other accessible (mode {oct(st.st_mode & 0o777)}); "
             f"expected 0600 or stricter. Run: chmod 600 {path}"
         )
 
@@ -245,7 +250,12 @@ async def run_git_transport(
             encoding=None,
             check=False,
         )
-        return result.exit_status or 0
+        # R169B (§21 SSH-02): exit_status must be a real int, not None.
+        # If the process was killed by a signal, treat as failure.
+        if result.exit_status is None:
+            sys.stderr.write("SSH transport: remote process exited without status (killed by signal?)\n")
+            return 1
+        return result.exit_status
     finally:
         conn.close()
         await conn.wait_closed()
@@ -332,11 +342,11 @@ def git_ssh_main(argv: list[str]) -> int:
             run_git_transport(host, port, username, key_file, known_hosts, cmd)
         )
     except Exception as e:
-        # Sanitize error — never leak key paths or secrets.
+        # R169B (§21 SSH-07): display a sanitized diagnostic message.
         msg = str(e)
         if key_file in msg:
             msg = msg.replace(key_file, "<KEY_PATH>")
-        sys.stderr.write(f"SSH transport failed: {type(e).__name__}\n")
+        sys.stderr.write(f"SSH transport failed: {type(e).__name__}: {msg}\n")
         return 1
 
 
