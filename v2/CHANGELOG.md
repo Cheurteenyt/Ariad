@@ -115,7 +115,7 @@ for all new Bloc B behaviors and the long-overdue documentation rewrite.
   8. `fsync(generations/)`.
   9. Unlink temp **after identity re-check** (lstat dev/ino/size match).
   10. `fsync(generations/)`.
-  
+
   The `cleanupTemp()` helper now **compares dev/ino/size** before
   unlinking. If the identity doesn't match (file was replaced), it does
   NOT unlink. The mutation state is only reset if the cleanup is fully
@@ -207,7 +207,7 @@ production code path is activated.
   8. fsync `generations/`.
   9. unlink temp.
   10. fsync `generations/`.
-  
+
   On any error, cleanup only touches the **temp** (which has a known
   identity from step 3), never the final path. This is truly identity-safe:
   a concurrent process cannot create or replace `finalPath` and have it

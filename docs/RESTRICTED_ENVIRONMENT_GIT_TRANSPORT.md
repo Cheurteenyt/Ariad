@@ -1,7 +1,9 @@
 # Restricted-Environment Git Transport
 
-**Status:** Maintainer/agent tool — NOT a runtime dependency  
-**Last verified:** 2026-07-14  
+**Status:** Maintainer/agent tool — NOT a runtime dependency
+
+**Last verified:** 2026-07-14
+
 **Helper:** `scripts/dev/asyncssh-git-transport.py`
 
 ## 1. Problem

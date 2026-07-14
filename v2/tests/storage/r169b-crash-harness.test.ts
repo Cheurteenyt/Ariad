@@ -343,7 +343,7 @@ const TSX_BIN = path.join(V2_ROOT, "node_modules/.bin/tsx");
  *
  * Returns the child's PID and a function to wait for the barrier.
  */
-function makeChildScript(crashPoint: string): string {
+function makeChildScript(crashPoint: string, pin = false): string {
   return `
 import { reserveGenerationStaging, prepareGenerationForPublication, publishPreparedGenerationInternal } from ${JSON.stringify(SRC_ROOT + "/storage/generation-publisher.ts")};
 import { PROD_PUBLISHER_OPS } from ${JSON.stringify(SRC_ROOT + "/storage/internal/generation-publisher-ops.ts")};
@@ -378,7 +378,7 @@ try {
   const p = prepareGenerationForPublication(r);
   const result = publishPreparedGenerationInternal(
     p,
-    { expectedActiveGenerationId: null },
+    { expectedActiveGenerationId: null, pin: ${String(pin)} },
     { cacheRoot },
     PROD_PUBLISHER_OPS,
     onBarrier,
@@ -495,7 +495,7 @@ describe("R169B-STEP3 (C3) — child-process crash tests", () => {
   it("crash at pre-cas-commit: kill child after manifest write but before CAS commit → manifest exists but CAS active is null", () => {
     const barrierDir = join(tmpdir(), `r169b-crash-barriers-${process.pid}-${Date.now()}`);
     mkdirSync(barrierDir, { recursive: true });
-    const childScript = makeChildScript("pre-cas-commit");
+    const childScript = makeChildScript("pre-cas-commit", true);
     const childScriptPath = join(tmpdir(), `r169b-crash-child-${process.pid}-${Date.now()}.ts`);
     writeFileSync(childScriptPath, childScript, "utf-8");
 
@@ -536,6 +536,8 @@ describe("R169B-STEP3 (C3) — child-process crash tests", () => {
       const cas = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
       const casActive = cas.getActiveGenerationId();
       cas.close();
+      let recoveryExpectedActive = casActive;
+      let interruptedGenerationId: string | null = null;
 
       // Two possible outcomes:
       //   a. The child completed before the kill → manifest exists,
@@ -545,6 +547,8 @@ describe("R169B-STEP3 (C3) — child-process crash tests", () => {
       //      (commit didn't happen). This is the crash scenario.
       if (existsSync(manifestPath)) {
         const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        recoveryExpectedActive = manifest.generationId;
+        interruptedGenerationId = manifest.generationId;
         // If the CAS active matches the manifest, the child completed.
         // If not, the child was killed at the barrier.
         if (casActive === manifest.generationId) {
@@ -573,7 +577,7 @@ describe("R169B-STEP3 (C3) — child-process crash tests", () => {
       const p = prepareGenerationForPublication(r);
       const result = publishPreparedGeneration(
         p,
-        { expectedActiveGenerationId: casActive }, // null or the prior active
+        { expectedActiveGenerationId: recoveryExpectedActive },
         { cacheRoot },
       );
       expect(result.publicationState).toBe("PUBLISHED");
@@ -585,6 +589,9 @@ describe("R169B-STEP3 (C3) — child-process crash tests", () => {
       // The CAS active matches.
       const cas3 = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
       expect(cas3.getActiveGenerationId()).toBe(result.generationId);
+      if (interruptedGenerationId !== null) {
+        expect(cas3.getGenerationCatalogEntry(interruptedGenerationId)?.pinned).toBe(true);
+      }
       cas3.close();
     } finally {
       try { rmSync(barrierDir, { recursive: true, force: true }); } catch { /* best effort */ }

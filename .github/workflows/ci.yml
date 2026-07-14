@@ -1,5 +1,6 @@
 # GitHub Actions CI for Codebase Memory V2
-# Runs typecheck, build, and tests on every push and pull request.
+# Runs the complete validation gate on pushes to main and pull requests:
+# backend, frontend, npm package smoke, and Docker smoke.
 # This is the canonical CI — GitHub is the canonical repository since R166
 # and GitLab is a passive main-only mirror with no pipelines.
 # Standard GitHub-hosted runners are free for public repositories; larger
@@ -25,8 +26,8 @@
 #       Previously, `if: github.event_name == 'schedule'` caused the job
 #       to be skipped on push/PR, and GitHub Actions reported skipped jobs
 #       as "1 error" in annotations, making the pipeline look failed.
-#       Now this workflow only runs backend + frontend on push/PR — no
-#       skipped jobs, no false error annotations.
+#       Now this workflow only runs validation jobs on push/PR — no
+#       schedule-only job, no false skipped-job annotations.
 
 name: CI
 
@@ -48,9 +49,8 @@ concurrency:
 
 # R52: least-privilege — the default GITHUB_TOKEN has write permissions
 # we don't need. Restrict to read-only for all jobs.
-# R55 (D3): quota-report needs `actions: read` for its /actions/runs API
-# call — it gets its own job-level override below. backend/frontend stay
-# at this workflow-level default (contents: read only).
+# The schedule-only quota report lives in quota-report.yml with its own
+# `actions: read` permission. All four CI jobs remain contents-read only.
 permissions:
   contents: read
 
@@ -143,6 +143,119 @@ jobs:
       - name: Test
         run: npx vitest run
 
+  # ── Package: autonomous pack + install + CLI smoke ─────────────
+  package-smoke:
+    name: npm pack + install + CLI smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: v2/package-lock.json
+
+      - name: npm ci (v2 only)
+        working-directory: v2
+        run: npm ci
+
+      - name: npm pack (triggers prepack autonomously)
+        working-directory: v2
+        run: |
+          PACK_DIR="$RUNNER_TEMP/cbm-pack"
+          mkdir -p "$PACK_DIR"
+          npm pack --pack-destination "$PACK_DIR"
+          TARBALLS=()
+          while IFS= read -r f; do
+            TARBALLS+=("$f")
+          done < <(find "$PACK_DIR" -maxdepth 1 -type f -name '*.tgz' -print)
+          if [ "${#TARBALLS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly 1 tarball, found ${#TARBALLS[@]}" >&2
+            exit 1
+          fi
+          TARBALL="${TARBALLS[0]}"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      - name: Inspect tarball contents
+        run: |
+          echo "=== Tarball contents ==="
+          tar -tf "${{ env.TARBALL }}" | sort
+          CONTENTS=$(tar -tf "${{ env.TARBALL }}")
+          for required in \
+            "package/package.json" \
+            "package/LICENSE" \
+            "package/README.md" \
+            "package/CHANGELOG.md" \
+            "package/dist/cli/index.js" \
+            "package/dist/ui/index.html"; do
+            if echo "$CONTENTS" | grep -Fqx "$required"; then
+              echo "  ok: $required"
+            else
+              echo "  MISSING: $required"
+              exit 1
+            fi
+          done
+          for forbidden in \
+            "package/src/" \
+            "package/tests/" \
+            "package/node_modules/" \
+            "package/.git"; do
+            if echo "$CONTENTS" | grep -Fq "$forbidden"; then
+              echo "  FORBIDDEN: $forbidden"
+              exit 1
+            fi
+          done
+
+      - name: Install tarball in temp directory
+        run: |
+          mkdir -p /tmp/cbm-install
+          npm install --prefix /tmp/cbm-install "${{ env.TARBALL }}"
+
+      - name: CLI smoke test from arbitrary cwd
+        working-directory: /tmp
+        run: |
+          /tmp/cbm-install/node_modules/.bin/cbm-v2 --version
+          /tmp/cbm-install/node_modules/.bin/cbm-v2 --help
+
+  # ── Docker: image + CLI + non-root smoke ───────────────────────
+  docker-smoke:
+    name: Docker build + CLI + non-root smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build Docker image (no cache)
+        run: docker build --no-cache -t cbm-v2:test .
+
+      - name: CLI version
+        run: docker run --rm cbm-v2:test --version
+
+      - name: CLI help
+        run: docker run --rm cbm-v2:test --help
+
+      - name: Non-root user check
+        run: |
+          CONTAINER_UID="$(docker run --rm --entrypoint sh cbm-v2:test -c 'id -u')"
+          echo "Container runs as UID: $CONTAINER_UID"
+          test "$CONTAINER_UID" = "1000"
+
+      - name: Cache directory writable
+        run: |
+          docker run --rm --entrypoint sh cbm-v2:test -c 'mkdir -p /home/node/.cache/codebase-memory-mcp && touch /home/node/.cache/codebase-memory-mcp/test && echo "Cache writable"'
+
+      - name: UI assets present
+        run: |
+          docker run --rm --entrypoint sh cbm-v2:test -c 'test -f /app/dist/ui/index.html && echo "UI index.html present"'
+
 # R112: removed quota-report job from this workflow.
 # Previously, quota-report had `if: github.event_name == 'schedule'` which
 # caused it to be SKIPPED on every push/PR. GitHub Actions reports skipped
@@ -150,4 +263,5 @@ jobs:
 # when backend/frontend passed.
 # Fix: quota-report now lives in its own schedule-only workflow file
 # (.github/workflows/quota-report.yml). This way, push/PR pipelines only
-# contain backend + frontend — no skipped jobs, no false error annotations.
+# contain the four validation jobs — no schedule-only skipped job and no
+# false error annotations.

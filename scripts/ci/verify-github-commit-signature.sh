@@ -9,16 +9,15 @@
 # same script against a local HTTP fixture server.
 #
 # DEPLOYMENT STATE (SIG-R3-TRUST-01, 2-phase bootstrap):
-#   Phase A (current): This script is published and tested, but NOT yet
-#     called by the mirror workflow. The mirror workflow remains in its
-#     pre-SIG-R169 state.
-#   Phase B (future PR): The mirror workflow will load this script from
-#     the immutable Phase A squash SHA (NOT from main, HEAD, or TARGET_SHA)
-#     and execute it before TARGET_SHA checkout.
+#   Phase A: completed at the immutable trusted SHA.
+#   Phase B: active. The mirror workflow loads this verifier and the mirror
+#     state machine from that pinned SHA (NOT main, HEAD, or TARGET_SHA),
+#     executes this verifier before TARGET_SHA checkout, and treats the target
+#     checkout as Git data only.
 #
 # Trust boundary (SIG-R169-POLICY-01):
-#   - Phase B: This script will be loaded from an immutable pinned
-#     Phase A squash SHA — NOT from a moving ref like main or HEAD.
+#   - Phase B: This script is loaded from an immutable pinned Phase A squash
+#     SHA — NOT from a moving ref like main or HEAD.
 #   - It verifies TARGET_SHA via the GitHub REST API.
 #   - No checked-out repository code is executed before this gate.
 #   - A GitHub "verified" badge proves cryptographic provenance, NOT code safety.

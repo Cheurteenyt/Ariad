@@ -103,6 +103,26 @@ function publishWithFingerprint(rootFingerprint: string, expectedActive: string 
 // ─── 1. Plan: basic retain / delete ──────────────────────────────────────
 
 describe("R169B-STEP2 GC — planGenerationGc (basic)", () => {
+  it("rejects destructive or malformed GC option values", () => {
+    const invalidOptions = [
+      { retainCount: -1 },
+      { retainCount: 1.5 },
+      { tmpMaxAgeMs: Number.NaN },
+      { tmpMaxAgeMs: Number.POSITIVE_INFINITY },
+      { promotionTempGraceMs: -1 },
+      { pin: ["not-a-uuid"] },
+    ];
+    for (const invalid of invalidOptions) {
+      try {
+        planGenerationGc(FIXTURE_PROJECT_NAME, { cacheRoot, ...invalid });
+        expect.fail(`expected options to be rejected: ${JSON.stringify(invalid)}`);
+      } catch (e) {
+        expect(e).toBeInstanceOf(GenerationStoreError);
+        expect((e as GenerationStoreError).code).toBe("GENERATION_STORE_CONFIG_ERROR");
+      }
+    }
+  });
+
   it("returns an empty plan when no generations have been published", () => {
     const plan = planGenerationGc(FIXTURE_PROJECT_NAME, { cacheRoot });
     expect(plan.project).toBe(FIXTURE_PROJECT_NAME);
@@ -282,10 +302,11 @@ describe("R169B-STEP2 GC — applyGenerationGcPlan (stale plan)", () => {
 // ─── 5. Apply: happy path ───────────────────────────────────────────────
 
 describe("R169B-STEP2 GC — applyGenerationGcPlan (happy path)", () => {
-  it("deletes the stale generation's DB + metadata + marks CAS DELETED", () => {
+  it("hashes and deletes in the ESM runtime, then marks CAS DELETED", () => {
     const ids = publishNGenerations(4);
     const plan = planGenerationGc(FIXTURE_PROJECT_NAME, { cacheRoot });
     expect(plan.delete.length).toBe(1);
+    const revisionBefore = plan.casRevision;
 
     const result = applyGenerationGcPlan(plan, { cacheRoot });
     expect(result.applied).toBe(true);
@@ -301,6 +322,9 @@ describe("R169B-STEP2 GC — applyGenerationGcPlan (happy path)", () => {
     const cas = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
     const entry = cas.getGenerationCatalogEntry(ids[0]);
     expect(entry?.status).toBe("DELETED");
+    // MARK_DELETING and DELETE each append one history entry, and each
+    // append increments the revision exactly once.
+    expect(cas.getRevision()).toBe(revisionBefore + 2);
     cas.close();
   });
 

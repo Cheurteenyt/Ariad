@@ -14,7 +14,7 @@
    GitHub Pull Request
               │
               ▼
-   GitHub Actions CI (backend + frontend)
+   GitHub Actions CI (backend + frontend + package + Docker)
               │
               ▼
    review + branch protection rules
@@ -38,7 +38,8 @@
 
 - **Canonical repository** for source code, branches, tags, issues, PRs.
 - **Primary CI** runs on GitHub Actions (`ci.yml`): backend typecheck + build
-  + tests + benchmark smoke, frontend typecheck + build + tests.
+  + tests + benchmarks, frontend typecheck + build + tests, npm package
+  smoke, and Docker smoke. All four jobs always run.
 - **Reviews and merges** happen on GitHub PRs.
 - **Mirror trigger** lives on GitHub (`mirror-main-to-gitlab.yml`).
 
@@ -65,6 +66,8 @@ human or bot key. It is stored as a GitHub Actions secret in the
 | `GITLAB_MIRROR_SSH_PRIVATE_KEY` | secret | Ed25519 private key, registered as a project-scoped write-access deploy key on the GitLab repo |
 | `GITLAB_REPOSITORY_SSH_URL` | variable | `git@gitlab.com:cheurteen1/codebase-memory-V2.git` |
 | `GITLAB_KNOWN_HOSTS` | variable | Pinned GitLab host keys (verified against an official GitLab source) |
+| `GITLAB_MIRROR_KEY_FINGERPRINT` | variable | Expected Ed25519 client deploy-key fingerprint |
+| `GITLAB_ED25519_HOST_FINGERPRINT` | variable | Expected official GitLab.com Ed25519 host-key fingerprint |
 
 The `gitlab-passive-mirror` environment is restricted to the `main` branch.
 No manual approval is required (otherwise every mirror would block).
@@ -271,7 +274,7 @@ The `mirror-main-to-gitlab` workflow required four runs before success:
 
 | Run | Failure mode | Root cause | Fix |
 |-----|--------------|------------|-----|
-| 1 | `GITLAB_REPOSITORY_SSH_URL is empty` | GitHub environment not configured | Configure environment + secret + 2 variables |
+| 1 | `GITLAB_REPOSITORY_SSH_URL is empty` | GitHub environment not configured | Configure environment + 1 secret + 4 variables |
 | 2 | `Host key verification failed` | `GITLAB_KNOWN_HOSTS` contained a stale ed25519 host key that did not match what GitLab.com actually presents | Capture live host key via paramiko handshake; compare fingerprint against `SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8` |
 | 3 | `GitLab: You are not allowed to push code to protected branches on this project` | Deploy key had write access but was not in the `Allowed to push and merge` list for the protected `main` branch | Add the deploy key to `Allowed to push and merge` for `main` in GitLab Settings → Repository → Protected branches |
 | 4 | success | — | — |
@@ -287,6 +290,8 @@ The `mirror-main-to-gitlab` workflow required four runs before success:
   protected-branch rule on `main`.
 - A host key captured dynamically from the network must never be
   accepted without comparison to an official pinned fingerprint.
+- The SSH handshake must be restricted to Ed25519 so the verified host-key
+  fingerprint is necessarily the key used by the connection.
 - A monolithic Git step turns multiple causes into an opaque `exit 128`.
 - The Job Summary must reflect the exact failing step and the real
   diagnostic, not a generic "Process completed with exit code 128".
@@ -304,6 +309,10 @@ required and the workflow fails closed if any is missing or empty.
 | `GITLAB_KNOWN_HOSTS` | variable | Pinned GitLab.com host keys (full file content, not a path) |
 | `GITLAB_MIRROR_KEY_FINGERPRINT` | variable | `SHA256:p45GIFj/WYp6QAab9FgwbC0cgGv4EHPj94I8PKQBO5M` — expected client deploy key fingerprint |
 | `GITLAB_ED25519_HOST_FINGERPRINT` | variable | `SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8` — expected GitLab.com host key fingerprint |
+
+The workflow accepts the repository URL only when it exactly equals
+`git@gitlab.com:cheurteen1/codebase-memory-V2.git`; a same-host different
+project is rejected before any credential is materialized.
 
 The environment is restricted to the `main` branch. No required
 reviewers and no wait timer — otherwise every mirror would block on a
@@ -354,6 +363,9 @@ role is to let the client verify it is talking to the real GitLab.com
 and not a man-in-the-middle. If GitLab rotates this key, the mirror
 workflow will fail with `Host key verification failed` — this is the
 security working as intended; do not disable `StrictHostKeyChecking`.
+The runtime also forces `HostKeyAlgorithms=ssh-ed25519` and
+`PubkeyAcceptedAlgorithms=ssh-ed25519`; the verified Ed25519 identities
+are therefore the identities used by the SSH handshake.
 
 ### 13.3 Difference between the two
 
@@ -548,8 +560,10 @@ bootstrap is complete:
   ```
   f5d42688d921f04b4323a017586af4566c17e381
   ```
-- **Phase B (active):** The mirror workflow loads the verifier from
-  this immutable pinned SHA and executes it before target checkout.
+- **Phase B (active):** The mirror workflow loads both the verifier and
+  mirror state machine from this immutable pinned SHA. It executes the
+  verifier before target checkout and never executes the target's copy of
+  the mirror script.
 
 ```
 TRUSTED_VERIFIER_SHA = f5d42688d921f04b4323a017586af4566c17e381
@@ -557,15 +571,18 @@ TRUSTED_VERIFIER_SHA = f5d42688d921f04b4323a017586af4566c17e381
 
 ### Rotation procedure
 
-To update the verifier:
-1. Publish a new Phase A PR (script + tests + docs only, gate NOT activated)
+To update the verifier or mirror state machine:
+1. Publish a new Phase A PR (scripts + tests + docs only; keep the old pin)
 2. Squash-merge and verify CI green + mirror green
 3. Record the new squash SHA
-4. Update `TRUSTED_VERIFIER_SHA` in `.github/workflows/mirror-main-to-gitlab.yml`
-   in a separate PR
+4. In a separate PR, update both the `TRUSTED_VERIFIER_SHA` environment
+   value and the literal trusted-checkout `ref` in
+   `.github/workflows/mirror-main-to-gitlab.yml`
+5. Update the pin assertions and documented SHA, then verify the pinned blob
+   is the runtime exercised by the tests
 
 Never use `main`, `HEAD`, `TARGET_SHA`, `github.sha`, or any moving ref as
-the verifier source.
+the verifier or mirror-runtime source.
 
 Rationale: If the workflow checked out the verifier from the default
 branch without a `ref`, `actions/checkout` would use the event SHA
@@ -575,7 +592,7 @@ trust root. Pinning to the Phase A SHA breaks the circle.
 
 ### Purpose
 
-Once activated, the gate will verify that GitHub has cryptographically
+The active gate verifies that GitHub has cryptographically
 verified the commit at `TARGET_SHA` **before** the mirror workflow
 materializes the GitLab SSH key or attempts any push to GitLab.
 
@@ -595,24 +612,27 @@ It does NOT prove:
   modify the gate — the pin must be rotated in a separate PR)
 - Absence of account compromise
 
-The verifier script is loaded from an immutable pinned SHA (Phase B).
-No checked-out repository code is executed before the gate. The
-workflow itself remains protected by repository branch protection
+The verifier and mirror state machine are loaded from an immutable pinned
+SHA (Phase B). No checked-out target code is executed before the gate, and
+the target checkout remains data-only while the GitLab key is available.
+The workflow itself remains protected by repository branch protection
 rules, not by the signature gate.
 
 ### Canonical source (SIG-R169-DIV-01)
 
-The verification logic lives in a **single canonical script**:
+The verification and transport logic live in two canonical scripts:
 
 ```text
 scripts/ci/verify-github-commit-signature.sh
+scripts/ci/mirror-main-to-gitlab.sh
 ```
 
-Phase B will call this script directly from the workflow. There is no
-inline duplication. Runtime tests
+Phase B calls immutable pinned snapshots of both scripts directly from the
+workflow. There is no inline duplication. Runtime tests
 (`v2/tests/ci/r169-signature-runtime.test.ts`) execute this same script
 against a local HTTP fixture server — the tests prove the actual
-production code path, not a copy.
+published source. A source change becomes the production runtime only after
+a separate pin-rotation PR.
 
 ### API endpoint
 
@@ -731,7 +751,7 @@ even on refusal paths (SIG-R169-DIAG-01):
 
 ### Phase B: Fail-closed JSON validation (SIG-R3-OUTPUT-01)
 
-When Phase B activates the gate, the workflow wrapper will validate
+The active Phase B workflow wrapper validates
 the JSON output fail-closed:
 
 1. Script exit 0 + JSON absent/empty → step fails
@@ -752,7 +772,8 @@ and **exits 1 on FAILED** — the job goes red if the effective state is
 FAILED, not just if an earlier step failed.
 
 **Step ordering (SIG-R169-Phase-B-CLEANUP):**
-1. Steps 1-6: validate, checkout verifier, gate, checkout target, SSH, mirror
+1. Steps 1-6: validate, checkout trusted runtime, gate, checkout target as
+   data, SSH, run the pinned mirror state machine
 2. Step 7: **Cleanup** (`id: cleanup`, `if: always()`) — runs before verdict
 3. Step 8: **Final verdict + summary** (`if: always()`, LAST step) — exits 1 on FAILED
 
@@ -955,6 +976,8 @@ Phase B adds three test files:
 
 ### Script
 
-`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.
+`scripts/ci/verify-github-commit-signature.sh` is the canonical verifier;
+`scripts/ci/mirror-main-to-gitlab.sh` is the canonical state machine.
 Phase A: completed (squash-merged as f5d42688d921f04b4323a017586af4566c17e381).
-Phase B: active — the mirror workflow calls this script from the pinned SHA.
+Phase B: active — the mirror workflow calls both scripts from the pinned SHA.
+Changes to either source require a later pin-rotation PR to become active.

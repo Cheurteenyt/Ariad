@@ -173,13 +173,16 @@ quota-report API call) must have their own job-level override.
 
 - **GitHub Actions** (`.github/workflows/ci.yml`): canonical CI. Jobs:
   backend (typecheck + build + test + benchmark smoke), frontend (same,
-  minus benchmark). Workflow-level `permissions: contents: read`.
+  minus benchmark), npm package/install/CLI smoke, and Docker build/CLI/
+  non-root smoke. Workflow-level `permissions: contents: read`.
 - **GitHub Actions mirror** (`.github/workflows/mirror-main-to-gitlab.yml`):
   triggers on `workflow_run` of `CI` with `conclusion=success &&
   event=push && head_branch=main`. Fast-forwards the validated SHA to
   GitLab `main` with `-o ci.no_pipeline`. Uses the `gitlab-passive-mirror`
   environment with `GITLAB_MIRROR_SSH_PRIVATE_KEY` secret and
-  `GITLAB_REPOSITORY_SSH_URL` / `GITLAB_KNOWN_HOSTS` variables.
+  `GITLAB_REPOSITORY_SSH_URL`, `GITLAB_KNOWN_HOSTS`,
+  `GITLAB_MIRROR_KEY_FINGERPRINT`, and
+  `GITLAB_ED25519_HOST_FINGERPRINT` variables.
 - **GitLab CI** (`.gitlab-ci.yml`): passive sentinel since R166. No
   pipelines, no MRs, no schedules, no runners. The variable
   `GITHUB_MIRROR_TOKEN` is obsolete and MUST NOT exist — verify its

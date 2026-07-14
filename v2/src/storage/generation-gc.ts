@@ -51,15 +51,15 @@
  *       5. BEGIN IMMEDIATE; re-read catalog state; verify status is
  *          ACTIVE (not already DELETING/DELETED); mark DELETING;
  *          appendPublicationHistory(MARK_DELETING); COMMIT.
- *       6. Delete the metadata sidecar.
- *       7. Delete the DB file.
- *       8. fsync the generations/ directory.
- *       9. R169B-STEP3 (GC-R169B-A1-11): re-read to confirm both
+ *       6. BEGIN IMMEDIATE again; revalidate active/manifest/catalog/
+ *          pin and keep this transaction locked through deletion.
+ *       7. Verify proofs; delete DB then metadata; fsync generations/.
+ *       8. R169B-STEP3 (GC-R169B-A1-11): re-read to confirm both
  *          files are absent. If any deletion or fsync failed →
  *          GC_DELETE_INCOMPLETE warning; status STAYS DELETING
  *          (NOT marked DELETED); the next GC pass re-attempts.
- *      10. Only if metadata absent AND DB absent AND fsync ok AND
- *          re-read confirms absence: BEGIN IMMEDIATE; mark DELETED;
+ *       9. Only if metadata absent AND DB absent AND fsync ok AND
+ *          re-read confirms absence: mark DELETED in the held txn;
  *          appendPublicationHistory(DELETE); COMMIT.
  *   - For each sweep-tmp entry:
  *       a. Re-verify the path is inside tmp/ (containment).
@@ -86,7 +86,8 @@ import {
   constants as fsConstants,
   type Stats,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
 
 import {
   GenerationStoreError,
@@ -185,6 +186,57 @@ function isValidUuidV4(s: string): boolean {
   return UUID_V4_RE.test(s);
 }
 
+function validateGenerationGcOptions(
+  project: string,
+  phase: string,
+  options?: GenerationGcOptions,
+): void {
+  if (!options) return;
+  if (options.cacheRoot !== undefined &&
+      (typeof options.cacheRoot !== "string" || options.cacheRoot.length === 0)) {
+    throw new GenerationStoreError(
+      "GENERATION_STORE_CONFIG_ERROR",
+      phase,
+      project,
+      "cacheRoot must be a non-empty string when provided",
+    );
+  }
+  for (const [name, value] of [
+    ["retainCount", options.retainCount],
+    ["tmpMaxAgeMs", options.tmpMaxAgeMs],
+    ["promotionTempGraceMs", options.promotionTempGraceMs],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new GenerationStoreError(
+        "GENERATION_STORE_CONFIG_ERROR",
+        phase,
+        project,
+        `${name} must be a non-negative safe integer (got ${String(value)})`,
+      );
+    }
+  }
+  if (options.pin !== undefined) {
+    if (!Array.isArray(options.pin)) {
+      throw new GenerationStoreError(
+        "GENERATION_STORE_CONFIG_ERROR",
+        phase,
+        project,
+        "pin must be an array of UUID v4 generation IDs",
+      );
+    }
+    for (const generationId of options.pin) {
+      if (typeof generationId !== "string" || !isValidUuidV4(generationId)) {
+        throw new GenerationStoreError(
+          "GENERATION_STORE_CONFIG_ERROR",
+          phase,
+          project,
+          `pin contains an invalid UUID v4 generation ID: ${String(generationId)}`,
+        );
+      }
+    }
+  }
+}
+
 // ─── PLANNER: planGenerationGc ───────────────────────────────────────────
 
 export function planGenerationGc(
@@ -200,6 +252,7 @@ export function planGenerationGc(
       "project must be a non-empty string",
     );
   }
+  validateGenerationGcOptions(project, phase, options);
   const cacheRoot = options?.cacheRoot ?? getCacheRoot();
   const retainCount = options?.retainCount ?? DEFAULT_RETAIN_COUNT;
   const tmpMaxAgeMs = options?.tmpMaxAgeMs ?? DEFAULT_TMP_MAX_AGE_MS;
@@ -454,6 +507,7 @@ export function applyGenerationGcPlan(
       `Plan is not authentic (not in the private WeakMap). Plans MUST be produced by planGenerationGc in the same process; spread/JSON-clone/literal objects are rejected.`,
     );
   }
+  validateGenerationGcOptions(project, phase, options);
 
   // R169B (§7 GATE): reject cacheRoot mismatch. The plan was created
   // with plan.cacheRoot — if options.cacheRoot differs, the applier
@@ -551,11 +605,8 @@ export function applyGenerationGcPlan(
   }
 
   // 5. Apply the delete list.
-  // R169B-STEP4 (GC-RACE-R169B-A2-02): each delete holds the CAS lock
-  // for the ENTIRE deletion (mark DELETING → delete files → fsync →
-  // mark DELETED → commit). This is "Model A" from the audit. The
-  // publisher cannot activate a generation mid-delete because the CAS
-  // lock serializes them. R169B is inactive; correctness > throughput.
+  // Each delete commits DELETING before unlinking, then commits DELETED
+  // only after both removals and the directory fsync are confirmed.
   for (const entry of plan.delete) {
     // a. Validate the generationId format (defense in depth).
     if (!isValidUuidV4(entry.generationId)) {
@@ -892,9 +943,6 @@ function computeGcSha256(path: string): string {
     if (fdStat.dev !== preStat.dev || fdStat.ino !== preStat.ino) {
       throw new Error(`identity mismatch between lstat and fstat: ${path}`);
     }
-    // Use node:crypto createHash for streaming.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createHash } = require("node:crypto");
     const hasher = createHash("sha256");
     const chunk = Buffer.allocUnsafe(64 * 1024);
     let totalRead = 0;
@@ -919,27 +967,21 @@ function computeGcSha256(path: string): string {
   }
 }
 
-// ─── Delete-under-CAS-lock helper (GC-RACE-R169B-A2-02 Model A) ────────
+// ─── Crash-safe generation deletion helper ─────────────────────────────
 
 /**
- * R169B-STEP4 (GC-RACE-R169B-A2-02): Delete a generation under the CAS
- * lock (Model A). The CAS lock is held for the ENTIRE deletion:
+ * Delete a generation with a two-transaction crash protocol:
  *   1. BEGIN IMMEDIATE
  *   2. Re-read active manifest + CAS active + catalog entry
  *   3. Verify candidate != active (defense in depth)
  *   4. Verify not pinned
  *   5. Verify status (ACTIVE for fresh delete; DELETING for recovery)
- *   6. Mark DELETING (skip for recovery — already DELETING)
- *   7. Delete the DB file
- *   8. fsync generations/
- *   9. Delete the metadata sidecar
- *  10. fsync generations/
- *  11. Re-lstat to confirm both absent (lstat ENOENT, not existsSync)
- *  12. Mark DELETED + history
- *  13. COMMIT
- *
- * The publisher cannot activate a generation mid-delete because the CAS
- * lock serializes them. R169B is inactive; correctness > throughput.
+ *   6. Mark DELETING (skip for recovery — already DELETING); COMMIT
+ *   7. BEGIN IMMEDIATE; revalidate active/manifest/catalog/pin
+ *   8. Verify file proofs, delete DB, fsync generations/
+ *   9. Revalidate metadata, delete it, fsync generations/
+ *  10. Re-lstat to confirm both absent (lstat ENOENT)
+ *  11. Mark DELETED + history; COMMIT the still-held transaction
  *
  * R169B-STEP4 (GC-RECOVERY-R169B-A2-06): for recovery (isRecovery=true),
  * the generation is already DELETING. We skip the MARK_DELETING step
@@ -1013,8 +1055,8 @@ function deleteGenerationUnderCasLock(
       return { deleted: false, warnings };
     }
     // 4-5. Verify catalog entry.
-    const cat = cas.getGenerationCatalogEntry(generationId);
-    if (cat === undefined) {
+    const initialCat = cas.getGenerationCatalogEntry(generationId);
+    if (initialCat === undefined) {
       cas.rollback();
       warnings.push({
         code: "GC_DELETE_FAILED",
@@ -1022,7 +1064,7 @@ function deleteGenerationUnderCasLock(
       });
       return { deleted: false, warnings };
     }
-    if (cat.pinned) {
+    if (initialCat.pinned) {
       cas.rollback();
       warnings.push({
         code: "GC_DELETE_FAILED",
@@ -1032,27 +1074,78 @@ function deleteGenerationUnderCasLock(
     }
     if (isRecovery) {
       // Recovery: status must be DELETING.
-      if (cat.status !== "DELETING") {
+      if (initialCat.status !== "DELETING") {
         cas.rollback();
         warnings.push({
           code: "GC_DELETE_FAILED",
-          message: `Recovery: generation ${generationId} status is ${cat.status} (expected DELETING)`,
+          message: `Recovery: generation ${generationId} status is ${initialCat.status} (expected DELETING)`,
         });
         return { deleted: false, warnings };
       }
     } else {
       // Fresh delete: status must be ACTIVE.
-      if (cat.status !== "ACTIVE") {
+      if (initialCat.status !== "ACTIVE") {
         cas.rollback();
         warnings.push({
           code: "GC_DELETE_FAILED",
-          message: `Generation ${generationId} status is ${cat.status} (not ACTIVE)`,
+          message: `Generation ${generationId} status is ${initialCat.status} (not ACTIVE)`,
         });
         return { deleted: false, warnings };
       }
       // 6. Mark DELETING.
       cas.setCatalogStatus(generationId, "DELETING");
       cas.appendPublicationHistory(generationId, project, "MARK_DELETING", null);
+    }
+
+    // Commit the deletion intent before touching either file. A crash
+    // from this point onward leaves a durable DELETING row for recovery.
+    cas.commit();
+
+    // Immediately reacquire the writer lock, then revalidate every
+    // authority used for deletion. This second transaction remains open
+    // through proofs, unlink, directory fsync and the DELETED transition.
+    cas.beginImmediate();
+    const deletionCasActive = cas.getActiveGenerationId();
+    let deletionManifest: GenerationManifestV1 | null;
+    try {
+      deletionManifest = readOptionalGenerationManifest(
+        activeManifestPath(project, cacheRoot),
+        project,
+      );
+    } catch {
+      cas.rollback();
+      warnings.push({
+        code: "GC_SAFETY_REFUSAL",
+        message: `Refused to delete generation ${generationId} — active manifest is corrupt/unreadable after committing DELETING`,
+      });
+      return { deleted: false, warnings };
+    }
+    const cat = cas.getGenerationCatalogEntry(generationId);
+    if (cat === undefined || cat.status !== "DELETING" || cat.pinned ||
+        deletionCasActive === generationId ||
+        deletionManifest?.generationId === generationId ||
+        currentActiveId === generationId) {
+      cas.rollback();
+      warnings.push({
+        code: "GC_DELETE_FAILED",
+        message: `Refused deletion after durable intent for ${generationId} (status=${cat?.status ?? "missing"}, pinned=${cat?.pinned ?? false}, casActive=${deletionCasActive === generationId}, manifestActive=${deletionManifest?.generationId === generationId})`,
+      });
+      return { deleted: false, warnings };
+    }
+
+    if (isRecovery) {
+      try {
+        validateRecoveryMetadataForCatalog(metadataPath, project, generationId, cat);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          cas.rollback();
+          warnings.push({
+            code: "GC_DELETE_FAILED",
+            message: `Recovery metadata proof failed for ${generationId}: ${(e as Error).message}`,
+          });
+          return { deleted: false, warnings };
+        }
+      }
     }
 
     // R169B-STEP10 (§10 POST-PUSH): GC proof under lock — re-lstat
@@ -1216,7 +1309,12 @@ function deleteGenerationUnderCasLock(
     // validate it (parse + schema) before unlinking. Only ENOENT is
     // truly idempotent.
     let metadataDeleteOk = false;
-    try {
+    if (!dbDeleteOk || !dirFsync1Ok) {
+      warnings.push({
+        code: "GC_DELETE_INCOMPLETE",
+        message: `Metadata retained because DB deletion was not durably completed for ${generationId}`,
+      });
+    } else try {
       const ms = lstatSync(metadataPath);
       if (ms.isSymbolicLink()) {
         throw new Error(`metadata path is a symlink: ${metadataPath}`);
@@ -1226,9 +1324,7 @@ function deleteGenerationUnderCasLock(
       }
       // R169B (§9): recovery must validate metadata for present files.
       if (isRecovery) {
-        const metaRaw = readFileSyncTextSafe(metadataPath, 256 * 1024);
-        const metaParsed = JSON.parse(metaRaw);
-        validateGenerationMetadata(metaParsed, project);
+        validateRecoveryMetadataForCatalog(metadataPath, project, generationId, cat);
       }
       unlinkSync(metadataPath);
       metadataDeleteOk = true;
@@ -1285,9 +1381,7 @@ function deleteGenerationUnderCasLock(
 
     if (!dbDeleteOk || !metadataDeleteOk || !dirFsync1Ok || !dirFsync2Ok || !dbConfirmedAbsent || !metadataConfirmedAbsent) {
       // Incomplete — do NOT mark DELETED. The status stays DELETING.
-      // We COMMIT the MARK_DELETING (if we did it) so the next GC pass
-      // sees the generation as DELETING and re-attempts.
-      cas.commit();
+      cas.rollback();
       warnings.push({
         code: "GC_DELETE_INCOMPLETE",
         message: `Generation ${generationId} deletion incomplete (dbDeleteOk=${dbDeleteOk}, metadataDeleteOk=${metadataDeleteOk}, dirFsync1Ok=${dirFsync1Ok}, dirFsync2Ok=${dirFsync2Ok}, dbConfirmedAbsent=${dbConfirmedAbsent}, metadataConfirmedAbsent=${metadataConfirmedAbsent}). Status stays DELETING; next GC pass will re-attempt.`,
@@ -1295,11 +1389,10 @@ function deleteGenerationUnderCasLock(
       return { deleted: false, warnings };
     }
 
-    // 12. Mark DELETED + history.
+    // 12-13. The second transaction has remained locked throughout the
+    // proofs and durable unlinks; finalize it atomically.
     cas.setCatalogStatus(generationId, "DELETED");
     cas.appendPublicationHistory(generationId, project, "DELETE", null);
-
-    // 13. COMMIT.
     cas.commit();
     return { deleted: true, warnings };
   } catch (e) {
@@ -1344,6 +1437,43 @@ function readFileSyncTextSafe(path: string, maxBytes: number): string {
   }
 }
 
+function validateRecoveryMetadataForCatalog(
+  metadataPath: string,
+  project: string,
+  generationId: string,
+  catalog: CasGenerationCatalogEntry,
+): Stats {
+  const before = lstatSync(metadataPath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error(`recovery metadata is not a regular file: ${metadataPath}`);
+  }
+  const raw = readFileSyncTextSafe(metadataPath, 256 * 1024);
+  const metadata = validateGenerationMetadata(JSON.parse(raw), project);
+  const manifest = metadata.manifest;
+  const expectedDbFile = `generations/generation-${generationId}.db`;
+  if (manifest.generationId !== generationId ||
+      manifest.project !== project ||
+      manifest.dbFile !== expectedDbFile ||
+      manifest.sha256 !== catalog.sha256 ||
+      manifest.sizeBytes !== catalog.sizeBytes ||
+      manifest.rootFingerprint !== catalog.rootFingerprint ||
+      manifest.extractorSemanticsVersion !== catalog.extractorSemanticsVersion ||
+      manifest.discoveryPolicyVersion !== catalog.discoveryPolicyVersion) {
+    throw new Error(
+      `recovery metadata does not exactly match catalog identity for generation ${generationId}`,
+    );
+  }
+  const after = lstatSync(metadataPath);
+  if (after.isSymbolicLink() || !after.isFile() ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs) {
+    throw new Error(`recovery metadata identity changed while being validated: ${metadataPath}`);
+  }
+  return after;
+}
+
 
 // ─── B1: Orphan Recovery ────────────────────────────────────────────────
 
@@ -1366,10 +1496,10 @@ export interface GenerationOrphanEntry {
   readonly observedAt: string;
   readonly reason: string;
   /**
-   * R169B-STEP10 (§7): Identity snapshot for PROMOTION_TEMP entries.
+   * Identity snapshot for every orphan file that may be unlinked.
    * The applier re-lstats and compares before unlinking. If the
    * identity changed (file was replaced by a concurrent publisher),
-   * the applier refuses to delete. null for non-PROMOTION_TEMP entries.
+   * the applier refuses to delete. null for recovery-only entries.
    */
   readonly identity: OrphanIdentity | null;
 }
@@ -1390,6 +1520,7 @@ export function planGenerationOrphanRecovery(
   if (!project || typeof project !== "string") {
     throw new GenerationStoreError("PROJECT_KEY_INVALID", phase, String(project), "project must be a non-empty string");
   }
+  validateGenerationGcOptions(project, phase, options);
   const cacheRoot = options?.cacheRoot ?? getCacheRoot();
   const graceMs = options?.promotionTempGraceMs ?? PROMOTION_TEMP_GRACE_MS;
   assertTrustedRootNoSymlinks(cacheRoot, project, phase);
@@ -1540,7 +1671,16 @@ export function planGenerationOrphanRecovery(
         const metaPath = deriveMetadataPath(projectStore, gid);
 
         if (!catalogIds.has(gid) && !protectedIds.has(gid)) {
-          orphans.push({ path: dbPath, kind: "NOT_IN_CATALOG", generationId: gid, observedAt: now, reason: "DB not in CAS catalog", identity: null });
+          const st = lstatSync(dbPath);
+          if (st.isSymbolicLink() || !st.isFile()) continue;
+          orphans.push({
+            path: dbPath,
+            kind: "NOT_IN_CATALOG",
+            generationId: gid,
+            observedAt: now,
+            reason: "DB not in CAS catalog",
+            identity: { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs },
+          });
           continue;
         }
 
@@ -1548,7 +1688,16 @@ export function planGenerationOrphanRecovery(
           lstatSync(metaPath);
         } catch (err2) {
           if ((err2 as NodeJS.ErrnoException).code === "ENOENT") {
-            orphans.push({ path: dbPath, kind: "DB_ONLY", generationId: gid, observedAt: now, reason: "DB exists but metadata missing", identity: null });
+            const st = lstatSync(dbPath);
+            if (st.isSymbolicLink() || !st.isFile()) continue;
+            orphans.push({
+              path: dbPath,
+              kind: "DB_ONLY",
+              generationId: gid,
+              observedAt: now,
+              reason: "DB exists but metadata missing",
+              identity: { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs },
+            });
           }
           continue;
         }
@@ -1566,7 +1715,16 @@ export function planGenerationOrphanRecovery(
           lstatSync(dbPath);
         } catch (err2) {
           if ((err2 as NodeJS.ErrnoException).code === "ENOENT" && !protectedIds.has(gid)) {
-            orphans.push({ path: jsonPath, kind: "METADATA_ONLY", generationId: gid, observedAt: now, reason: "Metadata exists but DB missing", identity: null });
+            const st = lstatSync(jsonPath);
+            if (st.isSymbolicLink() || !st.isFile()) continue;
+            orphans.push({
+              path: jsonPath,
+              kind: "METADATA_ONLY",
+              generationId: gid,
+              observedAt: now,
+              reason: "Metadata exists but DB missing",
+              identity: { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs },
+            });
           }
           continue;
         }
@@ -1590,7 +1748,10 @@ export function planGenerationOrphanRecovery(
   // its nested arrays/entries so a caller cannot mutate them in place.
   Object.freeze(plan);
   Object.freeze(plan.orphans);
-  for (const e of plan.orphans) Object.freeze(e);
+  for (const e of plan.orphans) {
+    if (e.identity) Object.freeze(e.identity);
+    Object.freeze(e);
+  }
   // Register the plan in the WeakMap so the applier can authenticate it.
   orphanPlanTokens.set(plan, true);
   return plan;
@@ -1599,6 +1760,7 @@ export function planGenerationOrphanRecovery(
 export interface GenerationOrphanResult {
   readonly project: string;
   readonly deletedTempPaths: readonly string[];
+  readonly deletedFinalPaths: readonly string[];
   readonly retainedOrphans: readonly GenerationOrphanEntry[];
   readonly casRecovered: boolean;
   readonly warnings: readonly GenerationStoreWarning[];
@@ -1623,6 +1785,8 @@ export function applyGenerationOrphanRecovery(
       `Orphan plan is not authentic (not in the private WeakMap). Plans MUST be produced by planGenerationOrphanRecovery in the same process; spread/JSON-clone/literal objects are rejected.`,
     );
   }
+  validateGenerationGcOptions(project, phase, options);
+  const finalOrphanGraceMs = options?.promotionTempGraceMs ?? PROMOTION_TEMP_GRACE_MS;
 
   // R169B-STEP10 (P0 — CONSOLIDATED-AUDIT): Verify cacheRoot/project
   // consistency. The applier NEVER trusts the plan's cacheRoot field
@@ -1654,6 +1818,7 @@ export function applyGenerationOrphanRecovery(
     return {
       project,
       deletedTempPaths: [],
+      deletedFinalPaths: [],
       retainedOrphans: plan.orphans,
       casRecovered: false,
       warnings: [{
@@ -1675,6 +1840,7 @@ export function applyGenerationOrphanRecovery(
     return {
       project,
       deletedTempPaths: [],
+      deletedFinalPaths: [],
       retainedOrphans: plan.orphans,
       casRecovered: false,
       warnings: [{
@@ -1687,6 +1853,7 @@ export function applyGenerationOrphanRecovery(
     return {
       project,
       deletedTempPaths: [],
+      deletedFinalPaths: [],
       retainedOrphans: plan.orphans,
       casRecovered: false,
       warnings: [{
@@ -1702,6 +1869,7 @@ export function applyGenerationOrphanRecovery(
   const generations = generationsDir(project, cacheRoot);
   const warnings: GenerationStoreWarning[] = [];
   const deletedTempPaths: string[] = [];
+  const deletedFinalPaths: string[] = [];
   const retainedOrphans: GenerationOrphanEntry[] = [];
   let casRecovered = false;
 
@@ -1720,13 +1888,13 @@ export function applyGenerationOrphanRecovery(
           // R169B-STEP10 (P0): Re-derive the path from the basename.
           // Extract the basename from orphan.path, validate it matches
           // the promotion-temp pattern, and re-join with generations/.
-          const basename = orphan.path.split("/").pop() ?? "";
-          if (!PROMOTION_TEMP_RE.test(basename)) {
-            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp basename does not match canonical pattern: ${basename}` });
+          const orphanBasename = basename(orphan.path);
+          if (!PROMOTION_TEMP_RE.test(orphanBasename)) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp basename does not match canonical pattern: ${orphanBasename}` });
             retainedOrphans.push(orphan);
             continue;
           }
-          const canonicalPath = join(generations, basename);
+          const canonicalPath = join(generations, orphanBasename);
           // Verify the canonical path is inside generations/ (containment).
           try {
             assertPathInsideNoSymlinks(generations, canonicalPath, project, phase);
@@ -1810,14 +1978,14 @@ export function applyGenerationOrphanRecovery(
         // R169B (§7 GATE): same treatment as PROMOTION_TEMP — CAS lock,
         // identity re-validation, unlink, fsync.
         try {
-          const basename = orphan.path.split("/").pop() ?? "";
+          const orphanBasename = basename(orphan.path);
           const META_TEMP_RE = /^\.metadata-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[0-9a-f-]+\.tmp$/;
-          if (!META_TEMP_RE.test(basename)) {
-            warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp basename does not match canonical pattern: ${basename}` });
+          if (!META_TEMP_RE.test(orphanBasename)) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp basename does not match canonical pattern: ${orphanBasename}` });
             retainedOrphans.push(orphan);
             continue;
           }
-          const canonicalPath = join(generations, basename);
+          const canonicalPath = join(generations, orphanBasename);
           try {
             assertPathInsideNoSymlinks(generations, canonicalPath, project, phase);
           } catch (e) {
@@ -1859,6 +2027,92 @@ export function applyGenerationOrphanRecovery(
         } catch (e) {
           warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to process metadata temp: ${(e as Error).message}` });
           retainedOrphans.push(orphan);
+        }
+        break;
+      }
+      case "NOT_IN_CATALOG":
+      case "DB_ONLY":
+      case "METADATA_ONLY": {
+        const gid = orphan.generationId;
+        if (!gid || !isValidUuidV4(gid) || !orphan.identity) {
+          retainedOrphans.push(orphan);
+          warnings.push({
+            code: "GC_SAFETY_REFUSAL",
+            message: `Final orphan lacks a valid generation ID or identity proof: ${orphan.path}`,
+          });
+          continue;
+        }
+        const canonicalPath = orphan.kind === "METADATA_ONLY"
+          ? deriveMetadataPath(projectStore, gid)
+          : deriveDbPath(projectStore, gid);
+        if (Date.now() - orphan.identity.mtimeMs < finalOrphanGraceMs) {
+          retainedOrphans.push(orphan);
+          warnings.push({
+            code: "GC_SAFETY_REFUSAL",
+            message: `Final orphan ${canonicalPath} is still inside the ${finalOrphanGraceMs}ms grace period`,
+          });
+          continue;
+        }
+        const casForFinal = openCasStore(project, cacheRoot);
+        let finalDirFd: number | null = null;
+        try {
+          casForFinal.beginImmediate();
+          assertTrustedRootNoSymlinks(cacheRoot, project, phase);
+          assertPathInsideNoSymlinks(generations, canonicalPath, project, phase);
+          const lockedManifest = readOptionalGenerationManifest(
+            activeManifestPath(project, cacheRoot),
+            project,
+          );
+          const catalogEntry = casForFinal.getGenerationCatalogEntry(gid);
+          // DB_ONLY/METADATA_ONLY rows that are still ACTIVE or DELETING
+          // represent catalog/disk corruption, not disposable garbage.
+          // Retain them fail-closed for explicit repair. Only an absent
+          // catalog row or a terminal DELETED row is safe to unlink.
+          if (lockedManifest?.generationId === gid || casForFinal.getActiveGenerationId() === gid ||
+              catalogEntry?.pinned === true ||
+              (catalogEntry !== undefined && catalogEntry.status !== "DELETED")) {
+            casForFinal.rollback();
+            retainedOrphans.push(orphan);
+            warnings.push({
+              code: "GC_SAFETY_REFUSAL",
+              message: `Final orphan ${canonicalPath} is active, pinned, or still referenced by the catalog`,
+            });
+            continue;
+          }
+          const st = lstatSync(canonicalPath);
+          if (st.isSymbolicLink() || !st.isFile() ||
+              st.dev !== orphan.identity.dev ||
+              st.ino !== orphan.identity.ino ||
+              st.size !== orphan.identity.size ||
+              st.mtimeMs !== orphan.identity.mtimeMs) {
+            casForFinal.rollback();
+            retainedOrphans.push(orphan);
+            warnings.push({
+              code: "GC_DELETE_FAILED",
+              message: `Final orphan identity changed; refusing to delete ${canonicalPath}`,
+            });
+            continue;
+          }
+          unlinkSync(canonicalPath);
+          const opened = openDirectoryNoFollow(generations, PROD_OPS);
+          finalDirFd = opened.fd;
+          PROD_OPS.fsyncSync(finalDirFd);
+          PROD_OPS.closeSync(finalDirFd);
+          finalDirFd = null;
+          casForFinal.commit();
+          deletedFinalPaths.push(canonicalPath);
+        } catch (e) {
+          if (finalDirFd !== null) {
+            try { PROD_OPS.closeSync(finalDirFd); } catch { /* best effort */ }
+          }
+          try { casForFinal.rollback(); } catch { /* best effort */ }
+          retainedOrphans.push(orphan);
+          warnings.push({
+            code: "GC_DELETE_FAILED",
+            message: `Failed to delete final orphan ${canonicalPath}: ${(e as Error).message}`,
+          });
+        } finally {
+          casForFinal.close();
         }
         break;
       }
@@ -2041,7 +2295,7 @@ export function applyGenerationOrphanRecovery(
     }
   }
 
-  if (deletedTempPaths.length > 0) {
+  if (deletedTempPaths.length > 0 || deletedFinalPaths.length > 0) {
     let dirFd: number | null = null;
     try {
       const opened = openDirectoryNoFollow(generations, PROD_OPS);
@@ -2055,5 +2309,5 @@ export function applyGenerationOrphanRecovery(
     }
   }
 
-  return { project, deletedTempPaths, retainedOrphans, casRecovered, warnings };
+  return { project, deletedTempPaths, deletedFinalPaths, retainedOrphans, casRecovered, warnings };
 }

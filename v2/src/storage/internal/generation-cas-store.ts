@@ -53,7 +53,16 @@
 
 import Database from "better-sqlite3";
 import type { Database as DatabaseType } from "better-sqlite3";
-import { lstatSync, chmodSync, openSync, closeSync, fsyncSync } from "node:fs";
+import {
+  lstatSync,
+  chmodSync,
+  openSync,
+  closeSync,
+  fsyncSync,
+  fstatSync,
+  readSync,
+  constants as fsConstants,
+} from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { ensureDirDurable } from "./generation-layout-io.js";
 
@@ -72,6 +81,7 @@ import {
 } from "../generation-paths.js";
 import {
   assertTrustedRootNoSymlinks,
+  validateGenerationMetadata,
 } from "../generation-validation.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -80,6 +90,82 @@ import {
  * The filename of the CAS SQLite DB inside the project store directory.
  */
 export const CAS_DB_FILENAME = "publication-cas.sqlite";
+const MAX_GENERATION_METADATA_BYTES = 256 * 1024;
+
+function readRecoveredPinnedFlag(
+  project: string,
+  projectStore: string,
+  manifest: GenerationManifestV1,
+): boolean {
+  const metadataPath = join(
+    projectStore,
+    GENERATIONS_SUBDIR,
+    `generation-${manifest.generationId}.json`,
+  );
+  let fd: number | null = null;
+  try {
+    const preStat = lstatSync(metadataPath);
+    if (preStat.isSymbolicLink() || !preStat.isFile()) {
+      throw new Error("metadata sidecar is not a regular file");
+    }
+    if (preStat.size > MAX_GENERATION_METADATA_BYTES) {
+      throw new Error(`metadata sidecar exceeds ${MAX_GENERATION_METADATA_BYTES} bytes`);
+    }
+    fd = openSync(metadataPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const fdStat = fstatSync(fd);
+    if (fdStat.dev !== preStat.dev || fdStat.ino !== preStat.ino || fdStat.size !== preStat.size) {
+      throw new Error("metadata identity changed between lstat and open");
+    }
+    const bytes = Buffer.alloc(fdStat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (count <= 0) break;
+      offset += count;
+    }
+    if (offset !== bytes.length) {
+      throw new Error(`metadata short read: expected ${bytes.length}, got ${offset}`);
+    }
+    const postStat = fstatSync(fd);
+    if (postStat.dev !== fdStat.dev || postStat.ino !== fdStat.ino || postStat.size !== fdStat.size) {
+      throw new Error("metadata changed while being read");
+    }
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const metadata = validateGenerationMetadata(JSON.parse(raw), project);
+    const recovered = metadata.manifest;
+    const manifestMatches =
+      recovered.formatVersion === manifest.formatVersion &&
+      recovered.project === manifest.project &&
+      recovered.generationId === manifest.generationId &&
+      recovered.dbFile === manifest.dbFile &&
+      recovered.createdAt === manifest.createdAt &&
+      recovered.rootFingerprint === manifest.rootFingerprint &&
+      recovered.extractorSemanticsVersion === manifest.extractorSemanticsVersion &&
+      recovered.discoveryPolicyVersion === manifest.discoveryPolicyVersion &&
+      recovered.nodeCount === manifest.nodeCount &&
+      recovered.edgeCount === manifest.edgeCount &&
+      recovered.fileCount === manifest.fileCount &&
+      recovered.sizeBytes === manifest.sizeBytes &&
+      recovered.sha256 === manifest.sha256;
+    if (!manifestMatches) {
+      throw new Error("metadata manifest does not exactly match the active manifest");
+    }
+    return metadata.pinned;
+  } catch (e) {
+    if (e instanceof GenerationStoreError) throw e;
+    throw new GenerationStoreError(
+      "PUBLICATION_CAS_STATE_CORRUPT",
+      "reconcileFromManifest",
+      project,
+      `Cannot recover catalog pin from metadata for ${manifest.generationId}: ${(e as Error).message}`,
+      manifest.generationId,
+    );
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
 
 /**
  * The schema for the CAS DB. Idempotent — uses CREATE IF NOT EXISTS.
@@ -975,6 +1061,17 @@ function createCasStoreHandle(
 
         if (casActive === manifestActive) {
           // No reconciliation needed. Read the revision (do not bump).
+          if (ownsTxn) {
+            try { db.exec("COMMIT"); } catch (e) {
+              try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+              throw new GenerationStoreError(
+                "PUBLICATION_CAS_STATE_CORRUPT",
+                phase,
+                project,
+                `reconcileFromManifest no-op COMMIT failed: ${(e as Error).message}`,
+              );
+            }
+          }
           return {
             activeGenerationId: casActive,
             revision: row.r,
@@ -1005,6 +1102,7 @@ function createCasStoreHandle(
             "SELECT generation_id FROM generation_catalog WHERE generation_id = ?",
           ).get(manifestActive) as { generation_id: string } | undefined;
           if (catEntry === undefined) {
+            const recoveredPinned = readRecoveredPinnedFlag(project, dirname(dbPath), manifest);
             // Rebuild the catalog entry from the manifest.
             db.prepare(`
               INSERT INTO generation_catalog (
@@ -1022,7 +1120,7 @@ function createCasStoreHandle(
               manifest.discoveryPolicyVersion,
               manifest.createdAt,
               now,
-              0,
+              recoveredPinned ? 1 : 0,
               "ACTIVE",
             );
           }

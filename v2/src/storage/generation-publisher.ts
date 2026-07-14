@@ -433,6 +433,42 @@ export function reserveGenerationStaging(
   }
   fd = null;
 
+  // Persist the new directory entry as well as the file contents. A
+  // file fsync alone does not make its name durable across a crash.
+  let tmpDirFd: number | null = null;
+  try {
+    const opened = openDirectoryNoFollow(tmp, PROD_OPS);
+    tmpDirFd = opened.fd;
+    PROD_OPS.fsyncSync(tmpDirFd);
+    PROD_OPS.closeSync(tmpDirFd);
+    tmpDirFd = null;
+  } catch (e) {
+    if (tmpDirFd !== null) {
+      try { PROD_OPS.closeSync(tmpDirFd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(stagingPath); } catch { /* best effort */ }
+    // Best effort: make the compensating unlink durable too.
+    let cleanupDirFd: number | null = null;
+    try {
+      const opened = openDirectoryNoFollow(tmp, PROD_OPS);
+      cleanupDirFd = opened.fd;
+      PROD_OPS.fsyncSync(cleanupDirFd);
+      PROD_OPS.closeSync(cleanupDirFd);
+      cleanupDirFd = null;
+    } catch {
+      if (cleanupDirFd !== null) {
+        try { PROD_OPS.closeSync(cleanupDirFd); } catch { /* best effort */ }
+      }
+    }
+    throw new GenerationStoreError(
+      "STAGING_CREATE_FAILED",
+      phase,
+      project,
+      `Failed to fsync tmp/ after creating staging file at "${stagingPath}": ${(e as Error).message}`,
+      generationId,
+    );
+  }
+
   // 8. Re-stat the staging file and validate it is a regular file (not
   //    a symlink, not a directory). This is defense-in-depth — the
   //    O_EXCL guard already prevents symlink attacks (O_EXCL|O_CREAT

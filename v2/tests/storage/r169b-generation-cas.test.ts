@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, mkdirSync, chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -107,6 +107,23 @@ function validCatalogEntry(overrides: Partial<CasGenerationCatalogEntry> = {}): 
     status: "ACTIVE",
     ...overrides,
   };
+}
+
+function writeRecoveryMetadata(manifest: GenerationManifestV1, pinned = false): string {
+  const dir = join(projectStoreDir(PROJECT, cacheRoot), "generations");
+  mkdirSync(dir, { recursive: true });
+  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
+  const metadataPath = join(dir, `generation-${manifest.generationId}.json`);
+  writeFileSync(metadataPath, JSON.stringify({
+    formatVersion: 1,
+    manifest,
+    publishedAt: manifest.createdAt,
+    deduped: false,
+    dedupSourceGenerationId: null,
+    previousActiveGenerationId: null,
+    pinned,
+  }) + "\n", { encoding: "utf8", mode: 0o600 });
+  return metadataPath;
 }
 
 // ─── 1. Open / create ────────────────────────────────────────────────────
@@ -463,6 +480,13 @@ describe("R169B-STEP2 CAS — reconcileFromManifest", () => {
     const result = cas.reconcileFromManifest(manifest);
     expect(result.reconciled).toBe(false);
     expect(result.activeGenerationId).toBe("gen-1");
+
+    // A no-op reconcile opened its own transaction; it must release the
+    // writer lock before returning so a second connection can write.
+    const cas2 = openCasStore(PROJECT, cacheRoot);
+    expect(() => cas2.beginImmediate()).not.toThrow();
+    cas2.rollback();
+    cas2.close();
     cas.close();
   });
 
@@ -473,10 +497,12 @@ describe("R169B-STEP2 CAS — reconcileFromManifest", () => {
     cas.incrementRevision(); // rev=1
     cas.commit();
 
-    const manifest = validManifest({ generationId: "gen-2" });
+    const generationId = "550e8400-e29b-41d4-a716-446655440002";
+    const manifest = validManifest({ generationId });
+    writeRecoveryMetadata(manifest);
     const result = cas.reconcileFromManifest(manifest);
     expect(result.reconciled).toBe(true);
-    expect(result.activeGenerationId).toBe("gen-2");
+    expect(result.activeGenerationId).toBe(generationId);
     expect(result.revision).toBe(2); // bumped
     cas.close();
   });
@@ -509,14 +535,43 @@ describe("R169B-STEP2 CAS — reconcileFromManifest", () => {
     cas.incrementRevision();
     cas.commit();
 
-    const manifest = validManifest({ generationId: "gen-2" });
+    const generationId = "550e8400-e29b-41d4-a716-446655440003";
+    const manifest = validManifest({ generationId });
+    writeRecoveryMetadata(manifest);
     cas.reconcileFromManifest(manifest);
     const history = cas.listPublicationHistory(PROJECT);
     // R169B-STEP5 (POSTCOMMIT-R169B-A3-11): the reconcile now appends
     // a "RECOVER" entry (was "PUBLISH") when the manifest is non-null
     // and CAS was divergent. This distinguishes CAS-only reconciliation
     // from an actual publication.
-    expect(history.some((h) => h.action === "RECOVER" && h.generationId === "gen-2")).toBe(true);
+    expect(history.some((h) => h.action === "RECOVER" && h.generationId === generationId)).toBe(true);
+    cas.close();
+  });
+
+  it("restores pinned=true from an exact recovery metadata sidecar", () => {
+    const generationId = "550e8400-e29b-41d4-a716-446655440004";
+    const manifest = validManifest({ generationId });
+    writeRecoveryMetadata(manifest, true);
+    const cas = openCasStore(PROJECT, cacheRoot);
+    const result = cas.reconcileFromManifest(manifest);
+    expect(result.reconciled).toBe(true);
+    expect(cas.getGenerationCatalogEntry(generationId)?.pinned).toBe(true);
+    cas.close();
+  });
+
+  it("fails closed when recovery metadata is absent or corrupt", () => {
+    const missingManifest = validManifest({ generationId: "550e8400-e29b-41d4-a716-446655440005" });
+    const cas = openCasStore(PROJECT, cacheRoot);
+    expect(() => cas.reconcileFromManifest(missingManifest)).toThrowError(GenerationStoreError);
+    expect(cas.getActiveGenerationId()).toBeNull();
+    expect(cas.getRevision()).toBe(0);
+
+    const corruptManifest = validManifest({ generationId: "550e8400-e29b-41d4-a716-446655440006" });
+    const metadataPath = writeRecoveryMetadata(corruptManifest);
+    writeFileSync(metadataPath, "{ corrupt", "utf8");
+    expect(() => cas.reconcileFromManifest(corruptManifest)).toThrowError(GenerationStoreError);
+    expect(cas.getActiveGenerationId()).toBeNull();
+    expect(cas.getRevision()).toBe(0);
     cas.close();
   });
 });

@@ -37,6 +37,14 @@ Response:
    ```bash
    cd v2 && npm run build && npx vitest run
    cd ../graph-ui && npx tsc --noEmit && npx vitest run
+   cd ..
+   PACK_DIR="$(mktemp -d)" && INSTALL_DIR="$(mktemp -d)"
+   npm pack --prefix v2 --pack-destination "$PACK_DIR"
+   npm install --prefix "$INSTALL_DIR" "$PACK_DIR"/*.tgz
+   "$INSTALL_DIR/node_modules/.bin/cbm-v2" --version
+   docker build --no-cache -t cbm-v2:continuity .
+   docker run --rm cbm-v2:continuity --version
+   rm -rf "$PACK_DIR" "$INSTALL_DIR"
    ```
 4. Wait for the canonical GitHub Actions CI to return to normal before
    resuming merges.
@@ -52,7 +60,8 @@ Response:
 1. **Freeze all merges** to `main`. Open PRs can still be created and
    reviewed, but do not merge until CI returns.
 2. If local validation is required for an urgent fix:
-   - Run the full backend + frontend test suites locally
+   - Reproduce all four CI jobs locally: backend, frontend, package smoke,
+     and Docker smoke
    - Document the local validation result in the PR description
    - A maintainer may approve an exception merge with explicit
      "merged without CI, locally validated" annotation

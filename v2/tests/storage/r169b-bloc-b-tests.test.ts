@@ -152,12 +152,16 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     const generations = generationsDir(FIXTURE_PROJECT_NAME, cacheRoot);
     const fakeUuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const fakeDbPath = join(generations, `generation-${fakeUuid}.db`);
+    const fakeMetaPath = join(generations, `generation-${fakeUuid}.json`);
     writeFileSync(fakeDbPath, "fake db content");
+    writeFileSync(fakeMetaPath, "fake metadata content");
 
     const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const notInCatalog = plan.orphans.filter((o) => o.kind === "NOT_IN_CATALOG");
     expect(notInCatalog.length).toBe(1);
     expect(notInCatalog[0].generationId).toBe(fakeUuid);
+    expect(notInCatalog[0].identity).not.toBeNull();
+    expect(Object.isFrozen(notInCatalog[0].identity)).toBe(true);
   });
 
   it("detects DB_ONLY orphans (DB exists, metadata missing, but UUID IS in catalog)", () => {
@@ -224,24 +228,38 @@ describe("R169B-STEP10 (B1) — applyGenerationOrphanRecovery", () => {
     expect(result.warnings.length).toBe(0);
   });
 
-  it("retains NOT_IN_CATALOG orphans (grace period — not deleted immediately)", () => {
+  it("deletes NOT_IN_CATALOG final DB orphans after the grace period", () => {
     publishNGenerations(1);
     const generations = generationsDir(FIXTURE_PROJECT_NAME, cacheRoot);
     const fakeUuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const fakeDbPath = join(generations, `generation-${fakeUuid}.db`);
+    const fakeMetaPath = join(generations, `generation-${fakeUuid}.json`);
     writeFileSync(fakeDbPath, "fake db content");
+    writeFileSync(fakeMetaPath, "fake metadata content");
 
     const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
-    expect(result.deletedTempPaths.length).toBe(0);
-    expect(existsSync(fakeDbPath)).toBe(true);
-    const retained = result.retainedOrphans.filter((o) => o.kind === "NOT_IN_CATALOG");
-    expect(retained.length).toBe(1);
+    expect(result.deletedFinalPaths).toContain(fakeDbPath);
+    expect(existsSync(fakeDbPath)).toBe(false);
+    expect(result.retainedOrphans.some((o) => o.kind === "NOT_IN_CATALOG")).toBe(false);
+
+    // The paired metadata becomes visible as METADATA_ONLY on the next
+    // pass and is removed under the same catalog/identity checks.
+    const secondPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const secondResult = applyGenerationOrphanRecovery(secondPlan, { cacheRoot, promotionTempGraceMs: 0 });
+    expect(secondResult.deletedFinalPaths).toContain(fakeMetaPath);
+    expect(existsSync(fakeMetaPath)).toBe(false);
   });
 
-  it("retains DB_ONLY and METADATA_ONLY orphans (grace period)", () => {
+  it("retains ACTIVE or pinned catalog-referenced DB_ONLY and METADATA_ONLY orphans fail-closed", () => {
     const ids = publishNGenerations(3);
+    const pinCas = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
+    pinCas.beginImmediate();
+    pinCas.setCatalogPinned(ids[0], true);
+    pinCas.appendPublicationHistory(ids[0], FIXTURE_PROJECT_NAME, "PIN", null);
+    pinCas.commit();
+    pinCas.close();
     // Delete metadata for ids[0] (DB_ONLY orphan).
     const metaPath0 = join(
       projectStoreDir(FIXTURE_PROJECT_NAME, cacheRoot),
@@ -264,6 +282,48 @@ describe("R169B-STEP10 (B1) — applyGenerationOrphanRecovery", () => {
     const retainedKinds = result.retainedOrphans.map((o) => o.kind);
     expect(retainedKinds).toContain("DB_ONLY");
     expect(retainedKinds).toContain("METADATA_ONLY");
+  });
+
+  it("deletes final DB and metadata remnants whose catalog row is DELETED", () => {
+    const ids = publishNGenerations(2);
+    const staleId = ids[0];
+    const cas = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
+    cas.beginImmediate();
+    cas.setCatalogStatus(staleId, "DELETING");
+    cas.appendPublicationHistory(staleId, FIXTURE_PROJECT_NAME, "MARK_DELETING", null);
+    cas.setCatalogStatus(staleId, "DELETED");
+    cas.appendPublicationHistory(staleId, FIXTURE_PROJECT_NAME, "DELETE", null);
+    cas.commit();
+    cas.close();
+
+    const dbPath = join(generationsDir(FIXTURE_PROJECT_NAME, cacheRoot), `generation-${staleId}.db`);
+    const metadataPath = join(generationsDir(FIXTURE_PROJECT_NAME, cacheRoot), `generation-${staleId}.json`);
+    const firstPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const firstResult = applyGenerationOrphanRecovery(firstPlan, { cacheRoot, promotionTempGraceMs: 0 });
+    expect(firstResult.deletedFinalPaths).toContain(dbPath);
+    expect(existsSync(dbPath)).toBe(false);
+
+    const secondPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    expect(secondPlan.orphans.some((o) => o.kind === "METADATA_ONLY" && o.generationId === staleId)).toBe(true);
+    const secondResult = applyGenerationOrphanRecovery(secondPlan, { cacheRoot, promotionTempGraceMs: 0 });
+    expect(secondResult.deletedFinalPaths).toContain(metadataPath);
+    expect(existsSync(metadataPath)).toBe(false);
+  });
+
+  it("refuses a final orphan whose identity changed after planning", () => {
+    publishNGenerations(1);
+    const generations = generationsDir(FIXTURE_PROJECT_NAME, cacheRoot);
+    const generationId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const dbPath = join(generations, `generation-${generationId}.db`);
+    writeFileSync(dbPath, "first identity");
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    rmSync(dbPath);
+    writeFileSync(dbPath, "replacement identity with different bytes");
+
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
+    expect(result.deletedFinalPaths).not.toContain(dbPath);
+    expect(existsSync(dbPath)).toBe(true);
+    expect(result.warnings.some((warning) => warning.message.includes("identity changed"))).toBe(true);
   });
 });
 

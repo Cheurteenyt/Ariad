@@ -14,11 +14,11 @@ name: Mirror validated GitHub main to GitLab
 #
 # Step ordering (SIG-R169-Phase-B-FINAL):
 #   1. Validate event identity
-#   2. Checkout pinned verifier
+#   2. Checkout pinned verifier + mirror runtime
 #   3. Verify signature (fail-closed JSON wrapper)
 #   4. Checkout TARGET_SHA (only if gate passed)
 #   5. Materialize SSH key (only if gate passed)
-#   6. Run mirror state machine
+#   6. Run the pinned mirror state machine from the trusted checkout
 #   7. Cleanup (always, id: cleanup)
 #   8. Final verdict + summary (always, LAST step, exits 1 on FAILED)
 #
@@ -44,6 +44,7 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -96,13 +97,12 @@ jobs:
             exit 1
           fi
 
-          case "$GITLAB_URL" in
-            git@gitlab.com:*) ;;
-            *)
-              echo "::error::Expected a git@gitlab.com:... SSH URL."
-              exit 1
-              ;;
-          esac
+          EXPECTED_GITLAB_URL="git@gitlab.com:cheurteen1/codebase-memory-V2.git"
+          if [ "$GITLAB_URL" != "$EXPECTED_GITLAB_URL" ]; then
+            echo "::error::Unexpected GitLab mirror URL."
+            echo "::error::Expected exactly: $EXPECTED_GITLAB_URL"
+            exit 1
+          fi
 
           if [ -z "$EXPECTED_KEY_FP" ]; then
             echo "::error::GITLAB_MIRROR_KEY_FINGERPRINT is empty."
@@ -281,6 +281,7 @@ jobs:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
+          path: target
 
       # ── Step 5: Materialize SSH key + known_hosts ────────────────────
       - name: Materialize SSH key and known_hosts
@@ -310,10 +311,13 @@ jobs:
           echo "ssh_key_file=$HOME/.ssh/gitlab_mirror_ed25519" >> "$GITHUB_OUTPUT"
           echo "known_hosts_file=$HOME/.ssh/known_hosts" >> "$GITHUB_OUTPUT"
 
-      # ── Step 6: Run mirror state machine ─────────────────────────────
-      - name: Run mirror state machine
+      # ── Step 6: Run PINNED mirror state machine ──────────────────────
+      # The target checkout is only Git data. No script supplied by
+      # TARGET_SHA is executed with the GitLab credential available.
+      - name: Run pinned mirror state machine
         id: mirror
         shell: bash
+        working-directory: target
         env:
           SSH_KEY_FILE: ${{ steps.materialize.outputs.ssh_key_file }}
           KNOWN_HOSTS_FILE: ${{ steps.materialize.outputs.known_hosts_file }}
@@ -321,7 +325,7 @@ jobs:
           OUTPUT_FILE: ${{ runner.temp }}/mirror-outputs.txt
         run: |
           set -euo pipefail
-          bash scripts/ci/mirror-main-to-gitlab.sh || SCRIPT_EXIT=$?
+          bash "$GITHUB_WORKSPACE/trusted-verifier/scripts/ci/mirror-main-to-gitlab.sh" || SCRIPT_EXIT=$?
           SCRIPT_EXIT=${SCRIPT_EXIT:-0}
 
           if [ -f "$OUTPUT_FILE" ]; then
@@ -573,6 +577,7 @@ jobs:
             echo "### Architecture"
             echo
             echo "- Verifier: \`trusted-verifier/scripts/ci/verify-github-commit-signature.sh\`"
+            echo "- Mirror runtime: \`trusted-verifier/scripts/ci/mirror-main-to-gitlab.sh\`"
             echo "- Verifier SHA (immutable pin): \`$TRUSTED_VERIFIER_SHA\`"
             echo "- GitLab pipeline requested: \`no\`"
             echo "- Force push used: \`no\`"

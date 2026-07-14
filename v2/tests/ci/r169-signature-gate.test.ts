@@ -312,7 +312,33 @@ describe("R169 SIG — Phase B activation (SIG-R169-Phase-B)", () => {
     expect(workflow).toContain("Validate event identity");
     expect(workflow).toContain("Checkout exact CI-validated SHA");
     expect(workflow).toContain("Materialize SSH key");
-    expect(workflow).toContain("Run mirror state machine");
+    expect(workflow).toContain("Run pinned mirror state machine");
+  });
+
+  it("Phase B: target checkout is isolated as Git data", () => {
+    const targetStart = workflow.indexOf("Checkout exact CI-validated SHA");
+    const materializeStart = workflow.indexOf("Materialize SSH key");
+    expect(targetStart).toBeGreaterThan(-1);
+    expect(materializeStart).toBeGreaterThan(targetStart);
+
+    const targetCheckout = workflow.substring(targetStart, materializeStart);
+    expect(targetCheckout).toContain("ref: ${{ env.TARGET_SHA }}");
+    expect(targetCheckout).toContain("path: target");
+    expect(targetCheckout).toContain("persist-credentials: false");
+  });
+
+  it("Phase B: mirror runtime comes from the trusted checkout", () => {
+    const mirrorStart = workflow.indexOf("Run pinned mirror state machine");
+    const cleanupStart = workflow.indexOf("Cleanup SSH material and temp files");
+    expect(mirrorStart).toBeGreaterThan(-1);
+    expect(cleanupStart).toBeGreaterThan(mirrorStart);
+
+    const mirrorStep = workflow.substring(mirrorStart, cleanupStart);
+    expect(mirrorStep).toContain("working-directory: target");
+    expect(mirrorStep).toContain(
+      'bash "$GITHUB_WORKSPACE/trusted-verifier/scripts/ci/mirror-main-to-gitlab.sh"',
+    );
+    expect(mirrorStep).not.toMatch(/^\s*bash\s+scripts\/ci\/mirror-main-to-gitlab\.sh(?:\s|$)/m);
   });
 
   it("Phase B: TRUSTED_VERIFIER_SHA is pinned to Phase A squash SHA", () => {

@@ -43,6 +43,7 @@ import {
   existsSync,
   lstatSync,
   writeFileSync,
+  readFileSync,
   chmodSync,
   symlinkSync,
   mkdirSync,
@@ -716,6 +717,35 @@ describe("R169B-STEP4 — GC-RECOVERY-R169B-A2-06: DELETING recovery", () => {
     const entry = cas2.getGenerationCatalogEntry(ids[0]);
     expect(entry?.status).toBe("DELETED");
     cas2.close();
+  });
+
+  it("recovery refuses a replaced metadata sidecar before deleting either file", () => {
+    const ids = publishNGenerations(4);
+    const targetId = ids[0];
+    const cas = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
+    cas.beginImmediate();
+    cas.setCatalogStatus(targetId, "DELETING");
+    cas.appendPublicationHistory(targetId, FIXTURE_PROJECT_NAME, "MARK_DELETING", null);
+    cas.commit();
+    cas.close();
+
+    const generations = generationsDir(FIXTURE_PROJECT_NAME, cacheRoot);
+    const targetDb = join(generations, `generation-${targetId}.db`);
+    const targetMetadata = join(generations, `generation-${targetId}.json`);
+    const replacementMetadata = join(generations, `generation-${ids[1]}.json`);
+    rmSync(targetMetadata);
+    writeFileSync(targetMetadata, readFileSync(replacementMetadata));
+
+    const plan = planGenerationGc(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const result = applyGenerationGcPlan(plan, { cacheRoot });
+    expect(result.deletedGenerations).not.toContain(targetId);
+    expect(existsSync(targetDb)).toBe(true);
+    expect(existsSync(targetMetadata)).toBe(true);
+    expect(result.warnings.some((warning) => warning.message.includes("Recovery metadata proof failed"))).toBe(true);
+
+    const casAfter = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
+    expect(casAfter.getGenerationCatalogEntry(targetId)?.status).toBe("DELETING");
+    casAfter.close();
   });
 });
 
