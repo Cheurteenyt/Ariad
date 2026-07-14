@@ -1,8 +1,8 @@
 # V2 Architecture — Codebase Memory V2
 
-> **Status:** FOUNDATION / INACTIVE (R169A) — implemented candidate, pending review
-> **Last verified:** 0.75.0 / R169A — generation store foundation is an implemented candidate, inactive, pending review.
-> Current behavior (indexer, readers, UI, MCP, CLI) is unchanged from R168.1 and still uses the legacy `<project>.db` path. The R169A foundation is an implemented candidate — no production code path calls it. `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix + concurrency + performance + activation).
+> **Status:** FOUNDATION / INACTIVE (R169A) — R169A is merged and remains FOUNDATION / INACTIVE. No production path uses the generation store.
+> **Last verified:** 0.75.0 / R169A — generation store foundation is merged and remains FOUNDATION / INACTIVE.
+> Current behavior (indexer, readers, UI, MCP, CLI) is unchanged from R168.1 and still uses the legacy `<project>.db` path. R169A is merged — no production code path calls it. `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix + concurrency + performance + activation).
 
 ## 1. System Context
 
@@ -173,19 +173,19 @@ See [RELEASE_POLICY.md](RELEASE_POLICY.md) for release governance.
 
 - No atomic generation publication (R169 target)
 - No project lease/fencing (R170 target)
-- Node 20 only in CI (Node 22/24 matrix deferred)
+- Node.js requirement: `>=20.0.0` (from `v2/package.json`). CI uses Node 20. No Node 22/24 matrix is certified.
 - No GitHub Release yet (pre-release after R169 + R170)
 - Repository name `codebase-mirror` is misleading (rename deferred)
 ## 15. R169A — Generation Store Target Architecture (FOUNDATION / INACTIVE)
 
-> **Status: FOUNDATION / INACTIVE — implemented candidate, pending review.**
+> **Status: FOUNDATION / INACTIVE — R169A is merged. No production path uses the generation store.**
 > The target architecture documented in this section is **not active**.
-> The foundation code is an implemented candidate, tested, but no
-> production code path calls it. The indexer still writes to the legacy
-> `<project>.db` path; readers still open the legacy DB directly. This
-> section describes the target, not the current behavior. `DATA-CARRY-01`
-> (P1) remains OPEN until R169E (after crash matrix + concurrency +
-> performance + activation).
+> The foundation code is merged, tested, but no production code path
+> calls it. The indexer still writes to the legacy `<project>.db` path;
+> readers still open the legacy DB directly. This section describes the
+> target, not the current behavior. `DATA-CARRY-01` (P1) remains OPEN
+> until R169E (after crash matrix + concurrency + performance +
+> activation).
 
 ### 15.1 Goal
 
@@ -344,8 +344,15 @@ project); `EACCES` / `EIO` / `ENOTDIR` / `ELOOP` fail closed.
 `writeJsonAtomically(targetPath, value)` accepted an arbitrary
 `targetPath` with no containment check, no symlink rejection, and did
 `mkdir -p` which could create directories via parent symlinks.
-R169A-FIX-R2 introduces `writeProjectJsonAtomically`, the ONLY public
-writer API. The internal `writeJsonAtomically` is not exported.
+R169A-FIX-R2 introduced `writeProjectJsonAtomicallyInternal` (the
+project-aware wrapper). **It is INTERNAL** — it lives in
+`v2/src/storage/internal/generation-store-io.ts`, is NOT exported
+from the public facade, and receives a canonical-payload `Buffer`
+(not a JSON-serializable value). The ONLY public writer in R169A is
+`writeIndexStateAtomically(project, state, options?)`. The
+low-level `writeJsonAtomically(targetPath, payload: Buffer, ...)` is
+also internal and not exported. R169B will own the first public
+publication API (`publishPreparedGeneration`).
 
 The wrapper:
 
@@ -417,7 +424,7 @@ it opened — and that generation is **immutable**.
 |---|---|---|
 | valid | (ignored) | `generation` |
 | absent | exists and is a regular file inside the trust root with no symlink chain | `legacy` |
-| absent | exists but is a directory / symlink / special file / outside the trust root | **FAIL CLOSED** — `LEGACY_SOURCE_OPEN_FAILED` |
+| absent | exists but is a directory / symlink / special file / outside the trust root | **FAIL CLOSED** — `LEGACY_SOURCE_INVALID` (R169A-FIX-R2: renamed from `LEGACY_SOURCE_OPEN_FAILED`; the old name is retained only as a historical note) |
 | absent | absent | `missing` |
 | invalid (any reason) | (ignored) | **FAIL CLOSED** |
 | manifest `dbFile` not canonical | (ignored) | **FAIL CLOSED** — `MANIFEST_DBFILE_NOT_CANONICAL` |
@@ -449,7 +456,7 @@ back-compat is preserved on the happy path. Migration to generation-
 only operation happens across the validated R169A→R169E roadmap:
 
 - **R169A** — Generation Store Contract + Resolver Foundation
-  (this round; implemented candidate, inactive, pending review).
+  (this round; merged, FOUNDATION / INACTIVE).
 - **R169B** — Durable Staging Publisher + Validator + fsync + CAS + GC
   primitives. Implement independent publisher primitives and test
   harnesses — NO production indexer caller.
@@ -464,7 +471,8 @@ only operation happens across the validated R169A→R169E roadmap:
 
 Structured error codes, never a single `DB_ERROR` bucket. See
 `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`
-(24 codes — 15 original + 5 from GPT 5.6 pass 1 + 4 from pass 2):
+(the source of truth — hardcoded counts in documentation go stale as
+codes are added across R169B–R169E):
 
 - `GENERATION_STORE_CONFIG_ERROR`
 - `MANIFEST_PARSE_ERROR` / `MANIFEST_SCHEMA_ERROR`
@@ -554,7 +562,7 @@ performance verification, and activation gating have all passed.
 
 | Round | Scope | Status |
 |-------|-------|--------|
-| R169A | Generation Store Contract + Resolver Foundation (path helpers, manifest V1 types, resolver, atomic JSON writer, plus the eight contracts from R169A-FIX pass 1 + pass 2: canonical `dbFile`, symlink chain security, directory fsync → `ATOMIC_DURABILITY_UNKNOWN`, legacy validation, trust root symlink bypass, project-aware writer, layout durability, manifest size bound + immutable key authority) | **implemented candidate — INACTIVE, pending review** |
+| R169A | Generation Store Contract + Resolver Foundation (path helpers, manifest V1 types, resolver, atomic JSON writer, plus the eight contracts from R169A-FIX pass 1 + pass 2: canonical `dbFile`, symlink chain security, directory fsync → `ATOMIC_DURABILITY_UNKNOWN`, legacy validation, trust root symlink bypass, project-aware writer, layout durability, manifest size bound + immutable key authority) | **R169A is merged — FOUNDATION / INACTIVE. No production path uses the generation store.** |
 | R169B | Durable Staging Publisher + Validator + fsync + CAS + GC primitives (independent primitives + test harnesses — NO production indexer caller) | planned |
 | R169C | Indexer Integration + Outcome Contract (wire primitives into `indexProjectWasm` and outcome paths) | planned |
 | R169D | Reader Cutover + Legacy Migration + Project Lifecycle | planned |

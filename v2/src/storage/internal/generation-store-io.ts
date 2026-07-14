@@ -11,10 +11,10 @@
  *   - `PROD_OPS` const (production fs bindings)
  *   - `ensureGenerationStoreLayoutDurableInternal` (mkdir + fsync chain)
  *   - `writeIndexStateAtomicallyInternal` (typed atomic writer, ops+hook)
- *   - All internal helpers they depend on: `assertLayoutDirPermissions`,
- *     `openDirectoryNoFollow`, `defaultSerializeJson`,
- *     `prepareGenerationManifestForWrite`, `prepareIndexStateForWrite`,
- *     `writeJsonAtomically`, `writeProjectJsonAtomicallyInternal`.
+ *   - All internal helpers they depend on: `openDirectoryNoFollow`,
+ *     `defaultSerializeJson`, `prepareGenerationManifestForWrite`,
+ *     `prepareIndexStateForWrite`, `writeJsonAtomically`,
+ *     `writeProjectJsonAtomicallyInternal`.
  *
  * WHY A SEPARATE MODULE:
  *   GPT 5.6 found that the public module `generation-store.ts` was still
@@ -30,16 +30,19 @@
  *   `listProjectStoreKeys`. The internal harness lives here and is
  *   imported only by tests (which live outside the package build).
  *
- * DEPENDENCY DIRECTION:
+ * DEPENDENCY DIRECTION (R169B-STEP1 — cycle broken):
  *   - This module imports types from `../generation-types.js`.
- *   - This module imports path helpers, validators, trust-root validators,
- *     `assertNotSymlink`, and `GenerationStoreOptions` from
- *     `../generation-store.js` (the public module).
- *   - The public module imports `PROD_OPS`, the two `*Internal` functions,
- *     `assertLayoutDirPermissions`, and `O_NOFOLLOW` from this module.
- *   - This circular dependency is safe because nothing at module-load
- *     time crosses the boundary — only function bodies reference the
- *     cross-module bindings, and those are only executed at call time.
+ *   - This module imports path helpers and `GenerationStoreOptions` from
+ *     `../generation-paths.js`.
+ *   - This module imports validators, trust-root validators,
+ *     `assertNotSymlink`, `assertLayoutDirPermissions`, and the
+ *     `O_NOFOLLOW` / `O_DIRECTORY` platform flags from
+ *     `../generation-validation.js`.
+ *   - This module does NOT import from `../generation-store.js` (the
+ *     public facade). The R169A circular dependency is BROKEN.
+ *   - The public facade imports `PROD_OPS` and the `*Internal` functions
+ *     from this module. The dependency graph is now acyclic:
+ *       types -> paths/validation -> internal I/O -> public facades.
  *
  * SECURITY:
  *   All filesystem writes go through `O_NOFOLLOW | O_DIRECTORY` opens
@@ -54,6 +57,18 @@
  *     passes). The only change is the FILE location and the EXPORT
  *     boundary: these symbols are no longer reachable from
  *     `generation-store.ts`'s public surface.
+ *
+ * R169B-STEP1 changes (this module):
+ *   - The import of path helpers, validators, and trust-root checks has
+ *     been redirected from `../generation-store.js` (the public facade)
+ *     to the new leaf modules `../generation-paths.js` and
+ *     `../generation-validation.js`. This breaks the R169A module cycle.
+ *   - `assertLayoutDirPermissions` and the `O_NOFOLLOW` / `O_DIRECTORY`
+ *     platform flags have been MOVED to `../generation-validation.js`.
+ *     This module imports them from there. They are no longer defined
+ *     locally. (The R169A source-inspection test that asserted
+ *     `export function` + `assertLayoutDirPermissions` in this module has
+ *     been updated to reflect the new location.)
  */
 
 import {
@@ -84,11 +99,11 @@ import {
   GenerationStoreErrorCode,
 } from "../generation-types.js";
 
-// Path helpers, validators, trust-root validators, and the options
-// interface live in the public module. We import them here so the
-// internal harness can call them. The public module imports PROD_OPS and
-// the *Internal functions back from this module — see the dependency
-// direction note in the file header.
+// R169B-STEP1: Path helpers and the GenerationStoreOptions interface
+// live in `../generation-paths.js`. Validators, trust-root checks, and
+// `assertLayoutDirPermissions` live in `../generation-validation.js`.
+// This module does NOT import from the public facade
+// (`../generation-store.js`); the R169A module cycle is broken.
 import {
   GenerationStoreOptions,
   getCacheRoot,
@@ -99,33 +114,26 @@ import {
   tmpDir,
   activeManifestPath,
   indexStatePath,
+} from "../generation-paths.js";
+import {
   assertTrustedRootNoSymlinks,
   assertPathInsideNoSymlinks,
   assertNotSymlink,
+  assertLayoutDirPermissions,
   validateGenerationManifest,
   validateIndexAttemptState,
-} from "../generation-store.js";
+  O_NOFOLLOW,
+  O_DIRECTORY,
+} from "../generation-validation.js";
 
-// ─── Platform constants (R169A-FIX-R3 SEC-R169A-R3-02 / SEC-R169A-R3-03) ──
-
-/**
- * Platform flags for O_NOFOLLOW and O_DIRECTORY. These are present on
- * Linux and macOS but NOT on Windows. We gracefully degrade when they
- * are absent.
- *
- * R169A-FIX-R8: This constant was previously a non-exported module-scoped
- * const in `generation-store.ts`. It is moved here so that the public
- * module's `parseGenerationManifest` (which still needs `O_NOFOLLOW` for
- * its open-with-O_NOFOLLOW branch) imports it from this internal module
- * rather than defining it locally. This keeps the FS-specific constants
- * centralized.
- */
-export const O_NOFOLLOW: number = typeof (fsConstants as Record<string, unknown>).O_NOFOLLOW === "number"
-  ? (fsConstants as { O_NOFOLLOW: number }).O_NOFOLLOW
-  : 0;
-export const O_DIRECTORY: number = typeof (fsConstants as Record<string, unknown>).O_DIRECTORY === "number"
-  ? (fsConstants as { O_DIRECTORY: number }).O_DIRECTORY
-  : 0;
+// R169B-STEP1: The `O_NOFOLLOW` and `O_DIRECTORY` platform flags are
+// now imported from `../generation-validation.js` (where they are
+// defined). The local definitions have been removed. They were duplicated
+// here and in the public facade in R169A; the deduplication is part of
+// the module-cycle break (the validation module owns these constants and
+// exports them to both the internal I/O module and the public facade).
+// The `fsConstants` import is retained because `openDirectoryNoFollow`
+// (below) uses `fsConstants.O_RDONLY` for its open() call.
 
 // ─── Injectable filesystem operations (R169A-FIX DUR-R169A-02) ───────────
 
@@ -242,77 +250,13 @@ export const PROD_OPS: AtomicFileOps = {
   },
 };
 
-// ─── Layout permission policy (R169A-FIX-R4 COMPAT-R169A-R4-01) ──────────
-
-/**
- * R169A-FIX-R4 (COMPAT-R169A-R4-01): Two-tier permission policy for
- * layout directories.
- *
- * Compatibility roots (cacheRoot, codebase-memory-mcp) require
- * `mode & 0o022 === 0` (no group/other WRITE). 0755, 0750, 0700 all
- * accepted — this preserves existing legacy caches that have 0755 on
- * the cbm directory.
- *
- * Private R169 dirs (projects, projectStore, generations, tmp) require
- * `mode === 0o700` exactly. These are created fresh by R169A and
- * contain potentially sensitive information (DB file paths, manifest
- * contents); they should not be readable by other users on the host.
- *
- * On POSIX (where `process.getuid` is available), the directory's uid
- * is best-effort checked against `process.getuid()`. On Windows this
- * check is skipped.
- *
- * R169A-FIX-R8: This helper is used by BOTH the public trust-root
- * validators (`assertTrustedRootNoSymlinks`,
- * `assertGenerationStoreRootTrusted`) AND by
- * `ensureGenerationStoreLayoutDurableInternal` (in this module). It is
- * exported from the internal module; the public module imports it from
- * here. It is NOT re-exported by the public module, so the public API
- * surface does not include it.
- */
-export function assertLayoutDirPermissions(
-  st: { mode: number; uid?: number },
-  dirPath: string,
-  isCompatRoot: boolean,
-  project: string,
-  phase: string,
-): void {
-  if (isCompatRoot) {
-    // Compatibility root: no group/other WRITE bits set.
-    // 0755, 0750, 0700 all accepted.
-    if ((st.mode & 0o022) !== 0) {
-      throw new GenerationStoreError(
-        "STORE_LAYOUT_PERMISSIONS_INSECURE",
-        phase,
-        project,
-        `Compatibility root "${dirPath}" has insecure permissions: mode=0o${(st.mode & 0o777).toString(8)} (group/other WRITE bits must be 0)`,
-      );
-    }
-  } else {
-    // Private R169 directory: must be exactly 0700.
-    if ((st.mode & 0o777) !== 0o700) {
-      throw new GenerationStoreError(
-        "STORE_LAYOUT_PERMISSIONS_INSECURE",
-        phase,
-        project,
-        `Private R169 directory "${dirPath}" has insecure permissions: mode=0o${(st.mode & 0o777).toString(8)} (must be exactly 0700)`,
-      );
-    }
-  }
-  // POSIX uid check (best-effort — skip on Windows where getuid is
-  // unavailable).
-  if (typeof st.uid === "number" && typeof process.getuid === "function") {
-    const expectedUid = process.getuid();
-    if (st.uid !== expectedUid) {
-      throw new GenerationStoreError(
-        "STORE_LAYOUT_PERMISSIONS_INSECURE",
-        phase,
-        project,
-        `Layout directory "${dirPath}" is owned by uid ${st.uid}, expected ${expectedUid}`,
-      );
-    }
-  }
-}
+// R169B-STEP1: `assertLayoutDirPermissions` has been MOVED to
+// `../generation-validation.js`. It is a pure validator (takes a stat-
+// shaped object, throws on bad permissions) and has no I/O harness
+// dependencies — it belongs in the validation module. This module
+// imports it from there. The R169A source-inspection test that asserted
+// `export function` + `assertLayoutDirPermissions` in this module has been
+// updated to reflect the new location.
 
 // ─── Layout durability (R169A-FIX-R2 DUR-R169A-R2-01, R169A-FIX-R3) ──────
 

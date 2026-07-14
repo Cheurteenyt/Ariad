@@ -37,7 +37,7 @@ settings freeze protocol.
 | Require conversation resolution | ON | All conversations must be resolved before merge |
 | Allowed merge method | Squash only | Linear history + clean commit messages |
 | Require status checks | ON | CI must pass before merge |
-| Required checks | `Backend (v2)`, `Frontend (graph-ui)` | Both CI jobs must be green |
+| Required checks | `Backend (v2)`, `Frontend (graph-ui)`, `npm pack + install + CLI smoke`, `Docker build + CLI + non-root smoke` | All four always-run CI jobs must be green |
 | Require branches up to date | ON | PR branch must be rebased on latest `main` |
 | Block force pushes | ON | No `--force` to `main` |
 | Require deployments to succeed | OFF | Not needed |
@@ -54,8 +54,6 @@ settings freeze protocol.
 | `Mirror validated main` | `workflow_run` on CI success | No (post-merge) | Runs after merge to main |
 | `gitlab-passive-mirror` | Environment deployment | No (post-merge) | Mirror deployment record |
 | `Repository Health Report` | Weekly schedule | No | Informational only |
-| `Docker Smoke` | push main + pull_request (path-filtered) | No (not yet stable) | Will become required after stable runs |
-| `Package Smoke` | push main + pull_request (path-filtered) | No (not yet stable) | Will become required after stable runs |
 
 ## 3. Settings → General → Pull Requests
 
@@ -91,13 +89,14 @@ not affecting normal single-branch pushes or mirror operations.
 | Setting | Expected | Verification |
 |---------|----------|-------------|
 | Default GITHUB_TOKEN permissions | Read-only | MANUAL VERIFICATION REQUIRED |
-| Allow GitHub Actions to create PRs | ON (if GLM opens PRs via workflow) | MANUAL VERIFICATION REQUIRED |
+| Allow GitHub Actions to create PRs | OFF | No maintained workflow needs `pull-requests: write` |
 | Fork PR workflows | Approval required | MANUAL VERIFICATION REQUIRED |
-| Actions allowed | GitHub-owned + local | MANUAL VERIFICATION REQUIRED |
+| Actions allowed | All actions, with full-length SHA pinning required | Authenticated GitHub API + workflow audit |
 | Artifact/log retention | 90 days recommended | MANUAL VERIFICATION REQUIRED |
 
-> **Note:** GitHub repository settings are not readable via the unauthenticated
-> API. The maintainer must manually verify each setting and update this table.
+> **Note:** Verify these settings with an authenticated GitHub API call during
+> each governance audit. Settings without API coverage still require a manual
+> check in the repository UI.
 
 ## 7. Environment: `gitlab-passive-mirror`
 
@@ -212,7 +211,7 @@ The normal workflow for every change:
 ```
 feature/round branch
   → GitHub Pull Request
-  → Backend (v2) + Frontend (graph-ui) green
+  → Backend (v2) + Frontend (graph-ui) + package smoke + Docker smoke green
   → conversations resolved
   → squash merge
   → branch automatically deleted
@@ -236,9 +235,8 @@ Direct push to `main` is NOT the normal workflow. In an emergency:
 
 Auto-merge is enabled at the repository level but must be used carefully:
 
-- Do NOT activate auto-merge until all necessary checks (including
-  Package Smoke and Docker Smoke when relevant) have run and are green
-- Auto-merge is appropriate when all required checks are in the ruleset
+- Do NOT activate auto-merge until all four always-run CI jobs are green
+- Auto-merge is appropriate only while all four checks remain required
   and stable
 - Never use `Merge without waiting for requirements to be met` outside
   a documented break-glass
@@ -251,7 +249,7 @@ After any modification to GitHub repository settings:
 [ ] Ruleset `protect-main` is Active
 [ ] Target is `main`
 [ ] PR required before merge
-[ ] Backend (v2) + Frontend (graph-ui) are required checks
+[ ] Backend + Frontend + Package Smoke + Docker Smoke are required checks
 [ ] Squash-only merge
 [ ] Force push blocked
 [ ] Deletion blocked
@@ -277,6 +275,7 @@ After any modification to GitHub repository settings:
 - [CI_CONTINUITY.md](CI_CONTINUITY.md) — Operational resilience plan
 - [RELEASE_POLICY.md](RELEASE_POLICY.md) — Release governance
 - [MAINTAINERS_GUIDE.md](../MAINTAINERS_GUIDE.md) — Development workflow and conventions
+- [RESTRICTED_ENVIRONMENT_GIT_TRANSPORT.md](RESTRICTED_ENVIRONMENT_GIT_TRANSPORT.md) — SSH wrapper for environments without native OpenSSH
 
 ## 16. Cross-host Signature Trust Boundary (SIG-R169)
 
@@ -287,8 +286,10 @@ bootstrap is complete:
 
 - **Phase A (completed):** Verifier script + tests + docs published and
   squash-merged as `f5d42688d921f04b4323a017586af4566c17e381`.
-- **Phase B (active):** The mirror workflow loads the verifier from
-  this immutable pinned SHA and executes it before target checkout.
+- **Phase B (active):** The mirror workflow loads both the verifier and
+  mirror state machine from this immutable pinned SHA. The verifier runs
+  before target checkout; the target checkout is thereafter treated as
+  Git data only.
 
 ```
 TRUSTED_VERIFIER_SHA = f5d42688d921f04b4323a017586af4566c17e381
@@ -296,12 +297,15 @@ TRUSTED_VERIFIER_SHA = f5d42688d921f04b4323a017586af4566c17e381
 
 ### Rotation procedure
 
-To update the verifier:
-1. Publish a new Phase A PR (script + tests + docs only, gate NOT activated)
+To update the verifier or mirror state machine:
+1. Publish a new Phase A PR (scripts + tests + docs only; keep the old pin)
 2. Squash-merge and verify CI green + mirror green
 3. Record the new squash SHA
-4. Update `TRUSTED_VERIFIER_SHA` in `.github/workflows/mirror-main-to-gitlab.yml`
-   in a separate PR
+4. In a separate PR, update both the `TRUSTED_VERIFIER_SHA` environment
+   value and the literal trusted-checkout `ref` in
+   `.github/workflows/mirror-main-to-gitlab.yml`
+5. Update the pin assertions and documented SHA, then verify the pinned blob
+   is the runtime exercised by the tests
 
 Never use `main`, `HEAD`, `TARGET_SHA`, `github.sha`, or any moving ref.
 
@@ -331,17 +335,19 @@ It does NOT prove:
 - Immutability of the workflow itself
 - Absence of account compromise
 
-The verifier script (Phase B) is loaded from an immutable pinned SHA —
-no checked-out repository code is executed before the gate. The
-workflow itself remains protected by repository branch protection
-rules, not by the signature gate.
+The verifier and mirror state machine are loaded from an immutable pinned
+SHA. No checked-out target code is executed before the gate, and no script
+provided by `TARGET_SHA` is executed after the GitLab credential is
+materialized. The workflow itself remains protected by repository branch
+protection rules, not by the signature gate.
 
 ### Canonical source (SIG-R169-DIV-01)
 
-The verification logic lives in a **single canonical script**. The mirror
-workflow calls this script directly — no inline duplication. Runtime tests
-execute the same script against a local HTTP fixture server, proving the
-actual production code path.
+The verification and transport logic live in two canonical scripts:
+`scripts/ci/verify-github-commit-signature.sh` and
+`scripts/ci/mirror-main-to-gitlab.sh`. The workflow calls their immutable
+pinned snapshots directly. Runtime tests execute the published sources;
+changes become active only after a separate trusted-pin rotation.
 
 ### Trust contract
 
@@ -424,9 +430,12 @@ mirror will refuse to replicate it to GitLab.
 
 ### Script
 
-`scripts/ci/verify-github-commit-signature.sh` — the canonical verifier.
+`scripts/ci/verify-github-commit-signature.sh` is the canonical verifier;
+`scripts/ci/mirror-main-to-gitlab.sh` is the canonical mirror state machine.
 Phase A: completed (squash-merged as `f5d42688d921f04b4323a017586af4566c17e381`).
-Phase B: active — the mirror workflow calls this script from the pinned
-immutable SHA before checkout of `TARGET_SHA`. Uses `GITHUB_TOKEN` (no
-new secrets). Retries on transient errors (max 3, backoff 1s/2s). Fails
-closed on all other errors.
+Phase B: active — the mirror workflow calls both scripts from the pinned
+immutable SHA and never executes the target's copy of the mirror script.
+The verifier uses `GITHUB_TOKEN` (no new secrets), retries transient errors
+(max 3, backoff 1s/2s), and fails closed on all other errors. Any change to
+either published source requires a later, separate pin-rotation PR before it
+becomes the production runtime.

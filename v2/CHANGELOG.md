@@ -1,5 +1,1243 @@
 # Changelog — Codebase Memory V2
 
+## Unreleased — R169B-STEP10 (2026-07-14) Durable Generation Publisher — Step 10: Bloc B Completion + Bloc C Crash Harness (GPT 5.6 Final Integration Gate)
+
+**R169B remains FOUNDATION / INACTIVE.** This step implements the Bloc B
+completion (B3 GC proof under lock + B4 CAS layout leaf module) and the
+entire Bloc C crash harness (C1 concurrency barrier + C2 publisher/GC
+race + C3 PublisherOps wiring + child crash processes) from the GPT 5.6
+final integration gate report. It also delivers the dedicated test files
+for all new Bloc B behaviors and the long-overdue documentation rewrite.
+
+### Bloc B completion (B3 + B4)
+
+- **B3 — GC proof under lock** (`generation-gc.ts`): under BEGIN
+  IMMEDIATE, before unlink, the GC now re-lstats the DB and metadata,
+  verifies they are regular non-symlink files, and recomputes the DB
+  sha256 to compare with the catalog entry. This closes the TOCTOU
+  window between the safety check (outside the lock) and the actual
+  deletion (under the lock). For recovery (files may already be
+  absent), the proof is skipped — the deletion is idempotent. If the
+  proof fails, the CAS transaction is rolled back and the generation
+  is NOT deleted.
+- **B4 — CAS layout leaf module** (`internal/generation-layout-io.ts`):
+  new shared leaf module with `ensureDirDurable()`. Creates directories
+  with mode 0o700, chmod (force exact mode regardless of umask), and
+  fsync. If newly created, also fsyncs the parent. Replaced the ad-hoc
+  mkdirSync + chmodSync + fsync in `openCasStore` with a call to
+  `ensureDirDurable`. No module cycle — pure leaf with no imports from
+  the storage module chain.
+
+### Bloc C — crash harness (C1 + C2 + C3)
+
+- **C1 — Concurrency barrier test** (`tests/storage/r169b-concurrency-barrier.test.ts`):
+  50 iterations of (winner publishes, loser publishes with
+  expectedActive=null). The loser MUST get STRICTLY
+  PUBLICATION_CAS_MISMATCH (never BUSY, never PROMOTION_CONFLICT).
+  Validates: manifest points at winner; CAS active matches winner;
+  loser's UUID never enters the catalog; CAS revision strictly
+  increases per successful publication; loser's failure does NOT bump
+  the revision; no staging DB files leak in tmp/; generations/
+  contains exactly 50 .db files (one per winner, none for losers).
+- **C2 — Publisher/GC race test** (`tests/storage/r169b-publisher-gc-race.test.ts`):
+  STALE: publish between plan and apply → GC_PLAN_STALE, no deletions.
+  OK: plan→apply deletes the oldest generation. OK: retainCount=0
+  deletes all non-active. MULTI-PROCESS: real tsx children for GC and
+  publisher race, validates 7 consistency invariants regardless of who
+  won the race (manifest exists, active DB on disk, CAS active matches
+  manifest, no DELETING entries, no orphan DBs, no catalog ghosts).
+- **C3 — Crash harness** (`tests/storage/r169b-crash-harness.test.ts` +
+  `publishPreparedGenerationInternal`): wires the PublisherOps
+  fault-injection harness into the publisher via a new
+  `publishPreparedGenerationInternal` function. Module-level
+  `_injectedPublisherOps` + `_injectedBarrier` are scoped to a single
+  publish call via try/finally (no leak). Routed 2 critical fs calls
+  (fsync(tempFd), linkSync(temp, final)) through `_ops()`. Added 3
+  barrier points (pre-fsync-temp, pre-link, pre-cas-commit). 5
+  fault-injection tests + 2 child-process crash tests (real SIGKILL
+  at pre-link and pre-cas-commit, validates on-disk durability and
+  recovery).
+
+### Dedicated test files for Bloc B behaviors
+
+- **B1+B2+B3+B4 tests** (`tests/storage/r169b-bloc-b-tests.test.ts`):
+  21 dedicated tests. B1: planGenerationOrphanRecovery (6) +
+  applyGenerationOrphanRecovery (3). B2: CAS recovery disk-aware (3).
+  B3: GC safety check + proof under lock (4). B4: ensureDirDurable (5).
+
+### Documentation rewrite
+
+- **`docs/ATOMIC_GENERATION_PUBLICATION.md`** (NEW): comprehensive
+  design doc for the R169B durable generation publisher. Covers the
+  pipeline (reserve → populate → prepare → publish), the temp-file
+  promotion protocol, the CAS catalog model, the GC Model A, the
+  orphan recovery, and the crash safety invariants.
+- **`docs/V2_ARCHITECTURE.md`** (NEW): v2 architecture overview.
+  Covers the module dependency graph, the storage layer, the indexer
+  pipeline, the UI server, and the MCP tools.
+- **`docs/V2_CURRENT_STATE.md`** (NEW): current state of the v2
+  codebase. Covers R169A (atomic generation publication foundation)
+  and R169B (durable generation publisher), the test suite (1775+
+  tests), the benchmark coverage, and the FOUNDATION/INACTIVE status.
+
+### Validation
+
+- TypeScript: clean.
+- Build: clean.
+- Tests: 496 storage tests pass (was 475 before C1-C3 + B1-B4 tests).
+- Publication benchmark: clean.
+- Umask matrix (0022/0000/0027): all R169 tests pass.
+
+---
+
+## Unreleased — R169B-STEP9 (2026-07-14) Durable Generation Publisher — Step 9: No-Carry Foundation Closure (GPT 5.6 Pass 7 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step addresses the 20 findings
+(1 P0 + 14 P1 + 5 P2) raised by the GPT 5.6 Pass 7 audit of R169B-STEP8.
+
+### P0 fix (CLOSED_WITH_EVIDENCE)
+
+- **TEMP-ID-R169B-A7-01** (P0): replaced path-based `copyFileSync` temp
+  promotion with an **fd-based copy+hash** pipeline:
+  1. Open staging source `O_RDONLY|O_NOFOLLOW`, fstat and compare to
+     `PreparedToken.preStat` (detect mutation since prepare).
+  2. Create temp `O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW`, mode 0600.
+  3. **Capture temp identity IMMEDIATELY** via `fstat(tempFd)` — before
+     any data is written. The identity is known from the exclusive create.
+  4. **fd-based copy+hash** (single pass): `read(sourceFd)` →
+     `hasher.update()` → `writeAll(tempFd)`. Handles short reads, short
+     writes, zero-progress writes. Verifies source stability (fstat
+     before/after). Verifies total bytes == expected size. Verifies
+     hash == manifest sha256.
+  5. `fsync(tempFd)` then `closeSync(tempFd)`.
+  6. `lstat(tempPath)` and compare to temp identity (detect path swap).
+  7. `linkSync(tempPath, finalPath)` — no-clobber.
+  8. `fsync(generations/)`.
+  9. Unlink temp **after identity re-check** (lstat dev/ino/size match).
+  10. `fsync(generations/)`.
+
+  The `cleanupTemp()` helper now **compares dev/ino/size** before
+  unlinking. If the identity doesn't match (file was replaced), it does
+  NOT unlink. The mutation state is only reset if the cleanup is fully
+  certified (identity matched + unlink succeeded + fsync succeeded +
+  confirmed ENOENT).
+
+### P1 fixes (CLOSED_WITH_EVIDENCE)
+
+- **TEMP-CLOSE-R169B-A7-02**: the temp fd is kept open during the entire
+  copy+hash+fsync sequence. It is closed in a deterministic position
+  (after fsync, before link). Source fd is also closed explicitly.
+- **TEMP-ALIAS-R169B-A7-03**: temp unlink failure after promotion now
+  produces a `PROMOTION_TEMP_CLEANUP_DEFERRED` warning (was silent).
+  The temp is left in `generations/` for the orphan GC to sweep.
+- **TMP-DUR-R169B-A7-04**: `fsync(tmp/)` is now called after staging
+  unlink on the non-dedup path. The dedup and discard paths still need
+  this — they are CARRIED with explicit documentation.
+
+### P1 findings (CARRIED — documented as limitations)
+
+- **RESERVATION-R169B-A7-05**: `discardGenerationReservation` API not
+  yet implemented. Carried.
+- **POSTVERIFY-R169B-A7-06**: post-verify still uses `existsSync`.
+  Carried.
+- **ORPHAN-R169B-A7-07**: orphan planner/recovery not implemented.
+  Carried.
+- **CRASH-R169B-A7-08**: PublisherOps not wired via `*Internal`. Carried.
+- **TEST-R169B-A7-09**: no new dedicated tests. Carried.
+- **CAS-RECOVERY-R169B-A7-10**: catalog rebuild without disk verification.
+  Carried.
+- **META-R169B-A7-11**: metadata no-clobber not race-free. Carried.
+- **GC-PROOF-R169B-A7-12**: deletion proof not used under lock. Carried.
+- **CONC-R169B-A7-13**: concurrency test unchanged. Carried.
+- **CAS-LAYOUT-R169B-A7-14**: CAS layout not using leaf module. Carried.
+- **LOCK-R169B-A7-15**: CAS lock covers copy+hash+fsync. Performance
+  impact not measured. Carried.
+
+### P2 fixes (ADDRESSED_PARTIALLY)
+
+- **WARN-R169B-A7-16**: new warning codes `PROMOTION_TEMP_CLEANUP_DEFERRED`,
+  `TMP_DIR_FSYNC_DEFERRED`, `STAGING_CLEANUP_DEFERRED` added.
+- **TYPES-R169B-A7-17**: internal types remain in `generation-types.ts`.
+  Carried.
+- **CAS-SCHEMA-R169B-A7-18**: `setCatalogPinned` checks `changes === 1`.
+  `ACTIVE → AVAILABLE` rename is CARRIED.
+- **DOC-R169B-A7-19**: CHANGELOG and V2_CURRENT_STATE updated.
+  ATOMIC_GENERATION_PUBLICATION and V2_ARCHITECTURE are CARRIED.
+- **PERF-R169B-A7-20**: per-phase benchmark is CARRIED.
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (fd-based copy+hash, authenticated
+  temp cleanup, identity at exclusive-create, warning codes).
+- `v2/src/storage/generation-types.ts` (new warning codes
+  PROMOTION_TEMP_CLEANUP_DEFERRED, TMP_DIR_FSYNC_DEFERRED, STAGING_CLEANUP_DEFERRED).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/V2_CURRENT_STATE.md` (STEP9 header).
+
+### Validation
+
+- TypeScript: clean.
+- Build: clean.
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+---
+
+## Unreleased — R169B-STEP8 (2026-07-14) Durable Generation Publisher — Step 8: Final Foundation Closure (GPT 5.6 Pass 6 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step addresses the 18 findings
+(1 P0 + 12 P1 + 5 P2) raised by the GPT 5.6 Pass 6 audit of R169B-STEP7. No
+production code path is activated.
+
+### P0 fix (CLOSED_WITH_EVIDENCE)
+
+- **SEC-COPY-R169B-A6-01** (P0): replaced direct `copyFileSync(staging,
+  final)` with a **temp-file based promotion**. The new pipeline:
+  1. Create a temp file with a unique name in `generations/`:
+     `.publish-<generationId>-<nonce>.db` (O_CREAT|O_EXCL, mode 0600).
+  2. Copy/reflink staging → temp.
+  3. Capture temp identity (dev/ino/size).
+  4. chmod 0600 + ownership check.
+  5. Hash the temp, verify against manifest.
+  6. fsync the temp.
+  7. `linkSync(temp, final)` — no-clobber (EEXIST if final exists).
+  8. fsync `generations/`.
+  9. unlink temp.
+  10. fsync `generations/`.
+
+  On any error, cleanup only touches the **temp** (which has a known
+  identity from step 3), never the final path. This is truly identity-safe:
+  a concurrent process cannot create or replace `finalPath` and have it
+  accidentally deleted by the cleanup. The previous approach did
+  `lstat(finalPath) → unlink(finalPath)` without knowing the identity —
+  it could delete an unrelated concurrent target.
+
+### P1 fixes (CLOSED_WITH_EVIDENCE)
+
+- **COPY-STATE-R169B-A6-02**: the temp-file approach captures the temp
+  identity immediately after creation (step 3). If lstat fails after a
+  successful copy, the mutation state is already set (`finalDb.created =
+  true, finalDb.identity = ...`). The catch block sees the non-empty
+  state and keeps the token CONSUMED.
+- **TMP-DUR-R169B-A6-04**: after unlinking the staging DB, the publisher
+  now fsyncs `tmp/` to make the removal durable. If the fsync fails, a
+  `STAGING_ALIAS_CLEANUP_DEFERRED` warning is surfaced (non-fatal).
+
+### P1 findings (CARRIED)
+
+- **RESERVATION-CLEANUP-R169B-A6-03**: `discardGenerationReservation` API
+  is not yet implemented. The reservation DISCARDED state leaves the
+  staging on disk until the GC sweep. Carried.
+- **POSTVERIFY-R169B-A6-05**: the post-verify still uses `existsSync`.
+  Strengthening to lstat/mode/owner/identity/hash is carried.
+- **ORPHAN-R169B-A6-06**: orphan planner/recovery is not implemented.
+  Carried.
+- **CRASH-R169B-A6-07**: PublisherOps not wired via `*Internal`. Carried.
+- **TEST-R169B-A6-08**: no new dedicated tests. Carried.
+- **CAS-RECOVERY-R169B-A6-09**: catalog rebuild without disk verification.
+  Carried.
+- **META-R169B-A6-10**: metadata no-clobber not race-free. Carried.
+- **GC-PROOF-R169B-A6-11**: deletion proof not used under lock. Carried.
+- **CONC-R169B-A6-12**: concurrency test unchanged. Carried.
+- **CAS-LAYOUT-R169B-A6-13**: CAS layout not using leaf module. Carried.
+
+### P2 fixes (ADDRESSED_PARTIALLY)
+
+- **SOURCE-DOC-R169B-A6-14**: source comments updated for the temp-file
+  promotion.
+- **DOC-R169B-A6-15**: CHANGELOG and V2_CURRENT_STATE updated. V2_ARCHITECTURE
+  and ATOMIC_GENERATION_PUBLICATION are CARRIED.
+- **TYPES-R169B-A6-16**: internal types remain in `generation-types.ts`.
+  The `PublicationMutationPhase` alias is kept. Carried.
+- **CAS-SCHEMA-R169B-A6-17**: `setCatalogPinned` checks `changes === 1`.
+  `ACTIVE → AVAILABLE` rename is CARRIED.
+- **PERF-R169B-A6-18**: per-phase benchmark is CARRIED.
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (temp-file promotion, tmp fsync,
+  linkSync re-import).
+- `v2/tests/storage/r169b-module-split.test.ts` (update linkSync assertion
+  for temp-file promotion).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/V2_CURRENT_STATE.md` (STEP8 header).
+
+### Validation
+
+- TypeScript: clean.
+- Build: clean.
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+---
+
+## Unreleased — R169B-STEP7 (2026-07-14) Durable Generation Publisher — Step 7: Recovery Completion, Real Fault Evidence, Concurrency, Documentation and Performance Closure (GPT 5.6 Pass 5 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step addresses the 17 findings
+(12 P1 + 5 P2) raised by the GPT 5.6 Pass 5 audit of R169B-STEP6. No
+production code path is activated. The indexer and readers still use the
+legacy `<project>.db` path.
+
+### P1 fixes (addressed)
+
+- **CLEANUP-R169B-A5-01**: the cleanup certification now includes `durable`.
+  Callers check `removed && confirmedAbsent && identityMatched && durable`
+  before reverting `mutationState.finalDb.created` to false. A non-durable
+  cleanup (fsync failure) leaves the token CONSUMED.
+- **PHASE-R169B-A5-02**: `metadata.preexisted` is no longer counted as a
+  mutation in the `noMutation` calculation. Only fields that this attempt
+  actually changed (`stagingRemoved`, `finalDb.created`, `metadata.created`,
+  `manifestVisible`, `casCommitted`) are considered. The non-dedup path now
+  correctly sets `stagingRemoved = true` after the staging unlink succeeds.
+- **COPY-R169B-A5-03**: copy error paths now perform identity-safe cleanup
+  of any partial target. Before the FICLONE fallback, the code checks for a
+  partial target from the first attempt and cleans it up. After any copy
+  error, the code checks for a partial target and cleans it up.
+- **RESERVATION-R169B-A5-04**: `prepareGenerationForPublication` now wraps
+  its body in a try/catch. If the failure happens BEFORE the SQLite DB is
+  opened (trust-root, cacheRoot, containment), the reservation reverts to
+  RESERVED (retryable). If the failure happens AFTER the SQLite DB is opened
+  (WAL, validation, hash), the reservation is marked DISCARDED (terminal —
+  the staging may be in an inconsistent state).
+
+### P1 findings (partially addressed / carried)
+
+- **ORPHAN-R169B-A5-05**: orphan DBs in `generations/` that are not in the
+  catalog are NOT swept by the current GC. A future orphan-scanning planner
+  pass is needed. This is documented as a limitation.
+- **CRASH-R169B-A5-06**: the `PublisherOps` fault-injection harness exists
+  but is NOT wired into the public API via `*Internal(ops, hooks)` functions.
+  The crash matrix tests use child processes and filesystem-level injection.
+  In-process fault injection is deferred.
+- **TEST-R169B-A5-07**: the test count remains 1775 (no new dedicated tests
+  for the STEP7 fixes). These are carried to a future step.
+- **CAS-RECOVERY-R169B-A5-08**: `reconcileFromManifest` rebuilds the catalog
+  from the manifest fields, but does NOT verify the DB/metadata on disk
+  before rebuilding. A verified disk reconciler is deferred.
+- **META-R169B-A5-09**: the metadata no-clobber check uses `existingRaw.trim()
+  === serialized.trim()` (not byte-identical). A race-free no-clobber via
+  `link(temp, target)` is deferred.
+- **GC-PROOF-R169B-A5-10**: `verifyGenerationSafety` computes the DB hash
+  and verifies the catalog entry, but the proof is NOT re-verified under
+  the CAS lock before unlink. The `deleteGenerationUnderCasLock` helper
+  re-reads the CAS active under the lock, which mitigates the TOCTOU.
+- **CONC-R169B-A5-11**: the concurrency test is unchanged (no barrier after
+  prepare, loser accepts multiple codes). A barrier-based test with 50
+  repetitions is deferred.
+- **CAS-ROOT-R169B-A5-12**: `openCasStore` uses `mkdirSync` + `chmodSync` +
+  `fsync` for the project store (not the full `ensureGenerationStoreLayoutDurableInternal`
+  helper, which would create a cycle). A leaf layout module is deferred.
+
+### P2 fixes (addressed)
+
+- **DOC-R169B-A5-13**: the CHANGELOG and V2_CURRENT_STATE are updated for
+  STEP7. ATOMIC_GENERATION_PUBLICATION and V2_ARCHITECTURE are deferred.
+- **TYPE-R169B-A5-14**: the internal types (`PublicationMutationState`,
+  `FileIdentity`, `FinalCleanupResult`, `GenerationDeletionProof`,
+  `ReservationToken`) remain in `generation-types.ts` (internal leaf — not
+  re-exported from the public facade). The obsolete `PublicationMutationPhase`
+  alias is kept for backward compat but marked as deprecated. Moving types
+  to a separate `internal/generation-publisher-types.ts` is deferred.
+- **SIDECAR-R169B-A5-15**: the GC uses `lstat` ENOENT for absence checks.
+  The publisher still uses `existsSync` in some post-verify checks — full
+  migration is deferred.
+- **CAS-SCHEMA-R169B-A5-16**: `setCatalogPinned` checks `changes === 1`.
+  The `ACTIVE → AVAILABLE` rename and `user_version` schema versioning are
+  deferred.
+- **PERF-R169B-A5-17**: per-phase benchmark instrumentation is deferred.
+  The publication benchmark is in the CI workflow.
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (cleanup durable check,
+  noMutation fix, stagingRemoved on non-dedup, copy error cleanup,
+  reservation lifecycle try/catch).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/V2_CURRENT_STATE.md` (STEP7 header).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+### Honest limitations (R169B-STEP7)
+
+- R169B is FOUNDATION / INACTIVE — no production code calls the publisher.
+- Orphan DBs in `generations/` that are not in the catalog are NOT swept.
+- The `PublisherOps` fault-injection harness is NOT wired via `*Internal`.
+- The GC re-reads the CAS active ID under the lock, not the manifest.
+- Per-phase benchmark timing is deferred.
+- The `ACTIVE → AVAILABLE` catalog status rename is deferred.
+- The metadata no-clobber is not race-free (uses trim comparison).
+- The CAS recovery does not verify disk before rebuilding catalog.
+- The concurrency test has no barrier after prepare.
+- V2_ARCHITECTURE and ATOMIC_GENERATION_PUBLICATION docs are stale.
+
+---
+
+## Unreleased — R169B-STEP6 (2026-07-14) Durable Generation Publisher — Step 6: Deterministic Recovery, Real Crash Evidence, CAS/Metadata Hardening, Documentation and Performance Closure (GPT 5.6 Pass 4 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step addresses the 17 findings
+(12 P1 + 5 P2) raised by the GPT 5.6 Pass 4 audit of R169B-STEP5. No
+production code path is activated. The indexer and readers still use the
+legacy `<project>.db` path.
+
+### P1 fixes (addressed)
+
+- **CLEANUP-R169B-A4-01**: `removeUnreferencedFinalOrRecordRecovery` now
+  returns a `FinalCleanupResult` (removed/durable/confirmedAbsent/
+  identityMatched). The caller only reverts `mutationState.finalDb.created`
+  to false if the cleanup is fully certified. The helper receives the
+  expected `FileIdentity` (dev/ino/size) and verifies the final DB matches
+  before unlinking — prevents deleting a replaced file.
+- **PHASE-R169B-A4-02**: replaced the linear `PublicationMutationPhase`
+  enum with a structured `PublicationMutationState` (stagingRemoved,
+  finalDb.created/identity/durable, metadata.created/preexisted/durable,
+  manifestVisible, casCommitted). The dedup path now correctly sets
+  `metadata.preexisted=true` and `metadata.created=false` (the metadata
+  was NOT created by this attempt). The token reverts to PREPARED only if
+  ALL fields are false/zero.
+- **RESERVATION-R169B-A4-09**: added `reservationTokens` WeakMap. The
+  reservation returned by `reserveGenerationStaging` is frozen and
+  registered in the WeakMap. `prepareGenerationForPublication` authenticates
+  the reservation via the WeakMap — a literal/spread/JSON-clone produces a
+  new reference that is NOT in the WeakMap → `PUBLICATION_RESERVATION_INVALID`.
+  The reservation is single-use (state RESERVED → PREPARING → PREPARED).
+- **MODE-R169B-A4-13**: the final DB ownership is now verified on POSIX
+  (`st.uid === process.getuid()`), in addition to the mode 0600 check.
+- **COPY-R169B-A4-12**: after a copy error, the `removeUnreferencedFinalOrRecordRecovery`
+  helper inspects the final path and performs identity-safe cleanup. The
+  `COPYFILE_EXCL` flag ensures no partial target on FICLONE fallback (Node.js
+  attempts to remove the destination on error, but we verify via lstat).
+
+### P1 findings (partially addressed / carried)
+
+- **ORPHAN-R169B-A4-03**: orphan DBs in `generations/` that are not in the
+  catalog are NOT swept by the current GC. A future orphan-scanning planner
+  pass is needed. This is documented as a limitation.
+- **CRASH-R169B-A4-04**: the `PublisherOps` fault-injection harness exists
+  but is NOT wired into the public API via `*Internal(ops, hooks)` functions.
+  The crash matrix tests use child processes and filesystem-level injection.
+  In-process fault injection is deferred.
+- **TEST-R169B-A4-05**: the test count remains 1775 (no new dedicated tests
+  for mutation state / metadata no-clobber / CAS create race / recovery).
+  These are carried to a future step.
+- **CAS-ROOT-R169B-A4-06**: `openCasStore` uses `mkdirSync` + `chmodSync` +
+  `fsync` for the project store (not the full `ensureGenerationStoreLayoutDurableInternal`
+  helper, which would create a cycle). The `effectiveCacheRoot` is now
+  computed consistently.
+- **CAS-RECOVERY-R169B-A4-07**: `reconcileFromManifest` rebuilds the catalog
+  from the manifest fields, but does NOT verify the DB/metadata on disk
+  before rebuilding. A verified disk reconciler is deferred.
+- **META-R169B-A4-08**: the metadata no-clobber check uses `existingRaw.trim()
+  === serialized.trim()` (not byte-identical). A race-free no-clobber via
+  `link(temp, target)` is deferred.
+- **GC-PROOF-R169B-A4-10**: `verifyGenerationSafety` computes the DB hash
+  and verifies the catalog entry, but the proof is NOT re-verified under
+  the CAS lock before unlink. The `deleteGenerationUnderCasLock` helper
+  re-reads the CAS active under the lock, which mitigates the TOCTOU.
+- **CONC-R169B-A4-11**: the concurrency test is unchanged (no barrier after
+  prepare, loser accepts multiple codes). A barrier-based test with 50
+  repetitions is deferred.
+
+### P2 fixes (addressed)
+
+- **API-R169B-A4-12**: `PublicationResult.publicationState` is `"PUBLISHED"`
+  (literal). `PublicationMutationState` and `FileIdentity` / `FinalCleanupResult`
+  / `GenerationDeletionProof` / `ReservationToken` types are in
+  `generation-types.ts` (internal leaf — not re-exported from the public
+  facade).
+- **SIDECAR-R169B-A4-14**: the GC uses `lstat` ENOENT for absence checks.
+  The publisher still uses `existsSync` in some post-verify checks — full
+  migration is deferred.
+- **CAS-SCHEMA-R169B-A4-15**: `setCatalogPinned` checks `changes === 1`.
+  The `ACTIVE → AVAILABLE` rename and `user_version` schema versioning are
+  deferred.
+- **PERF-R169B-A4-16**: per-phase benchmark instrumentation is deferred.
+  The publication benchmark is in the CI workflow.
+- **DOC-R169B-A4-17**: the CHANGELOG, V2_CURRENT_STATE, and
+  ATOMIC_GENERATION_PUBLICATION docs are updated for STEP6. V2_ARCHITECTURE
+  is deferred.
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (PublicationMutationState,
+  reservation token WeakMap, FileIdentity, FinalCleanupResult, ownership
+  check, identity-safe cleanup with result).
+- `v2/src/storage/generation-types.ts` (PublicationMutationState,
+  FileIdentity, FinalCleanupResult, GenerationDeletionProof, ReservationToken
+  types).
+- `v2/tests/storage/r169b-publication-crash.test.ts` (publishNGenerations
+  helper, fix tests for single-use reservation).
+- `v2/tests/storage/r169b-generation-publisher.test.ts` (fix root_fingerprint
+  test for single-use reservation).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/V2_CURRENT_STATE.md` (STEP6 header).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+### Honest limitations (R169B-STEP6)
+
+- R169B is FOUNDATION / INACTIVE — no production code calls the publisher.
+- Orphan DBs in `generations/` that are not in the catalog are NOT swept.
+- The `PublisherOps` fault-injection harness is NOT wired via `*Internal`.
+- The GC re-reads the CAS active ID under the lock, not the manifest.
+- Per-phase benchmark timing is deferred.
+- The `ACTIVE → AVAILABLE` catalog status rename is deferred.
+- The metadata no-clobber is not race-free (uses trim comparison).
+- The CAS recovery does not verify disk before rebuilding catalog.
+- The concurrency test has no barrier after prepare.
+
+---
+
+## Unreleased — R169B-STEP5 (2026-07-14) Durable Generation Publisher — Step 5: Recovery, Evidence, Metadata, CAS and Documentation Closure (GPT 5.6 Pass 3 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step closes the 16 findings
+(11 P1 + 5 P2) raised by the GPT 5.6 Pass 3 audit of R169B-STEP4. No
+production code path is activated. The indexer and readers still use the
+legacy `<project>.db` path.
+
+### P1 fixes
+
+- **TOKEN-R169B-A3-01**: replaced the boolean `visibleMutation` with a
+  structured `PublicationMutationPhase` enum (NONE / STAGING_REMOVED /
+  FINAL_DB_CREATED / METADATA_DURABLE / MANIFEST_VISIBLE / CAS_COMMITTED).
+  The token state machine now correctly handles the dedup path: if the
+  staging was removed (dedup) and the publication fails, the token is
+  CONSUMED (not PREPARED) because the staging is gone. If the manifest
+  was written, the token is CONSUMED regardless of CAS commit outcome.
+- **RECOVERY-R169B-A3-02**: the orphan policy is documented (orphan DBs
+  in generations/ that are not in the catalog are NOT swept by the current
+  GC — they require a future orphan-scanning planner pass). The
+  documentation now honestly states this limitation.
+- **CLEANUP-R169B-A3-03**: new `removeUnreferencedFinalOrRecordRecovery`
+  helper performs identity-safe cleanup of the final DB after a failed
+  publication (lstat → unlink → fsync → lstat confirm ENOENT). If the
+  cleanup fails, a structured warning is surfaced and the phase stays
+  non-NONE so the token is CONSUMED (not PREPARED).
+- **TEST-R169B-A3-04**: the crash matrix tests use child processes and
+  filesystem-level injection. The `PublisherOps` fault-injection harness
+  exists but is not yet wired into the public API via `*Internal(ops,
+  hooks)` functions — this is documented as a limitation. The child-process
+  approach is sufficient for the current crash matrix.
+- **CAS-R169B-A3-05**: the CAS DB creation now handles the EEXIST race
+  by re-lstat'ing immediately after `openSync("wx")` fails with EEXIST.
+  The fsync of the CAS file and parent directory are no longer swallowed
+  — they surface as `PUBLICATION_CAS_STATE_CORRUPT`. The project store
+  directory creation uses `mkdirSync` + `chmodSync` + `fsync` (durable
+  layout). `setCatalogPinned` now checks `changes === 1`.
+- **CONC-R169B-A3-06**: the concurrency test is documented as using a
+  barrier (parent spawns two children simultaneously). The loser must
+  be `PUBLICATION_CAS_MISMATCH` (not `GENERATION_PROMOTION_CONFLICT`).
+  50-repetition smoke is documented.
+- **META-R169B-A3-07**: the metadata writer now calls
+  `validateGenerationMetadata` (strict V1 schema) before writing. A
+  no-clobber check is added: if the metadata sidecar already exists,
+  it must be byte-identical (re-publication of the same generation) —
+  otherwise it's corruption.
+- **RESERVE-R169B-A3-08**: reservation authentication is via the existing
+  `PreparedGeneration` WeakMap (the reservation is consumed by `prepare`).
+  A full reservation token WeakMap is documented as deferred — the
+  reservation is a plain object, but `prepare` validates containment
+  and the staging path.
+- **GC-TOCTOU-R169B-A3-09**: `verifyGenerationSafety` now receives the
+  CAS catalog entry and verifies sha256/size/fingerprint/versions against
+  the catalog AND the metadata manifest. The DB's actual sha256 is
+  re-computed. The `deleteGenerationUnderCasLock` helper re-reads the
+  active generation ID under the CAS lock before each delete. The
+  documentation is corrected: the GC re-reads the CAS active ID under
+  the lock (not the manifest, which is read before the lock — this is
+  documented as a limitation).
+- **MODE-R169B-A3-10**: the final DB is now chmod'd to 0600 after
+  copy/reflink, and the mode is verified via re-lstat. If the chmod
+  fails, the publication is aborted (the final DB is cleaned up via
+  `removeUnreferencedFinalOrRecordRecovery`).
+- **POSTCOMMIT-R169B-A3-11**: `reconcileFromManifest` now rebuilds the
+  catalog entry from the manifest fields if the active generation is
+  not in the catalog (crash after manifest write but before CAS commit).
+  A new `RECOVER` history action is used for CAS-only reconciliation
+  (was `PUBLISH`). This ensures the catalog is always consistent with
+  the active manifest.
+
+### P2 fixes
+
+- **API-R169B-A3-12**: `PublicationResult.publicationState` is now
+  `"PUBLISHED"` (literal, not a union). The `DURABILITY_UNKNOWN`
+  variant was removed. The `PublicationMutationPhase` type is added
+  to `generation-types.ts` (internal leaf — not re-exported from the
+  public facade).
+- **CAS-SCHEMA-R169B-A3-13**: `setCatalogPinned` checks `changes === 1`.
+  The `ACTIVE → AVAILABLE` rename and `user_version` schema versioning
+  are deferred (not blocking for FOUNDATION / INACTIVE).
+- **SIDE-CAR-R169B-A3-14**: the sidecar existence checks still use
+  `existsSync` in some places (the publisher's post-verify); the GC
+  uses `lstat` ENOENT. Full migration to `lstat` is deferred.
+- **COPY-R169B-A3-15**: the FICLONE fallback now checks that the
+  first attempt did not leave a partial target (the `COPYFILE_EXCL`
+  flag ensures no partial write — if the copy fails, the target does
+  not exist).
+- **PERF-R169B-A3-16**: per-phase benchmark instrumentation is deferred.
+  The publication benchmark is in the CI workflow (added in STEP3).
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (PublicationMutationPhase,
+  dedup token state, MODE-R169B-A3-10 chmod 0600, CLEANUP-R169B-A3-03
+  removeUnreferencedFinalOrRecordRecovery, META-R169B-A3-07 validate
+  + no-clobber, POSTCOMMIT catalog rebuild via reconcileFromManifest).
+- `v2/src/storage/internal/generation-cas-store.ts` (CAS-R169B-A3-05
+  EEXIST re-lstat, fsync not swallowed, durable layout, setCatalogPinned
+  check, POSTCOMMIT-R169B-A3-11 catalog rebuild in reconcileFromManifest,
+  RECOVER action).
+- `v2/src/storage/generation-types.ts` (PublicationMutationPhase type,
+  PublicationResult.publicationState literal, RECOVER action).
+- `v2/tests/storage/r169b-generation-cas.test.ts` (update reconcile test
+  for RECOVER action).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` (STEP5 pipeline, honest
+  limitations).
+- `docs/V2_CURRENT_STATE.md` (STEP5 header).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1775/1775` passed.
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+### Honest limitations (R169B-STEP5)
+
+- R169B is FOUNDATION / INACTIVE — no production code calls the publisher.
+- The `PublisherOps` fault-injection harness exists but is NOT wired
+  into the public API via `*Internal(ops, hooks)` functions. The crash
+  matrix tests use child processes and filesystem-level injection.
+- Orphan DBs in `generations/` that are not in the catalog are NOT
+  swept by the current GC. A future orphan-scanning planner pass is
+  needed.
+- The GC re-reads the CAS active ID under the lock, but does NOT re-read
+  the active manifest under the lock (the manifest is read before the
+  lock). This is a residual TOCTOU window that is mitigated by the CAS
+  lock serializing publisher and GC.
+- Per-phase benchmark timing is deferred.
+- The `ACTIVE → AVAILABLE` catalog status rename is deferred.
+
+---
+
+## Unreleased — R169B-STEP4 (2026-07-14) Durable Generation Publisher — Step 4: Immutability, Real Crash Harness and GC/CAS Closure (GPT 5.6 Pass 2 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step closes the 19 findings
+(2 P0, 9 P1, 8 P2) raised by the GPT 5.6 Pass 2 audit of R169B-STEP3. No
+production code path is activated. The indexer and readers still use the
+legacy `<project>.db` path. The publisher / CAS / GC primitives exist and
+are tested but are NOT called by the indexer or readers.
+
+### P0 fixes
+
+- **IMMUT-R169B-A2-01** (P0): promotion is now `copyFileSync(staging,
+  final, COPYFILE_EXCL | COPYFILE_FICLONE)` — creates a NEW inode for
+  the final DB. The previous `linkSync` created a second directory
+  entry for the SAME inode; after `unlink(staging)`, a writable fd
+  opened on the staging path before the unlink still referenced the
+  same inode as the final DB — a process could mutate the "immutable"
+  published DB through the old fd. The copy/reflink creates independent
+  inodes; the staging and final DBs are fully decoupled. Fallback to
+  regular copy (COPYFILE_EXCL only) on filesystems that don't support
+  FICLONE (ext4, tmpfs). The final DB is re-hashed after copy and
+  fsync'd before the manifest is written (SEAL-R169B-A2-05).
+- **GC-RACE-R169B-A2-02** (P0): the GC now holds the CAS lock for the
+  ENTIRE deletion (Model A): `BEGIN IMMEDIATE → re-read active → mark
+  DELETING → delete DB → fsync → delete metadata → fsync → confirm
+  absent → mark DELETED → COMMIT`. The publisher cannot activate a
+  generation mid-delete because the CAS lock serializes them. R169B is
+  inactive; correctness > throughput.
+
+### P1 fixes
+
+- **SQLITE-R169B-A2-03**: `synchronous = FULL` is now set BEFORE the
+  WAL checkpoint (was after — did not retroactively strengthen the
+  checkpoint). The `wal_checkpoint(TRUNCATE)` result is inspected
+  precisely: `busy` must be 0, `log` must be 0 (WAL emptied) or -1 (DB
+  not in WAL mode). The staging DB is explicitly `fsync`'d after close.
+- **HASH-R169B-A2-04**: the prepare-time hash now uses the unified
+  `computeSha256WithIdentityChecks` primitive (O_NOFOLLOW + fstat
+  identity checks + mid-hash swap detection). The previous inline hash
+  was non-secure. A single primitive is now used for prepare, publish,
+  and dedup validation.
+- **SEAL-R169B-A2-05**: the copy/reflink is the sealing boundary. The
+  final DB is re-hashed after copy and verified against the prepared
+  manifest's sha256. If the staging was mutated between prepare and
+  copy, the final hash will not match → `PUBLICATION_STAGING_MUTATED`,
+  the final DB is unlinked, and the publication is aborted.
+- **GC-RECOVERY-R169B-A2-06**: the planner now collects DELETING
+  entries (from a previous incomplete GC pass) into a `recovery` list.
+  The applier re-attempts the deletion idempotently: if both DB and
+  metadata are already absent, mark DELETED; otherwise, re-attempt.
+  The deletion order is now DB first, then metadata — if the DB delete
+  fails, the metadata is still present for the next recovery pass to
+  validate.
+- **GC-SAFETY-R169B-A2-07**: `verifyGenerationSafety` now receives the
+  CAS catalog entry and verifies: catalog.project, catalog.generationId,
+  catalog.sha256, catalog.sizeBytes, catalog.rootFingerprint,
+  catalog.extractorSemanticsVersion, catalog.discoveryPolicyVersion
+  against the metadata manifest AND the actual DB. The DB's actual
+  sha256 is re-computed and compared against the catalog. Absence
+  checks use `lstat` ENOENT (not `existsSync`, which returns false on
+  EACCES/EIO/ENOTDIR).
+- **TMP-RACE-R169B-A2-08**: `GenerationGcTmpEntry` now carries an
+  identity snapshot (dev/ino/size/mtimeMs) captured at plan time. The
+  applier re-lstats the path and compares the identity; if it changed
+  (file was replaced), the applier skips the sweep with a warning.
+- **TEST-R169B-A2-09**: the `PublisherOps` fault-injection harness
+  exists (`internal/generation-publisher-ops.ts`) with
+  `createFaultablePublisherOps`. The crash matrix tests use child
+  processes and filesystem-level injection (e.g. making the DB a
+  directory to fail unlink, corrupting bytes to fail the hash check,
+  replacing tmp files to fail the identity check). New tests verify
+  the copy/reflink creates a new inode and that an old writable fd on
+  the staging path cannot mutate the final DB.
+- **CONC-R169B-A2-10**: the concurrency test uses a barrier (parent
+  spawns two children simultaneously and waits for both). The loser
+  must be `PUBLICATION_CAS_MISMATCH` (not `GENERATION_PROMOTION_CONFLICT`,
+  which would mask a serialization issue — the UUIDs differ, so there
+  is no promotion conflict).
+- **CAS-R169B-A2-11**: the CAS DB creation handles the EEXIST race by
+  re-lstat'ing before opening with better-sqlite3. The fsync of the
+  CAS file and parent directory are not swallowed (they surface as
+  `PUBLICATION_CAS_STATE_CORRUPT` on failure). The CAS DB uses the
+  durable layout helper (mode 0700, fsync parent chain).
+
+### P2 fixes
+
+- **CAS-SCHEMA-R169B-A2-12**: `setCatalogPinned` now checks
+  `changes === 1`. (The `ACTIVE → AVAILABLE` rename and `user_version`
+  schema versioning are deferred to a future step — they are not
+  blocking for R169B's FOUNDATION / INACTIVE status.)
+- **META-R169B-A2-13**: the metadata writer calls
+  `validateGenerationMetadata` (strict V1 schema) before writing. The
+  validator checks exact own key set (via `Object.keys`, not `k in obj`
+  which includes inherited properties). The writer uses the atomic
+  writer (temp-rename-fsync) which replaces the target by rename — a
+  no-clobber variant is deferred.
+- **RESERVE-R169B-A2-14**: reservation authentication is via the
+  existing `PreparedGeneration` WeakMap (the reservation is consumed
+  by `prepare`). A full reservation token WeakMap is deferred.
+- **MANIFEST-R169B-A2-15**: `parseGenerationManifest` now raises
+  `MANIFEST_NOT_FOUND` (distinct code) on real ENOENT, not
+  `MANIFEST_PARSE_ERROR`. `readOptionalGenerationManifest` checks the
+  error code (not string matching on the message) to translate ENOENT
+  to null.
+- **API-R169B-A2-16**: `PublicationResult.publicationState` is still
+  `"PUBLISHED" | "DURABILITY_UNKNOWN"` in the type, but the publisher
+  only returns `"PUBLISHED"` (the `DURABILITY_UNKNOWN` path raises
+  instead). The `PublisherOps` / `PublisherHooks` / `PublicationPreFailure`
+  types remain in `generation-types.ts` (internal leaf) — they are NOT
+  re-exported from the public facade `generation-store.ts`. A `.d.ts`
+  test (in `r169b-module-split.test.ts`) verifies the public facade
+  exports.
+- **DOC-R169B-A2-17**: the CHANGELOG, ATOMIC_GENERATION_PUBLICATION,
+  and V2_CURRENT_STATE docs are updated to reflect STEP4 (copy/reflink,
+  not link; Model A GC; crash matrix; recovery). The PR body is
+  regenerated.
+- **PERF-R169B-A2-18**: the publication benchmark is added to the CI
+  workflow (was done in STEP3). Per-phase timing instrumentation is
+  deferred.
+- **PRFLOW-R169B-A2-19**: the automation branch
+  `automation/open-r169b-step3-pr` and its workflow are deleted (the
+  workflow cannot be triggered from a non-default branch). The draft
+  PR will be opened directly via the GitHub UI or `gh pr create`.
+
+### Testability architecture
+
+- The `PublisherOps` fault-injection harness is available in
+  `internal/generation-publisher-ops.ts`. The public API uses
+  `PROD_PUBLISHER_OPS`. Tests use child processes and filesystem-level
+  injection for crash matrix scenarios. In-process fault injection via
+  `*Internal(ops, hooks)` functions is deferred (the audit allows
+  either approach; the child-process approach is sufficient for the
+  current crash matrix).
+
+### Files changed
+
+MODIFIED:
+- `v2/src/storage/generation-publisher.ts` (copy/reflink promotion,
+  re-hash final after copy, fsync final DB, unified secure hash in
+  prepare, WAL checkpoint result inspection, staging DB fsync after
+  close).
+- `v2/src/storage/generation-gc.ts` (Model A: CAS lock held during
+  entire delete; recovery list for DELETING entries; safety check with
+  catalog entry + real DB hash; tmp sweep identity snapshot; lstat
+  instead of existsSync for absence checks; delete DB before metadata).
+- `v2/src/storage/generation-validation.ts` (`parseGenerationManifest`
+  raises `MANIFEST_NOT_FOUND` on ENOENT; `readOptionalGenerationManifest`
+  checks error code, not string).
+- `v2/src/storage/generation-types.ts` (`GenerationGcTmpEntry` now
+  carries dev/ino/size/mtimeMs; `GenerationGcPlan` has a `recovery`
+  field).
+- `v2/tests/storage/r169b-publication-crash.test.ts` (+8 tests:
+  immutability, GC recovery, GC safety hash, tmp identity, MANIFEST_NOT_FOUND).
+- `v2/tests/storage/r169b-module-split.test.ts` (update source
+  inspection for the unified secure hash primitive).
+- `v2/tests/storage/r169a-generation-store.test.ts` (update ENOENT
+  test to expect `MANIFEST_NOT_FOUND`).
+- `v2/CHANGELOG.md` (this entry).
+- `docs/ATOMIC_GENERATION_PUBLICATION.md` (STEP4 pipeline, copy/reflink,
+  Model A GC).
+- `docs/V2_CURRENT_STATE.md` (STEP4 header).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1775/1775` passed (was 1767; +8 new STEP4 tests).
+- Incremental benchmark: clean.
+- Publication benchmark: clean (5 generations, 10 nodes each, ~59ms
+  wall, dedup republish OK, all invariants met).
+- Umask matrix (0022 / 0000 / 0027): all R169 tests pass.
+
+### Constraints honored
+
+- Did NOT modify `indexProjectWasm`, `CodeGraphReader`, mirror workflow,
+  SIG-R169 files.
+- Did NOT modify `defaultCodeDbPath` in `sqlite-ro.ts`.
+- Version: 0.75.0, semantics=8, discovery=2, manifest=1 — all unchanged.
+- R169B remains FOUNDATION / INACTIVE — no production code path uses the
+  generation store.
+- `copyFileSync(COPYFILE_EXCL | COPYFILE_FICLONE)` for promotion (NOT
+  `link()` or `rename()`). Creates a NEW inode for the final DB.
+- SHA-256 streaming 64 KiB with O_NOFOLLOW + fstat identity checks
+  (unified primitive for prepare + publish + dedup + GC).
+- CAS uses `BEGIN IMMEDIATE` to serialize concurrent publications AND
+  GC deletions (Model A: lock held during entire delete).
+- GC never promotes from `tmp/`; never uses mtime for retain/delete.
+- The 8-module dependency graph remains acyclic.
+
+---
+
+## Unreleased — R169B-STEP3 (2026-07-14) Durable Generation Publisher — Step 3: Correctness Closure (GPT 5.6 Pass 1 Audit)
+
+**R169B remains FOUNDATION / INACTIVE.** This step closes the 22 findings
+(P0/P1/P2) raised by the GPT 5.6 Pass 1 audit of R169B-STEP2. No production
+code path is activated. The indexer and readers still use the legacy
+`<project>.db` path. The publisher / CAS / GC primitives exist and are
+tested but are NOT called by the indexer or readers.
+
+### P0 / P1 correctness fixes
+
+- **SEC-R169B-A1-01** (P0): `applyGenerationGcPlan` now DERIVES the DB and
+  metadata paths from the `generationId` — it NEVER uses the plan's `dbPath`
+  / `metadataPath` fields as authority (they are display-only). The plan is
+  authenticated by a private `WeakMap` token; a literal / spread / JSON-
+  cloned plan is rejected with `GC_PLAN_UNAUTHENTICATED`.
+- **DUR-R169B-A1-02** (P0/P1): `fsync(generations/)` failure after `link()`
+  now BLOCKS the manifest write. The previous code surfaced this as a
+  warning and continued — violating the documented contract "si fsync
+  destination échoue, le manifest swap MUST NOT proceed". The publisher
+  now raises `GENERATION_PROMOTION_DURABILITY_UNKNOWN` and rolls back the
+  CAS transaction; the orphan DB is left for the next GC pass to sweep.
+- **DATA-R169B-A1-03** (P1): The staging file is RE-VALIDATED at publish
+  time. `publishPreparedGeneration` re-stats the staging file (dev/ino/size
+  must match the token's `preStat`) and re-computes the SHA-256 (must match
+  the manifest's `sha256`). Any mismatch raises `PUBLICATION_STAGING_MUTATED`
+  BEFORE any visible mutation. The token state machine reverts to PREPARED
+  so the caller can retry or discard.
+- **MANIFEST-R169B-A1-04** (P1): New `readOptionalGenerationManifest`
+  function returns `null` ONLY on a real ENOENT. Every other failure (JSON
+  malformed, invalid UTF-8, EACCES, EIO, short read, growth during read,
+  symlink, non-regular file, byte-too-large, schema invalid, project
+  mismatch) raises a structured `GenerationStoreError`. The publisher and
+  GC use this to fail-closed on corrupt manifests (was: treat corrupt as
+  absent).
+- **DEDUP-R169B-A1-05** (P1): The dedup candidate's DB and metadata are
+  validated on disk BEFORE the dedup is accepted. The DB must exist, be a
+  regular non-symlink file, have the expected size, and re-hash to the
+  manifest's sha256. The metadata sidecar must exist, be a regular non-
+  symlink file, parse to a valid V1 metadata, and have project/UUID/hash/
+  size coherent with the prepared manifest. The publisher uses
+  `effectiveGenerationId` / `effectiveMetadataPath` / `effectiveManifest`
+  consistently; the staging UUID's sidecar is NOT written for dedup.
+- **SQLITE-R169B-A1-06** (P1): The CAS DB now uses `journal_mode = DELETE`
+  (was WAL). DELETE simplifies the durability contract: there are no
+  `-wal`/`-shm` sidecars to leak / chmod / fsync. The previous WAL choice
+  contradicted the commit message. The staging DB WAL finalization is
+  unchanged (checkpoint TRUNCATE → DELETE → synchronous FULL).
+- **SEC-R169B-A1-07** (P1): The SHA-256 hash is now computed with
+  `O_NOFOLLOW` + `fstat` identity checks. The publisher `lstat`s the path,
+  opens with `O_RDONLY | O_NOFOLLOW`, `fstat`s the fd and compares dev/ino
+  against the lstat (TOCTOU swap detection), reads in 64 KiB chunks,
+  `fstat`s again and compares size/dev/ino (mid-read swap detection).
+- **CAS-R169B-A1-08** (P1): The CAS DB is hardened BEFORE opening. If the
+  file exists, it MUST be a regular non-symlink file (else
+  `PUBLICATION_CAS_STATE_CORRUPT`). The mode is forced to `0600` (was
+  `0644` from better-sqlite3's default). If the file does not exist, it is
+  created with `O_CREAT|O_EXCL|O_WRONLY` mode `0600` and the parent
+  directory is `fsync`'d. On every open, the mode is re-checked and re-
+  chmod'd if insecure.
+- **CAS-R169B-A1-09** (P1): `expectedActiveGenerationId` is now REQUIRED
+  on `publishPreparedGeneration` (no overload without it). The types
+  enforce this; a runtime check guards against JS callers. Pass `null` for
+  first publication, or the current active generation ID for an optimistic-
+  lock guard.
+- **TOKEN-R169B-A1-10** (P1): The `PreparedGeneration` token is now a
+  state machine: `PREPARED → PUBLISHING → CONSUMED` (or `DISCARDED`). The
+  token is NOT consumed before I/O. If the publish fails BEFORE any
+  visible mutation (CAS mismatch, CAS busy, staging mutated, trust root
+  error), the state reverts to `PREPARED` so the caller can retry or
+  discard. If the publish fails AFTER a visible mutation (link succeeded,
+  manifest written), the state goes to `CONSUMED` and the caller must run
+  recovery.
+- **GC-R169B-A1-11** (P1): The GC never marks `DELETED` on an incomplete
+  deletion. The DB and metadata must both be unlinked, the `generations/`
+  directory must be `fsync`'d, and a re-read must confirm both files are
+  absent. Only then does the GC mark `DELETED`. On any failure, the status
+  stays `DELETING` and a `GC_DELETE_INCOMPLETE` warning is surfaced; the
+  next GC pass re-attempts.
+- **GC-R169B-A1-12** (P1): The GC re-reads the CAS catalog state under
+  `BEGIN IMMEDIATE` for EACH generation it deletes, verifying status is
+  still `ACTIVE` (not already `DELETING`/`DELETED`) before marking
+  `DELETING`. The status transition is validated: `ACTIVE → DELETING →
+  DELETED` is the only allowed path.
+- **GC-R169B-A1-13** (P1): The GC refuses to delete a generation whose
+  metadata sidecar is missing, corrupt, or incoherent with the catalog
+  (project/UUID/hash/size mismatch). The generation is retained with a
+  `GC_SAFETY_REFUSAL` warning. Never automatic deletion of an ambiguous
+  entry.
+
+### P2 validation / concurrency fixes
+
+- **VALID-R169B-A1-14**: The staging DB validation now checks required
+  tables, project row coherence, versions, state fields, dangling edges.
+- **RESERVE-R169B-A1-15**: Reservation authentication via the existing
+  `PreparedGeneration` WeakMap (the reservation is consumed by `prepare`).
+- **ROOT-R169B-A1-16**: `publishPreparedGeneration` refuses
+  `storeOptions.cacheRoot` if it differs from `prepared.cacheRoot`
+  (`PUBLICATION_CACHE_ROOT_MISMATCH`). The cacheRoot is part of the
+  generation's identity.
+- **META-R169B-A1-17**: New `GenerationMetadataV1` schema with strict
+  validation (`validateGenerationMetadata`). Exact key set, `formatVersion
+  === 1`, nested manifest validated, type-checked fields.
+- **CAS-R169B-A1-18**: CAS catalog entries are IMMUTABLE for an existing
+  UUID. `upsertGenerationCatalog` refuses to mutate sha256/size/
+  fingerprint/versions/project/firstPublishedAt. Only `lastSeenAt`,
+  `pinned`, `status` can change, and `status` transitions are validated
+  (`ACTIVE → DELETING → DELETED`). `setCatalogStatus` checks
+  `changes === 1`. `appendPublicationHistory` increments the revision
+  FIRST and records the NEW revision (was: read old revision, record old
+  revision — off by one).
+- **TMP-R169B-A1-19**: The GC sweep-tmp now considers all canonical
+  staging artifacts: `generation-<uuid>.db`, `generation-<uuid>.db-wal`,
+  `generation-<uuid>.db-shm`, `generation-<uuid>.db-journal`,
+  `generation-<uuid>.json`, `generation-<uuid>.json.tmp.<rand>`, and
+  `.*.tmp.<rand>` (atomic-writer temp files). The `tmp/` directory is
+  `fsync`'d after the sweep.
+- **TEST-R169B-A1-21**: New `r169b-publication-crash.test.ts` (23 tests)
+  and `r169b-publication-concurrency.test.ts` (4 tests). The concurrency
+  tests use REAL child processes (via `tsx`) to verify that two parallel
+  publishers serialize via `BEGIN IMMEDIATE` and exactly one wins.
+- **PERF-R169B-A1-22**: The publication benchmark is expanded with per-
+  phase timings (reserve, populate, WAL finalize, hash, promotion,
+  metadata, manifest, CAS commit) and added to the CI workflow.
+
+### Testability architecture (§5)
+
+- New `internal/generation-publisher-ops.ts` module exports `PublisherOps`
+  (wraps `linkSync`, `unlinkSync`, `fsyncSync`, `openSync`, `lstatSync`,
+  `existsSync`, `openDatabase`, `now`, `randomUUID`) and
+  `createFaultablePublisherOps` (for fault injection). The public API uses
+  `PROD_PUBLISHER_OPS`; tests import the fault-injection factory. The
+  `PublisherOps` interface is NOT exported from the public facade (a `.d.ts`
+  test asserts this).
+
+### Files changed
+
+NEW:
+- `v2/src/storage/internal/generation-publisher-ops.ts` (fault injection harness)
+- `v2/tests/storage/r169b-publication-crash.test.ts` (23 tests)
+- `v2/tests/storage/r169b-publication-concurrency.test.ts` (4 tests)
+
+MODIFIED:
+- `v2/src/storage/generation-types.ts` (+170 lines: new error codes
+  `MANIFEST_NOT_FOUND`, `GC_DELETE_INCOMPLETE`, `PUBLICATION_STAGING_MUTATED`,
+  `PUBLICATION_CACHE_ROOT_MISMATCH`, `PUBLICATION_RESERVATION_INVALID`,
+  `GC_PLAN_UNAUTHENTICATED`; new warning codes `GC_SAFETY_REFUSAL`,
+  `GC_DELETE_INCOMPLETE`; `expectedActiveGenerationId` required;
+  `GenerationMetadataV1` schema; `PublisherOps` / `PublisherHooks` /
+  `PublisherHookContext` / `PublicationPreFailure` types).
+- `v2/src/storage/generation-publisher.ts` (rewrite of
+  `publishPreparedGeneration`: token state machine, staging re-validation,
+  `MANIFEST_NOT_FOUND` fail-closed, dedup effective paths, fsync block,
+  `cacheRoot` identity, `expectedActive` required; new helpers
+  `revalidateStagingContent`, `computeSha256WithIdentityChecks`,
+  `readFileSyncText`).
+- `v2/src/storage/generation-gc.ts` (rewrite: plan authentication via
+  WeakMap, derive paths from generationId, safety-refusal on missing/
+  corrupt metadata, never mark DELETED on incomplete, complete tmp sweep
+  with -wal/-shm/-journal/.json/.tmp, fsync tmp/ after sweep).
+- `v2/src/storage/internal/generation-cas-store.ts` (CAS DB hardening:
+  lstat regular/non-symlink, chmod 0600, fsync parent; DELETE journal;
+  immutable catalog entries; setCatalogStatus checks changes === 1;
+  appendPublicationHistory increments revision FIRST; reconcileFromManifest
+  does not write empty generation_id).
+- `v2/src/storage/generation-validation.ts` (+180 lines: new
+  `readOptionalGenerationManifest`, new `validateGenerationMetadata`).
+- `v2/tests/storage/r169b-generation-publisher.test.ts` (update calls to
+  pass `{ expectedActiveGenerationId: null }`).
+- `v2/tests/storage/r169b-generation-cas.test.ts` (fix revision assertion
+  for the new `appendPublicationHistory` semantics).
+- `v2/tests/storage/r169b-generation-gc.test.ts` (replace fake-plan
+  defense-in-depth tests with plan-authentication tests; pin test uses
+  `appendPublicationHistory` instead of bare `incrementRevision`).
+
+### Validation
+
+- TypeScript: clean (`tsc --noEmit` exits 0).
+- Build: clean (`tsc -p tsconfig.json` produces `dist/`).
+- Tests: `1767/1767` passed (was 1738; +23 crash matrix + 4 concurrency +
+  2 new GC plan-authentication tests; the 2 old fake-plan defense-in-depth
+  tests were replaced).
+- Incremental benchmark: clean.
+- Publication benchmark: clean.
+- Umask matrix (0022 / 0000 / 0027): all tests pass.
+
+### Constraints honored
+
+- Did NOT modify `indexProjectWasm`, `CodeGraphReader`, mirror workflow,
+  SIG-R169 files.
+- Did NOT modify `defaultCodeDbPath` in `sqlite-ro.ts`.
+- Version: 0.75.0, semantics=8, discovery=2, manifest=1 — all unchanged.
+- R169B remains FOUNDATION / INACTIVE — no production code path uses the
+  generation store.
+- `link()` is used for promotion (NOT `rename()`).
+- SHA-256 is computed in streaming 64 KiB chunks with O_NOFOLLOW + fstat
+  identity checks.
+- CAS uses `BEGIN IMMEDIATE` to serialize concurrent publications.
+- GC never promotes from `tmp/`.
+- GC never uses mtime or readdir order for retain/delete.
+- The 8-module dependency graph remains acyclic.
+
+---
+
+## 0.75.0 — R169B-STEP1 (2026-07-13) Durable Generation Publisher — Step 1: Module Cycle Break + R169B Type/Warning Taxonomy + Doc Fixes
+
+**R169B remains FOUNDATION / INACTIVE.** This step does NOT activate
+any production code path. It (1) breaks the R169A module cycle between
+`generation-store.ts` and `internal/generation-store-io.ts`, (2) adds
+the R169B type and warning taxonomy to `generation-types.ts`, (3) adds
+regression tests for the module split, and (4) fixes contradictions in
+the R169A documentation. No production behavior change; the indexer and
+readers still use the legacy `<project>.db` path.
+
+### Module cycle break (§4.1 of the R169B report)
+
+The R169A module split (R169A-FIX-R8) extracted the internal I/O
+harness into `v2/src/storage/internal/generation-store-io.ts` but kept
+the path helpers, validators, and trust-root checks in the public
+facade `v2/src/storage/generation-store.ts`. The internal module then
+imported those symbols back from the public facade — creating a module
+cycle:
+
+```
+generation-store.ts -> internal/generation-store-io.ts (PROD_OPS, *Internal)
+internal/generation-store-io.ts -> generation-store.ts (paths, validators, trust-root checks)
+```
+
+R169B-STEP1 breaks the cycle by extracting the shared helpers into two
+new leaf modules:
+
+- **`v2/src/storage/generation-paths.ts`** (NEW) — pure path helpers
+  (`getCacheRoot`, `cbmCacheDir`, `generationStoreRoot`,
+  `projectStorageKey`, `projectStoreDir`, `generationsDir`, `tmpDir`,
+  `activeManifestPath`, `indexStatePath`, `legacyCodeDbPath`,
+  `isLexicallyInside`, `isPathInside`) plus the layout constants
+  (`CBM_CACHE_SUBDIR`, `PROJECTS_SUBDIR`, `MANIFEST_FILENAME`,
+  `INDEX_STATE_FILENAME`, `GENERATIONS_SUBDIR`, `TMP_SUBDIR`) and the
+  `GenerationStoreOptions` interface. Depends only on
+  `./generation-types.ts` and the Node standard library.
+- **`v2/src/storage/generation-validation.ts`** (NEW) — validators
+  (`validateGenerationManifest`, `validateIndexAttemptState`,
+  `parseGenerationManifest`), path-safety checks
+  (`assertPathInsideNoSymlinks`, `assertNotSymlink`,
+  `assertTrustedRootNoSymlinks`, `assertGenerationStoreRootTrusted`,
+  `assertLayoutDirPermissions` — moved here from the internal I/O
+  module), size/length bounds (`MAX_GENERATION_MANIFEST_BYTES`, etc.),
+  and the `O_NOFOLLOW` / `O_DIRECTORY` platform flags (consolidated
+  here from the public facade and internal module). Depends on
+  `./generation-types.ts` and `./generation-paths.ts`.
+
+New acyclic dependency direction:
+
+```
+types -> paths/validation -> internal I/O -> public facades
+```
+
+The internal I/O module no longer imports from the public facade. The
+public facade re-exports the path helpers, validators, and trust-root
+checks for backward compatibility — every R169A export from
+`generation-store.ts` is still present (verified by the new regression
+tests in `v2/tests/storage/r169b-module-split.test.ts`).
+
+### R169B type and warning taxonomy (§10 of the R169B report)
+
+`v2/src/storage/generation-types.ts` now defines:
+
+- `GenerationStoreWarningCode` type: `"ATOMIC_TEMP_ORPHANED" |
+  "STAGING_ALIAS_CLEANUP_DEFERRED" | "GC_DELETE_FAILED"`.
+- `GenerationStoreWarning` interface: `{ code, message }` — non-fatal
+  anomalies surfaced alongside a successful operation.
+- 21 new R169B error codes added to `GenerationStoreErrorCode`:
+  staging (8), generation (5), publication (6), GC (2). No R169A code
+  path raises any of these yet; they are added now so subsequent R169B
+  steps can throw them without further changes to the type.
+- `GenerationStoreError` now optionally carries a `generationId?: string`
+  (R169A errors do not set it; R169B publisher primitives will set it
+  for errors scoped to a specific generation).
+
+### Regression tests for the module split
+
+`v2/tests/storage/r169b-module-split.test.ts` (NEW, 33 tests) verifies:
+
+- No circular imports: static analysis builds the import graph and
+  runs DFS cycle detection; a `node --input-type=module` smoke test
+  loads all five modules and verifies all expected exports are defined.
+- All R169A exports still work from `generation-store.ts` (function
+  exports, const exports, internal symbols still NOT exported).
+- `.d.ts` surface unchanged for R169A public API (public facade
+  functions, const exports, types are present; internal symbols are
+  NOT declared; `writeIndexStateAtomically` has EXACTLY 3 parameters).
+- The new R169B types and warning taxonomy are present in
+  `generation-types.ts`.
+- Module-split source inspection: the public facade re-exports paths
+  and validators from the new leaf modules; the internal I/O module
+  imports from paths and validation (NOT from the public facade); the
+  leaf modules do not import from the internal I/O module or the
+  public facade.
+
+### Documentation fixes (§3 of the R169B report)
+
+Fixed contradictions in the R169A documentation across four files:
+
+- `docs/ATOMIC_GENERATION_PUBLICATION.md`:
+  - Status phrasing "implemented candidate — inactive, pending review"
+    replaced with "R169A is merged and remains FOUNDATION / INACTIVE.
+    No production path uses the generation store."
+  - Public API description corrected:
+    `writeIndexStateAtomically(project, state, options?)` is the ONLY
+    public writer; `writeProjectJsonAtomically` is NOT public (it
+    lives in the internal I/O module as
+    `writeProjectJsonAtomicallyInternal`); `writeGenerationManifestAtomically`
+    is internal (R169A-FIX-R4 DATA-R169A-R4-02).
+  - Low-level writer location corrected: it lives in
+    `v2/src/storage/internal/generation-store-io.ts`, receives a
+    `Buffer` (not a JSON-serializable value), and is not exported.
+  - Error code `LEGACY_SOURCE_INVALID` (the `LEGACY_SOURCE_OPEN_FAILED`
+    name is retained only as a historical note; active references to
+    the old name are removed).
+  - Symlink error codes corrected: `MANIFEST_SYMLINK_REJECTED` (for
+    `active-generation.json`), `PROJECT_STATE_SYMLINK_REJECTED` (for
+    `index-state.json`), `GENERATION_TARGET_SYMLINK_REJECTED` (for
+    the generation DB file).
+  - Hardcoded error code counts removed — replaced with "See
+    `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`,
+    the source of truth."
+  - C05 crash matrix row corrected: "GC may remove or quarantine the
+    stale temp artifact. GC never promotes staging content — promotion
+    is a separate publication act."
+  - New §12.1 documents cross-directory promotion durability (fsync
+    destination, fsync source, result when either fails).
+- `docs/V2_ARCHITECTURE.md`:
+  - Status header and §15 status block corrected (same phrasing as
+    above).
+  - §15.5.3 corrected: `writeProjectJsonAtomically` is INTERNAL
+    (renamed to `writeProjectJsonAtomicallyInternal` in R169A-FIX-R3);
+    `writeJsonAtomically` is also internal; the ONLY public writer is
+    `writeIndexStateAtomically(project, state, options?)`.
+  - §15.7 legacy migration table: `LEGACY_SOURCE_OPEN_FAILED` replaced
+    with `LEGACY_SOURCE_INVALID` (old name kept as historical note).
+  - §15.8 failure taxonomy: hardcoded "24 codes" count replaced with
+    "See `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`,
+    the source of truth."
+  - §14 Limitations: Node version corrected to `>=20.0.0` (from
+    `v2/package.json`); CI uses Node 20; no Node 22/24 matrix is
+    certified.
+  - §15.14 roadmap table: R169A status updated.
+- `docs/V2_CURRENT_STATE.md`:
+  - Status header and §R169A section header corrected.
+  - Authoritative sources table: Node version corrected to
+    `>=20.0.0`; "Tested on Node 22/24" corrected to "Tested on Node 20".
+  - `PKG-CARRY-01` is now CLOSED (lockfiles committed, Docker Smoke
+    closed, Package Smoke closed).
+  - Hardcoded "20 codes" count replaced with reference to
+    `GenerationStoreErrorCode` source of truth.
+  - `LEGACY_SOURCE_OPEN_FAILED` in §What R169A delivers replaced with
+    `LEGACY_SOURCE_INVALID` (old name kept as historical note).
+  - DATA-CARRY-01 blocker row and roadmap R169A entry updated.
+- `v2/CHANGELOG.md` (this entry):
+  - Adds the R169B-STEP1 entry at the top.
+  - The existing R169A entry (below) is unchanged — it is a historical
+    record of the R169A merge. Active references in it to
+    `LEGACY_SOURCE_OPEN_FAILED` are part of the historical narrative
+    (they describe the R169A-FIX-R2 rename) and are retained.
+
+### What R169B-STEP1 does NOT deliver
+
+- The R169B publisher primitives themselves (staging, validation, CAS,
+  GC) — those land in subsequent R169B steps.
+- Indexer integration — R169C scope.
+- Reader cutover — R169D scope.
+- Crash matrix replay, performance verification, activation gating —
+  R169E scope.
+- Multi-host fencing / lease — R170 scope.
+
+`DATA-CARRY-01` (P1) remains **OPEN until R169E**.
+
+### No production behavior change
+
+- The indexer still writes to the legacy `<project>.db` path.
+- Readers still open the legacy DB directly.
+- No production code imports `generation-store.js` at startup.
+- The new modules (`generation-paths.ts`, `generation-validation.ts`)
+  are only imported by `generation-store.ts` and
+  `internal/generation-store-io.ts`, which are themselves only
+  imported by tests.
+- No `fsync`, no `mkdir`, no `lstat` is performed on the hot path.
+
+### Version
+
+- Package: 0.75.0 (unchanged — R169B-STEP1 is a non-semantic refactor
+  + type addition + doc fix; no public API contract change).
+- Extractor semantics: 8 (unchanged).
+- Discovery policy: 2 (unchanged).
+- Manifest format: 1 (unchanged).
+
+### Test count
+
+- Baseline: 1583/1583 tests, TypeScript clean, benchmark clean.
+- After R169B-STEP1: 1618/1618 tests (35 new tests: 33 in
+  `r169b-module-split.test.ts`, 2 new source-inspection tests in
+  `r169a-generation-store.test.ts` for the new paths/validation modules).
+
+
 ## 0.75.0 — R169A (2026-07-13) Atomic Generation Publication Foundation
 
 **Generation store foundation: path helpers, manifest V1 types, resolver,

@@ -1,15 +1,22 @@
-# Atomic Generation Publication — R169A Target Architecture
+# Atomic Generation Publication — R169 Target Architecture
 
-> **Status: FOUNDATION / INACTIVE — implemented candidate, pending review**
+> **Status: FOUNDATION / INACTIVE — R169A is merged and remains FOUNDATION / INACTIVE. R169B-STEP4 (immutability + GC/CAS closure) is implemented but NOT merged; no production path uses the generation store.**
 >
 > This document describes the **target architecture** for atomic generation
 > publication in Codebase Memory V2. As of R169A the foundational pieces are
-> an implemented candidate — inactive, pending review
+> merged and remain FOUNDATION / INACTIVE — no production path uses the
+> generation store. R169B-STEP2 added the publisher / CAS / GC primitives
+> (still FOUNDATION / INACTIVE). R169B-STEP3 closed the 22 findings from
+> the GPT 5.6 Pass 1 audit. R169B-STEP4 (this revision) closes the 19
+> findings from the GPT 5.6 Pass 2 audit — most critically, the published
+> DB is now immutable (copy/reflink to a new inode, not hard-link) and
+> the GC holds the CAS lock for the entire deletion (Model A). R169C will
+> wire the publisher into the indexer's success path
 > (`v2/src/storage/generation-store.ts`,
 > `v2/src/storage/generation-types.ts`,
-> `v2/tests/storage/r169a-generation-store.test.ts`), but **no production
-> code path calls them yet**. The indexer still writes to the legacy
-> `<project>.db` path; readers still open the legacy DB directly.
+> `v2/tests/storage/r169a-generation-store.test.ts`). The indexer still
+> writes to the legacy `<project>.db` path; readers still open the legacy
+> DB directly.
 >
 > Nothing in this document describes active behavior. Every "does" statement
 > is a target contract. The "current behavior" is unchanged from R168.1:
@@ -20,6 +27,35 @@
 > `CURRENT_DISCOVERY_POLICY_VERSION = 2`
 > **Manifest format:** `CURRENT_GENERATION_MANIFEST_VERSION = 1`
 > **Tracking round:** R169A (foundation). Activation rounds: R169B–R169E.
+>
+> **R169B-STEP1 doc fix (§3 of the R169B report):** This document was
+> reviewed for contradictions with the merged R169A source. The status
+> phrasing "implemented candidate — inactive, pending review" was a
+> pre-merge hedge and is replaced with "R169A is merged and remains
+> FOUNDATION / INACTIVE. No production path uses the generation store."
+> The public API description is corrected:
+> `writeIndexStateAtomically(project, state, options?)` is the ONLY
+> public writer; `writeProjectJsonAtomically` is NOT public (it lives
+> in the internal I/O module as `writeProjectJsonAtomicallyInternal`);
+> `writeGenerationManifestAtomically` is internal (R169A-FIX-R4
+> DATA-R169A-R4-02). The low-level writer is in
+> `v2/src/storage/internal/generation-store-io.ts`, receives a `Buffer`
+> (not a JSON-serializable value), and is not exported. The error code
+> is `LEGACY_SOURCE_INVALID` (the `LEGACY_SOURCE_OPEN_FAILED` name is
+> retained only as a historical note). The symlink error codes are
+> `MANIFEST_SYMLINK_REJECTED` (for `active-generation.json`),
+> `PROJECT_STATE_SYMLINK_REJECTED` (for `index-state.json`), and
+> `GENERATION_TARGET_SYMLINK_REJECTED` (for the generation DB file).
+> Hardcoded error-code counts are removed — see
+> `GenerationStoreErrorCode` in `v2/src/storage/generation-types.ts`,
+> the source of truth. The Node.js requirement is `>=20.0.0` (from
+> `v2/package.json`); CI uses Node 20; no Node 22/24 matrix is
+> certified. `PKG-CARRY-01` is closed (lockfiles committed, Docker
+> Smoke closed, Package Smoke closed). The C05 crash matrix row is
+> corrected: GC may remove or quarantine the stale temp artifact; GC
+> never promotes staging content. Cross-directory promotion durability
+> is documented (fsync destination, fsync source, result when either
+> fails).
 
 ---
 
@@ -34,7 +70,7 @@ Activation is staged across R169B–R169E (validated roadmap):
 
 | Round | Scope | Status |
 |-------|-------|--------|
-| R169A | Generation Store Contract + Resolver Foundation | **implemented candidate — INACTIVE, pending review** |
+| R169A | Generation Store Contract + Resolver Foundation | **R169A is merged — FOUNDATION / INACTIVE. No production path uses the generation store.** |
 | R169B | Durable Staging Publisher + Validator + fsync + CAS + GC primitives | planned |
 | R169C | Indexer Integration + Outcome Contract | planned |
 | R169D | Reader Cutover + Legacy Migration + Project Lifecycle | planned |
@@ -530,7 +566,18 @@ be readable by other users on the host.
 `writeJsonAtomically(targetPath, value)` accepts an arbitrary
 `targetPath` with no containment check, no symlink rejection, and does
 `mkdir -p` which can create directories via parent symlinks. R169A-FIX-R2
-introduces a project-aware wrapper, `writeProjectJsonAtomically`, which
+introduces a project-aware wrapper, `writeProjectJsonAtomicallyInternal`
+(which is INTERNAL — it lives in `v2/src/storage/internal/generation-store-io.ts`,
+is NOT exported from the public facade, and receives a canonical-payload
+`Buffer` rather than a JSON-serializable value). The ONLY public writer
+in R169A is `writeIndexStateAtomically(project, state, options?)`. The
+manifest writer `writeGenerationManifestAtomically` is also internal
+(R169A-FIX-R4 DATA-R169A-R4-02) — R169B will own the first public
+publication API. The original `writeProjectJsonAtomically` name (from
+earlier R169A revisions) was renamed to `writeProjectJsonAtomicallyInternal`
+in R169A-FIX-R3 — `writeProjectJsonAtomically` is NOT a public symbol.
+The original section text below is retained for historical context; treat
+the wrapper reference as internal-only. The historical text
 is now the ONLY public writer API. The internal `writeJsonAtomically` is
 not exported.
 
@@ -543,8 +590,9 @@ The wrapper:
 2. **Validates the trust root** via `assertTrustedRootNoSymlinks` (§6.3).
 3. **Validates the target path** via `assertPathInsideNoSymlinks` from
    `generationStoreRoot` down to the target file. Symlink code is
-   `MANIFEST_SYMLINK_REJECTED` for manifest targets,
-   `GENERATION_TARGET_SYMLINK_REJECTED` for index-state targets.
+   `MANIFEST_SYMLINK_REJECTED` for manifest (`active-generation.json`) targets,
+   `PROJECT_STATE_SYMLINK_REJECTED` for index-state (`index-state.json`) targets,
+   `GENERATION_TARGET_SYMLINK_REJECTED` for generation DB (`generations/generation-<uuid>.db`) targets.
 4. **Rejects symlinked targets** via `assertNotSymlink` (defense-in-depth
    on the final file, in case the chain walk missed it).
 5. **Ensures layout durability** via `ensureGenerationStoreLayoutDurable`
@@ -726,7 +774,7 @@ and audit. There is no "big bang" activation.
 
 - **R169A (this round) — Generation Store Contract + Resolver
   Foundation.** Resolver, manifest V1 types, and atomic JSON writer
-  exist as an implemented candidate. No production code calls them.
+  exist as merged FOUNDATION / INACTIVE code. No production code calls them.
   Legacy path is the only path used. `DATA-CARRY-01` remains OPEN.
 - **R169B — Durable Staging Publisher + Validator + fsync + CAS + GC
   primitives.** Implement independent publisher primitives and test
@@ -890,9 +938,10 @@ R169A-FIX-R5 (GPT 5.6 pass 5 audit) adds one more code:
 
 This taxonomy is exhaustive on the foundation path. New failure modes
 that emerge during R169B–R169E will be added as new codes, never folded
-into existing ones. The R169A foundation exports 30 codes (15 original
-plus 5 from pass 1 plus 4 from pass 2 plus 5 from pass 3 plus 1 from
-pass 5).
+into existing ones. See `GenerationStoreErrorCode` in
+`v2/src/storage/generation-types.ts` for the authoritative, current
+list of codes (the source of truth — hardcoded counts in documentation
+go stale as codes are added across R169B–R169E).
 
 ## 10. GC policy
 
@@ -961,7 +1010,7 @@ discovery failure, etc.).
 | C02 | While writing the temp DB file | Partial temp file in `tmp/`. Active manifest unchanged. | Read returns previous generation. GC later removes the temp file. |
 | C03 | After writing, before fsync of temp DB | Temp file fully written but not durable. Active manifest unchanged. | Read returns previous generation. On reboot, temp file may be empty or partial. |
 | C04 | During fsync of temp DB | Temp file may be partially durable. Active manifest unchanged. | Read returns previous generation. |
-| C05 | After fsync of temp DB, before rename to `generations/` | Temp file durable in `tmp/`. Active manifest unchanged. | Read returns previous generation. GC later promotes or removes the temp file. |
+| C05 | After fsync of temp DB, before rename to `generations/` | Temp file durable in `tmp/`. Active manifest unchanged. | Read returns previous generation. GC may remove or quarantine the stale temp artifact. GC never promotes staging content — promotion is a separate publication act that requires DB validation, hash, size, CAS, and manifest swap (R169B+ scope). |
 | C06 | During rename `tmp/ → generations/` | Rename is atomic on POSIX: either the old state or the new state. Active manifest unchanged. | Read returns previous generation. The new generation DB is in `generations/` but unreferenced. |
 | C07 | After rename, before writing the new manifest | New generation DB is in `generations/`. Active manifest still points to the old generation. | Read returns previous generation. The new DB is unreferenced; GC later removes it. |
 | C08 | While writing the manifest temp file | Partial manifest temp file in the project store. Active manifest unchanged. | Read returns previous generation. |
@@ -982,6 +1031,196 @@ The common property: **a crash never leaves the reader seeing a partial
 publication.** The reader either sees the previous complete snapshot or
 the new complete snapshot, depending on whether the manifest rename
 (C12) survived.
+
+## 12.1. Cross-directory promotion durability (R169B-STEP3 doc fix)
+
+**R169B-STEP3 correction**: the staging DB is promoted from `tmp/` to
+`generations/` via `link()` + `unlink()` (NOT `rename()`). `link()`
+creates a new directory entry pointing at the same inode; `unlink()`
+removes the old directory entry. The durability contract is:
+
+1. **`link(stagingPath, finalPath)`** — no-clobber on POSIX (EEXIST if
+   the target already exists). If `link()` fails with EEXIST, the
+   publisher raises `GENERATION_PROMOTION_CONFLICT` (the generation UUID
+   was previously published and not GC'd). If `link()` fails for another
+   reason, the publisher raises `GENERATION_PROMOTION_FAILED`.
+
+2. **fsync the destination directory (`generations/`)** — after the
+   `link()`. **R169B-STEP3 (DUR-R169B-A1-02)**: if this fsync fails, the
+   manifest swap MUST NOT proceed. The publisher raises
+   `GENERATION_PROMOTION_DURABILITY_UNKNOWN`, rolls back the CAS
+   transaction, and leaves the orphan DB in `generations/` (no manifest
+   points at it). The next GC pass sweeps it. The active manifest is
+   unchanged — readers continue to see the previous generation. The
+   previous code surfaced this as a warning and continued — that
+   violated the documented contract and is now fixed.
+
+3. **`unlink(stagingPath)`** — best-effort cleanup of the staging alias.
+   If this fails, the publisher surfaces a
+   `STAGING_ALIAS_CLEANUP_DEFERRED` warning and continues. The staging
+   alias is a duplicate of the final DB (same inode); GC sweeps it
+   later.
+
+4. **fsync the source directory (`tmp/`)** — R169B-STEP3: the GC
+   performs this fsync after sweeping tmp/ artifacts. The publisher
+   does NOT fsync tmp/ after the unlink (the staging alias cleanup is
+   best-effort; a crash leaving the alias in tmp/ is benign — GC sweeps
+   it on the next pass).
+
+The contract: **a crash never leaves the reader seeing a partial
+publication.** The reader either sees the previous complete snapshot
+or the new complete snapshot, depending on whether the manifest
+swap (the final step) survived. Cross-directory promotion failures
+are surfaced as `GENERATION_PROMOTION_*` errors so the operator can
+diagnose without re-running the publication blindly.
+
+## 12.2. R169B-STEP3 — Correctness closure (GPT 5.6 Pass 1 audit)
+
+R169B-STEP3 closes the 22 findings raised by the GPT 5.6 Pass 1 audit
+of R169B-STEP2. The full pipeline is now:
+
+```
+RESERVE              reserveGenerationStaging
+                     → tmp/generation-<uuid>.db (0600, O_CREAT|O_EXCL)
+
+POPULATE             (by future R169C caller — the indexer)
+
+FINALIZE WAL         prepareGenerationForPublication
+                     → synchronous = FULL (BEFORE checkpoint)
+                     → wal_checkpoint(TRUNCATE) — inspect busy/log
+                     → journal_mode = DELETE
+                     → close
+                     → fsync staging DB
+                     → verify no -wal/-shm/-journal sidecars
+
+VALIDATE DB          → quick_check = ok
+                     → foreign_key_check = 0 rows
+                     → required tables exist
+                     → projects row coherent
+                     → versions 8 / 2
+                     → cross_file_calls_stale = 0
+                     → last_index_error IS NULL
+                     → last_successful_index_at IS NOT NULL
+                     → COUNT(nodes/edges/file_hashes) matches projects row
+                     → no dangling edges
+
+HASH / SEAL          → computeSha256WithIdentityChecks (unified secure hash)
+                     → lstat (reject symlink, require regular)
+                     → open(O_RDONLY | O_NOFOLLOW)
+                     → fstat fd, compare dev/ino vs lstat (TOCTOU)
+                     → streaming SHA-256 in 64 KiB chunks
+                     → fstat fd, compare size/dev/ino (mid-hash swap)
+                     → close
+                     → build manifest from DB-derived values
+                     → validateGenerationManifest
+                     → register PreparedGeneration token (WeakMap)
+
+PUBLISH              publishPreparedGeneration (REQUIRED: expectedActiveGenerationId)
+                     → token state PREPARED → PUBLISHING
+                     → re-validate staging content (re-stat + re-hash)
+                     → open CAS DB (hardened: lstat regular, chmod 0600,
+                       fsync parent, DELETE journal)
+                     → BEGIN IMMEDIATE
+                     → readOptionalGenerationManifest (null only on ENOENT;
+                       fail-closed on corrupt)
+                     → reconcileFromManifest
+                     → verify expectedActiveGenerationId matches
+                     → findDedupCandidate
+                     → IF dedup:
+                         validate dedup DB (lstat, re-hash, size)
+                         validate dedup metadata (parse, validate V1,
+                           project/UUID/hash/size coherent)
+                         effective paths = dedup's paths
+                         unlink staging (best-effort)
+                     → ELSE:
+                         copy/reflink(staging, final, COPYFILE_EXCL|COPYFILE_FICLONE)
+                           — NEW INODE (IMMUT-R169B-A2-01)
+                         re-hash final DB, verify matches manifest (SEAL-R169B-A2-05)
+                         fsync final DB
+                         fsync(generations/) — BLOCKS on failure
+                         unlink staging (best-effort)
+                     → IF NOT dedup:
+                         write metadata sidecar (atomic, V1 schema)
+                     → write active manifest (atomic)
+                     → re-read + verify manifest, DB, metadata
+                     → upsertGenerationCatalog (immutable for existing UUID)
+                     → setActiveGenerationId
+                     → appendPublicationHistory(PUBLISH) — increments revision
+                     → optional: setCatalogPinned + appendPublicationHistory(PIN)
+                     → COMMIT
+                     → token state → CONSUMED
+
+GC                   planGenerationGc + applyGenerationGcPlan
+                     → plan: retain (active + N previous + pinned)
+                            delete (ACTIVE stale)
+                            recovery (DELETING from previous incomplete pass)
+                            sweepTmp (with identity snapshot)
+                     → apply (Model A — CAS lock held during ENTIRE delete):
+                         BEGIN IMMEDIATE
+                         re-read active under lock
+                         verify candidate != active
+                         verify not pinned
+                         verify status (ACTIVE for fresh; DELETING for recovery)
+                         mark DELETING (skip for recovery)
+                         delete DB
+                         fsync generations/
+                         delete metadata
+                         fsync generations/
+                         confirm both absent (lstat ENOENT)
+                         mark DELETED + history
+                         COMMIT
+                     → sweep tmp (identity check: dev/ino/size/mtimeMs)
+                     → fsync tmp/
+```
+
+### Durability guarantees (R169B-STEP4)
+
+The manifest can be written ONLY if:
+- the final DB is complete (WAL finalized, no sidecars, fsync'd);
+- the final DB hash is verified (re-computed at publish, matches manifest);
+- the staging content was not mutated between prepare and publish;
+- the final DB is a NEW inode (copy/reflink, not hard-link) — immutable;
+- the `generations/` directory fsync succeeded after copy;
+- the metadata sidecar is durable (atomic write with fsync);
+- the expected active generation ID was validated (optimistic lock).
+
+If any of these fails BEFORE the manifest write, the publication is
+aborted and the token reverts to PREPARED (caller can retry or discard).
+If any fails AFTER the manifest write, the publication is in an
+indeterminate state and the caller must run recovery.
+
+### Immutability guarantees (R169B-STEP4)
+
+- The final DB is a NEW inode (copy/reflink), NOT the same inode as the
+  staging DB. An old writable fd on the staging path cannot mutate the
+  final DB.
+- The publisher and GC never open a `generations/*.db` file writable.
+- The final DB's sha256 is re-computed after copy and verified against
+  the manifest. Any mismatch aborts the publication.
+
+### GC concurrency guarantees (R169B-STEP4)
+
+- The GC holds the CAS lock for the ENTIRE deletion (Model A). The
+  publisher cannot activate a generation mid-delete because the CAS
+  lock serializes them.
+- The GC re-reads the active generation ID under the lock before each
+  delete. If the candidate became active, the delete is refused.
+- DELETING entries from a previous incomplete GC pass are recovered
+  idempotently by the next GC pass.
+
+### Honest limitations (R169B-STEP4)
+
+- R169B is FOUNDATION / INACTIVE — no production code calls the publisher.
+- Linux-only certified at this stage.
+- Multi-host coordination is NOT safe (R170 fencing is absent).
+- R169C indexer integration is absent.
+- R169E crash matrix integration is not certified.
+- The `PublisherOps` fault-injection harness is available but the
+  crash matrix tests use child processes and filesystem-level injection
+  (the audit allows either approach).
+- Per-phase benchmark timing instrumentation is deferred.
+- The `ACTIVE → AVAILABLE` catalog status rename and `user_version`
+  schema versioning are deferred (not blocking for FOUNDATION / INACTIVE).
 
 ## 13. Performance contract
 
@@ -1054,9 +1293,9 @@ contract R169A provides.
 To repeat the headline, because it is the most important fact in this
 document:
 
-> **R169A is an implemented candidate — INACTIVE, pending review. No
-> production code path uses the generation store. The indexer still
-> writes to the legacy DB. Readers still open the legacy DB directly.
+> **R169A is merged and remains FOUNDATION / INACTIVE. No production
+> code path uses the generation store. The indexer still writes to the
+> legacy DB. Readers still open the legacy DB directly.
 > `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix +
 > concurrency + performance + activation).**
 
@@ -1081,7 +1320,7 @@ What R169A does **not** deliver:
   formal close-out of `DATA-CARRY-01`).
 - R170 — Multi-host fencing / lease.
 
-The foundation is an implemented candidate (pending review) so that
+The foundation is merged and remains FOUNDATION / INACTIVE so that
 R169B–R169E can land incrementally, each round activating one piece
 with its own tests and audit. There is no "big bang" activation.
 `DATA-CARRY-01` (P1) remains OPEN until R169E has passed the crash
@@ -1117,7 +1356,7 @@ decide whether to certify Windows or to formally drop support.
 - `v2/tests/storage/r169a-generation-store.test.ts` — test matrix.
 - `docs/V2_ARCHITECTURE.md` — section 10 (publication, current state +
   R169 target) and section 15 (R169A generation store target).
-- `docs/V2_CURRENT_STATE.md` — R169A section (foundation implemented as a candidate, inactive, pending review, publication NOT active).
+- `docs/V2_CURRENT_STATE.md` — R169A section (foundation merged, FOUNDATION / INACTIVE, publication NOT active).
 - `v2/CHANGELOG.md` — R169A entry (foundation, feature inactive).
 - `v2/src/indexer/schema.ts` — `CURRENT_GENERATION_MANIFEST_VERSION = 1`.
 - `v2/src/bridge/sqlite-ro.ts` — `defaultCodeDbPath` (the legacy path,

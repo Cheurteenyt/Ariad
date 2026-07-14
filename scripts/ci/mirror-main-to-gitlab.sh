@@ -9,7 +9,9 @@
 #   - DIAG-R168.1-01: GitHub reads + local object errors classified
 #   - TEST-R168.1-01: test-only hooks for real race condition tests
 #
-# Called by .github/workflows/mirror-main-to-gitlab.yml (production).
+# Published source for .github/workflows/mirror-main-to-gitlab.yml.
+# Production executes this script from the workflow's immutable trusted pin,
+# never from TARGET_SHA.
 # Tested by v2/tests/ci/r168-mirror-runtime.test.ts (bare repo tests).
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +225,48 @@ run_local_git() {
   printf '%s' "$output"
 }
 
+# Test Git ancestry without conflating a normal "not ancestor" result with
+# an operational Git failure.
+# Returns:
+#   0 — ancestor
+#   1 — not an ancestor (normal state-machine result)
+#   2 — Git/object/ref failure (state + diagnostics populated)
+# Arguments: $1 = phase, $2 = candidate ancestor, $3 = descendant
+git_is_ancestor() {
+  local phase="$1"
+  local ancestor="$2"
+  local descendant="$3"
+  local output
+  local status
+  local category="LOCAL_GIT_ERROR"
+
+  if output="$(git merge-base --is-ancestor "$ancestor" "$descendant" 2>&1)"; then
+    return 0
+  else
+    status=$?
+  fi
+
+  if [ "$status" -eq 1 ]; then
+    return 1
+  fi
+
+  case "$output" in
+    *"Not a valid object name"*|*"bad object"*|*"Not a valid commit name"*)
+      category="LOCAL_OBJECT_MISSING" ;;
+    *"unknown revision"*|*"not a valid ref"*|*"ambiguous argument"*)
+      category="LOCAL_REF_MISSING" ;;
+    *"fatal: not a git repository"*)
+      category="LOCAL_NOT_A_REPO" ;;
+  esac
+
+  STATE_ERROR_CATEGORY="$category"
+  STATE_ERROR_PHASE="$phase"
+  STATE_FINAL_RESULT="failed"
+  echo "::error::[$category] during $phase (merge-base exit $status)" >&2
+  echo "$output" >&2
+  return 2
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test-only hooks (TEST-R168.1-01)
 # These allow race condition tests to mutate state at specific points.
@@ -307,6 +351,8 @@ if [ "$SKIP_SSH_CONFIG" != "yes" ]; then
     -i $SSH_KEY_FILE \
     -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=yes \
+    -o HostKeyAlgorithms=ssh-ed25519 \
+    -o PubkeyAcceptedAlgorithms=ssh-ed25519 \
     -o UserKnownHostsFile=$KNOWN_HOSTS_FILE \
     -o BatchMode=yes \
     -o ConnectTimeout=15 \
@@ -428,13 +474,18 @@ run_github_git "github-read" fetch --no-tags "$GITHUB_REMOTE" main:refs/remotes/
 CURRENT_GITHUB_MAIN="$(run_local_git "github-read" rev-parse refs/remotes/github/main)"
 echo "GitHub main: $CURRENT_GITHUB_MAIN"
 
-if ! run_local_git "github-read" merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_GITHUB_MAIN" 2>/dev/null; then
+if git_is_ancestor "github-read" "$TARGET_SHA" "$CURRENT_GITHUB_MAIN"; then
+  echo "✓ TARGET_SHA is ancestor of GitHub main."
+else
+  ANCESTRY_STATUS=$?
+  if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+    exit 1
+  fi
   echo "::error::TARGET_SHA is not an ancestor of GitHub main." >&2
   STATE_ERROR_CATEGORY="TARGET_SHA_NOT_ANCESTOR"
   STATE_ERROR_PHASE="github-read"
   exit 1
 fi
-echo "✓ TARGET_SHA is ancestor of GitHub main."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Add GitLab remote + read GitLab main
@@ -456,10 +507,13 @@ if [ -n "$REMOTE_SHA" ]; then
   run_gitlab_git "fetch" fetch --no-tags gitlab main:refs/remotes/gitlab/main
 
   # DIVERGENCE CHECK: GitLab main must be ancestor of GitHub main.
-  # merge-base --is-ancestor returns exit 1 when NOT an ancestor — this is
-  # a normal result, not an error. Only treat it as divergence when it
-  # explicitly returns non-ancestor (exit 1).
-  if ! git merge-base --is-ancestor "$REMOTE_SHA" "$CURRENT_GITHUB_MAIN" 2>/dev/null; then
+  if git_is_ancestor "divergence-check" "$REMOTE_SHA" "$CURRENT_GITHUB_MAIN"; then
+    echo "✓ No divergence."
+  else
+    ANCESTRY_STATUS=$?
+    if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+      exit 1
+    fi
     echo "::error::DIVERGENCE: GitLab main has history absent from GitHub main." >&2
     echo "GitLab main: $REMOTE_SHA" >&2
     echo "GitHub main: $CURRENT_GITHUB_MAIN" >&2
@@ -468,7 +522,6 @@ if [ -n "$REMOTE_SHA" ]; then
     STATE_OBSERVED_SHA="$REMOTE_SHA"
     exit 1
   fi
-  echo "✓ No divergence."
 fi
 
 # Test hook: race after initial read (TEST-R168.1-01)
@@ -482,16 +535,38 @@ echo ""
 echo "=== Classify mirror state ==="
 
 PROVISIONAL_RESULT=""
+TARGET_IS_ANCESTOR_OF_REMOTE="false"
+REMOTE_IS_ANCESTOR_OF_TARGET="false"
+
+if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$TARGET_SHA" ]; then
+  if git_is_ancestor "classify" "$TARGET_SHA" "$REMOTE_SHA"; then
+    TARGET_IS_ANCESTOR_OF_REMOTE="true"
+  else
+    ANCESTRY_STATUS=$?
+    if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+      exit 1
+    fi
+  fi
+
+  if git_is_ancestor "classify" "$REMOTE_SHA" "$TARGET_SHA"; then
+    REMOTE_IS_ANCESTOR_OF_TARGET="true"
+  else
+    ANCESTRY_STATUS=$?
+    if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+      exit 1
+    fi
+  fi
+fi
 
 if [ "$REMOTE_SHA" = "$TARGET_SHA" ]; then
   echo "GitLab already at TARGET_SHA."
   STATE_PUSH_ATTEMPTED="false"
   PROVISIONAL_RESULT="already-mirrored"
-elif [ -n "$REMOTE_SHA" ] && git merge-base --is-ancestor "$TARGET_SHA" "$REMOTE_SHA" 2>/dev/null; then
+elif [ "$TARGET_IS_ANCESTOR_OF_REMOTE" = "true" ]; then
   echo "GitLab already ahead (newer valid mirror)."
   STATE_PUSH_ATTEMPTED="false"
   PROVISIONAL_RESULT="newer-valid-mirror-present"
-elif [ -z "$REMOTE_SHA" ] || git merge-base --is-ancestor "$REMOTE_SHA" "$TARGET_SHA" 2>/dev/null; then
+elif [ -z "$REMOTE_SHA" ] || [ "$REMOTE_IS_ANCESTOR_OF_TARGET" = "true" ]; then
   echo "Fast-forward eligible."
 
   run_gitlab_git "dry-run" push --dry-run -o ci.no_pipeline gitlab "$TARGET_SHA:refs/heads/main"
@@ -553,27 +628,49 @@ fi
 # Case A: GitLab is exactly at TARGET_SHA
 if [ "$STATE_OBSERVED_SHA" = "$TARGET_SHA" ]; then
   # MIRROR-R168.1-01: even in this case, verify TARGET_SHA is ancestor of fresh GitHub main
-  if ! run_local_git "post-read" merge-base --is-ancestor "$TARGET_SHA" "$STATE_GITHUB_MAIN_SHA" 2>/dev/null; then
+  if git_is_ancestor "post-read" "$TARGET_SHA" "$STATE_GITHUB_MAIN_SHA"; then
+    echo "✓ GitLab main matches TARGET_SHA, and TARGET_SHA is in fresh GitHub main."
+    STATE_POST_VERIFY_RESULT="success"
+    STATE_FINAL_RESULT="$PROVISIONAL_RESULT"
+    exit 0
+  else
+    ANCESTRY_STATUS=$?
+    if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+      STATE_POST_VERIFY_RESULT="failure"
+      exit 1
+    fi
     echo "::error::TARGET_SHA is no longer an ancestor of fresh GitHub main." >&2
     STATE_POST_VERIFY_RESULT="failure"
     STATE_ERROR_CATEGORY="TARGET_SHA_NOT_IN_FRESH_GITHUB"
     STATE_ERROR_PHASE="post-read"
     exit 1
   fi
-  echo "✓ GitLab main matches TARGET_SHA, and TARGET_SHA is in fresh GitHub main."
-  STATE_POST_VERIFY_RESULT="success"
-  STATE_FINAL_RESULT="$PROVISIONAL_RESULT"
-  exit 0
 fi
 
 # Case B: GitLab is a descendant of TARGET_SHA (race: newer mirror won)
-if run_local_git "post-read" merge-base --is-ancestor "$TARGET_SHA" "$STATE_OBSERVED_SHA" 2>/dev/null; then
-  if run_local_git "post-read" merge-base --is-ancestor "$STATE_OBSERVED_SHA" "$STATE_GITHUB_MAIN_SHA" 2>/dev/null; then
+TARGET_IS_ANCESTOR_OF_OBSERVED="false"
+if git_is_ancestor "post-read" "$TARGET_SHA" "$STATE_OBSERVED_SHA"; then
+  TARGET_IS_ANCESTOR_OF_OBSERVED="true"
+else
+  ANCESTRY_STATUS=$?
+  if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+    STATE_POST_VERIFY_RESULT="failure"
+    exit 1
+  fi
+fi
+
+if [ "$TARGET_IS_ANCESTOR_OF_OBSERVED" = "true" ]; then
+  if git_is_ancestor "post-read" "$STATE_OBSERVED_SHA" "$STATE_GITHUB_MAIN_SHA"; then
     echo "✓ Newer validated mirror won the race."
     STATE_POST_VERIFY_RESULT="success"
     STATE_FINAL_RESULT="newer-valid-mirror-present"
     exit 0
   else
+    ANCESTRY_STATUS=$?
+    if [ "$ANCESTRY_STATUS" -eq 2 ]; then
+      STATE_POST_VERIFY_RESULT="failure"
+      exit 1
+    fi
     echo "::error::GitLab is ahead of TARGET_SHA but not in fresh GitHub main." >&2
     STATE_POST_VERIFY_RESULT="failure"
     STATE_ERROR_CATEGORY="POST_VERIFY_DESCENDANT_NOT_IN_GITHUB"

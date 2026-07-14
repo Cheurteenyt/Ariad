@@ -1,4 +1,4 @@
-# GitHub Actions Quota Report — schedule-only workflow
+# GitHub Actions Quota Report — scheduled/manual workflow
 #
 # R112: split from ci.yml to fix false "1 error" annotation on push/PR pipelines.
 # Previously, quota-report lived in ci.yml with `if: github.event_name == 'schedule'`,
@@ -6,8 +6,8 @@
 # jobs as "1 error" in annotations, making the pipeline look failed even when
 # backend/frontend passed.
 #
-# Now this workflow ONLY triggers on schedule (weekly Monday 00:00 UTC).
-# Push/PR pipelines only run ci.yml (backend + frontend) — no skipped jobs.
+# Now this workflow triggers on schedule (weekly Monday 00:00 UTC) or manually.
+# Push/PR pipelines run the four always-on jobs in ci.yml — no skipped jobs.
 #
 # R50: original quota-report job
 # R52: security hardening, single API call + single parse
@@ -30,6 +30,7 @@ jobs:
   quota-report:
     name: Quota Report
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Generate repository health report
         env:
@@ -41,6 +42,7 @@ jobs:
 
           # GitHub API rate limits — fail on HTTP error (R168.2 fix)
           RATE_LIMIT=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/rate_limit")
@@ -64,6 +66,7 @@ jobs:
           # the API, NOT filtered to the last 30 days. The GitHub API
           # does not support date filtering on this endpoint.
           RUNS_RESPONSE=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=1")
