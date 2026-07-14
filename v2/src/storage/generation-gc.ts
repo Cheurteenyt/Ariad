@@ -1361,7 +1361,7 @@ export interface OrphanIdentity {
 
 export interface GenerationOrphanEntry {
   readonly path: string;
-  readonly kind: "DB_ONLY" | "METADATA_ONLY" | "NOT_IN_CATALOG" | "PROMOTION_TEMP" | "ACTIVE_NOT_IN_CATALOG";
+  readonly kind: "DB_ONLY" | "METADATA_ONLY" | "NOT_IN_CATALOG" | "PROMOTION_TEMP" | "METADATA_TEMP" | "ACTIVE_NOT_IN_CATALOG";
   readonly generationId: string | null;
   readonly observedAt: string;
   readonly reason: string;
@@ -1503,6 +1503,31 @@ export function planGenerationOrphanRecovery(
           observedAt: now,
           reason: `promotion temp left by failed publication (age=${Math.round(ageMs / 1000)}s)`,
           identity,
+        });
+        continue;
+      }
+
+      // R169B (§7 GATE): Metadata temps — `.metadata-<uuid>-<nonce>.tmp`.
+      // Same treatment as promotion temps: identity capture, grace period,
+      // CAS lock deletion.
+      if (/^\.metadata-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[0-9a-f-]+\.tmp$/.test(ent.name)) {
+        const metaTempPath = join(generations, ent.name);
+        let metaIdentity: OrphanIdentity | null = null;
+        let metaAgeMs = 0;
+        try {
+          const st = lstatSync(metaTempPath);
+          if (st.isSymbolicLink() || !st.isFile()) { continue; }
+          metaAgeMs = Date.now() - st.mtimeMs;
+          if (metaAgeMs < graceMs) { continue; }
+          metaIdentity = { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs };
+        } catch { continue; }
+        orphans.push({
+          path: metaTempPath,
+          kind: "METADATA_TEMP",
+          generationId: null,
+          observedAt: now,
+          reason: `metadata temp left by failed publication (age=${Math.round(metaAgeMs / 1000)}s)`,
+          identity: metaIdentity,
         });
         continue;
       }
@@ -1777,6 +1802,62 @@ export function applyGenerationOrphanRecovery(
           }
         } catch (e) {
           warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete orphan temp: ${(e as Error).message}` });
+          retainedOrphans.push(orphan);
+        }
+        break;
+      }
+      case "METADATA_TEMP": {
+        // R169B (§7 GATE): same treatment as PROMOTION_TEMP — CAS lock,
+        // identity re-validation, unlink, fsync.
+        try {
+          const basename = orphan.path.split("/").pop() ?? "";
+          const META_TEMP_RE = /^\.metadata-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[0-9a-f-]+\.tmp$/;
+          if (!META_TEMP_RE.test(basename)) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp basename does not match canonical pattern: ${basename}` });
+            retainedOrphans.push(orphan);
+            continue;
+          }
+          const canonicalPath = join(generations, basename);
+          try {
+            assertPathInsideNoSymlinks(generations, canonicalPath, project, phase);
+          } catch (e) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp containment check failed: ${(e as Error).message}` });
+            retainedOrphans.push(orphan);
+            continue;
+          }
+          const casForMetaTemp = openCasStore(project, cacheRoot);
+          try {
+            casForMetaTemp.beginImmediate();
+            const stLocked = lstatSync(canonicalPath);
+            if (stLocked.isSymbolicLink() || !stLocked.isFile()) {
+              casForMetaTemp.rollback();
+              warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp not a regular file under lock: ${canonicalPath}` });
+              retainedOrphans.push(orphan);
+              continue;
+            }
+            if (orphan.identity) {
+              if (stLocked.dev !== orphan.identity.dev ||
+                  stLocked.ino !== orphan.identity.ino ||
+                  stLocked.size !== orphan.identity.size ||
+                  stLocked.mtimeMs !== orphan.identity.mtimeMs) {
+                casForMetaTemp.rollback();
+                warnings.push({ code: "GC_DELETE_FAILED", message: `Metadata temp identity changed under lock: ${canonicalPath}` });
+                retainedOrphans.push(orphan);
+                continue;
+              }
+            }
+            unlinkSync(canonicalPath);
+            casForMetaTemp.commit();
+            deletedTempPaths.push(canonicalPath);
+          } catch (e) {
+            try { casForMetaTemp.rollback(); } catch { /* best effort */ }
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete metadata temp under CAS lock: ${(e as Error).message}` });
+            retainedOrphans.push(orphan);
+          } finally {
+            casForMetaTemp.close();
+          }
+        } catch (e) {
+          warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to process metadata temp: ${(e as Error).message}` });
           retainedOrphans.push(orphan);
         }
         break;
