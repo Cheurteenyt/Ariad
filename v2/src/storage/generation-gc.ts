@@ -1102,3 +1102,250 @@ function readFileSyncTextSafe(path: string, maxBytes: number): string {
     }
   }
 }
+
+
+// ─── B1: Orphan Recovery ────────────────────────────────────────────────
+
+export interface GenerationOrphanEntry {
+  readonly path: string;
+  readonly kind: "DB_ONLY" | "METADATA_ONLY" | "NOT_IN_CATALOG" | "PROMOTION_TEMP" | "ACTIVE_NOT_IN_CATALOG";
+  readonly generationId: string | null;
+  readonly observedAt: string;
+  readonly reason: string;
+}
+
+export interface GenerationOrphanPlan {
+  readonly project: string;
+  readonly cacheRoot: string;
+  readonly orphans: readonly GenerationOrphanEntry[];
+  readonly activeGenerationId: string | null;
+  readonly casRevision: number;
+}
+
+export function planGenerationOrphanRecovery(
+  project: string,
+  options?: GenerationGcOptions,
+): GenerationOrphanPlan {
+  const phase = "planGenerationOrphanRecovery";
+  if (!project || typeof project !== "string") {
+    throw new GenerationStoreError("PROJECT_KEY_INVALID", phase, String(project), "project must be a non-empty string");
+  }
+  const cacheRoot = options?.cacheRoot ?? getCacheRoot();
+  assertTrustedRootNoSymlinks(cacheRoot, project, phase);
+
+  const projectStore = projectStoreDir(project, cacheRoot);
+  const generations = generationsDir(project, cacheRoot);
+  const manifestPath = activeManifestPath(project, cacheRoot);
+
+  let activeManifest: GenerationManifestV1 | null;
+  try {
+    activeManifest = readOptionalGenerationManifest(manifestPath, project);
+  } catch (err) {
+    if (err instanceof GenerationStoreError) {
+      throw new GenerationStoreError("GC_SAFETY_REFUSAL", phase, project,
+        `Active manifest corrupt: [${err.code}] ${err.message}`);
+    }
+    throw err;
+  }
+  const activeGenerationId = activeManifest?.generationId ?? null;
+
+  const cas = openCasStore(project, cacheRoot);
+  let casRevision: number;
+  let catalogIds: Set<string>;
+  let pinnedIds: Set<string>;
+  try {
+    casRevision = cas.getRevision();
+    const active = cas.listCatalogEntriesByStatus("ACTIVE");
+    catalogIds = new Set(active.map(e => e.generationId));
+    pinnedIds = new Set(active.filter(e => e.pinned).map(e => e.generationId));
+    cas.listCatalogEntriesByStatus("DELETING").forEach(e => catalogIds.add(e.generationId));
+  } finally {
+    cas.close();
+  }
+
+  const protectedIds = new Set<string>();
+  if (activeGenerationId) protectedIds.add(activeGenerationId);
+  pinnedIds.forEach(id => protectedIds.add(id));
+
+  const orphans: GenerationOrphanEntry[] = [];
+  const now = new Date().toISOString();
+
+  if (existsSync(generations)) {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(generations, { withFileTypes: true }) as unknown as import("node:fs").Dirent[];
+    } catch {
+      entries = [];
+    }
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+
+      // Promotion temps.
+      if (/^\.publish-[0-9a-f-]+-[0-9a-f-]+\.db$/.test(ent.name)) {
+        orphans.push({
+          path: join(generations, ent.name),
+          kind: "PROMOTION_TEMP",
+          generationId: null,
+          observedAt: now,
+          reason: "promotion temp left by failed publication",
+        });
+        continue;
+      }
+
+      // generation-<uuid>.db
+      const dbMatch = ent.name.match(/^generation-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.db$/);
+      if (dbMatch) {
+        const gid = dbMatch[1];
+        const dbPath = join(generations, ent.name);
+        const metaPath = deriveMetadataPath(projectStore, gid);
+
+        if (!catalogIds.has(gid) && !protectedIds.has(gid)) {
+          orphans.push({ path: dbPath, kind: "NOT_IN_CATALOG", generationId: gid, observedAt: now, reason: "DB not in CAS catalog" });
+          continue;
+        }
+
+        try {
+          lstatSync(metaPath);
+        } catch (err2) {
+          if ((err2 as NodeJS.ErrnoException).code === "ENOENT") {
+            orphans.push({ path: dbPath, kind: "DB_ONLY", generationId: gid, observedAt: now, reason: "DB exists but metadata missing" });
+          }
+          continue;
+        }
+        continue;
+      }
+
+      // generation-<uuid>.json without DB
+      const jsonMatch = ent.name.match(/^generation-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/);
+      if (jsonMatch) {
+        const gid = jsonMatch[1];
+        const jsonPath = join(generations, ent.name);
+        const dbPath = deriveDbPath(projectStore, gid);
+
+        try {
+          lstatSync(dbPath);
+        } catch (err2) {
+          if ((err2 as NodeJS.ErrnoException).code === "ENOENT" && !protectedIds.has(gid)) {
+            orphans.push({ path: jsonPath, kind: "METADATA_ONLY", generationId: gid, observedAt: now, reason: "Metadata exists but DB missing" });
+          }
+          continue;
+        }
+        continue;
+      }
+    }
+  }
+
+  if (activeGenerationId && !catalogIds.has(activeGenerationId)) {
+    orphans.push({ path: manifestPath, kind: "ACTIVE_NOT_IN_CATALOG", generationId: activeGenerationId, observedAt: now, reason: "Active manifest generation not in CAS catalog" });
+  }
+
+  return { project, cacheRoot, orphans, activeGenerationId, casRevision };
+}
+
+export interface GenerationOrphanResult {
+  readonly project: string;
+  readonly deletedTempPaths: readonly string[];
+  readonly retainedOrphans: readonly GenerationOrphanEntry[];
+  readonly casRecovered: boolean;
+  readonly warnings: readonly GenerationStoreWarning[];
+}
+
+export function applyGenerationOrphanRecovery(
+  plan: GenerationOrphanPlan,
+  options?: GenerationGcOptions,
+): GenerationOrphanResult {
+  const phase = "applyGenerationOrphanRecovery";
+  const project = plan.project;
+  const cacheRoot = options?.cacheRoot ?? plan.cacheRoot ?? getCacheRoot();
+
+  assertTrustedRootNoSymlinks(cacheRoot, project, phase);
+
+  const projectStore = projectStoreDir(project, cacheRoot);
+  const generations = generationsDir(project, cacheRoot);
+  const warnings: GenerationStoreWarning[] = [];
+  const deletedTempPaths: string[] = [];
+  const retainedOrphans: GenerationOrphanEntry[] = [];
+  let casRecovered = false;
+
+  for (const orphan of plan.orphans) {
+    switch (orphan.kind) {
+      case "PROMOTION_TEMP": {
+        try {
+          const st = lstatSync(orphan.path);
+          if (st.isSymbolicLink() || !st.isFile()) {
+            warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp not a regular file: ${orphan.path}` });
+            retainedOrphans.push(orphan);
+            continue;
+          }
+          unlinkSync(orphan.path);
+          deletedTempPaths.push(orphan.path);
+        } catch (e) {
+          warnings.push({ code: "GC_DELETE_FAILED", message: `Failed to delete orphan temp: ${(e as Error).message}` });
+          retainedOrphans.push(orphan);
+        }
+        break;
+      }
+      case "ACTIVE_NOT_IN_CATALOG": {
+        if (!orphan.generationId) { retainedOrphans.push(orphan); continue; }
+        const gid = orphan.generationId;
+        const dbPath = deriveDbPath(projectStore, gid);
+        const metaPath = deriveMetadataPath(projectStore, gid);
+        try {
+          const dbStat = lstatSync(dbPath);
+          if (!dbStat.isFile()) { warnings.push({ code: "GC_DELETE_FAILED", message: `Active DB not regular: ${dbPath}` }); retainedOrphans.push(orphan); continue; }
+          const metaStat = lstatSync(metaPath);
+          if (!metaStat.isFile()) { warnings.push({ code: "GC_DELETE_FAILED", message: `Active metadata not regular: ${metaPath}` }); retainedOrphans.push(orphan); continue; }
+          const metaRaw = readFileSyncTextSafe(metaPath, 256 * 1024);
+          const metaParsed = JSON.parse(metaRaw);
+          const metaValidated = validateGenerationMetadata(metaParsed, project);
+          const actualHash = computeGcSha256(dbPath);
+          if (actualHash !== metaValidated.manifest.sha256) { warnings.push({ code: "GC_DELETE_FAILED", message: `Active DB hash mismatch during CAS recovery` }); retainedOrphans.push(orphan); continue; }
+          const cas = openCasStore(project, cacheRoot);
+          try {
+            cas.beginImmediate();
+            const now = new Date().toISOString();
+            const m = metaValidated.manifest;
+            const existing = cas.getGenerationCatalogEntry(gid);
+            if (!existing) {
+              cas.upsertGenerationCatalog({ generationId: gid, project, sha256: m.sha256, sizeBytes: m.sizeBytes, rootFingerprint: m.rootFingerprint, extractorSemanticsVersion: m.extractorSemanticsVersion, discoveryPolicyVersion: m.discoveryPolicyVersion, firstPublishedAt: m.createdAt, lastSeenAt: now, pinned: false, status: "ACTIVE" });
+            }
+            cas.setActiveGenerationId(gid);
+            cas.appendPublicationHistory(gid, project, "RECOVER", null);
+            cas.commit();
+            casRecovered = true;
+          } catch (e) {
+            try { cas.rollback(); } catch {}
+            warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery failed: ${(e as Error).message}` });
+            retainedOrphans.push(orphan);
+          } finally {
+            cas.close();
+          }
+        } catch (e) {
+          warnings.push({ code: "GC_DELETE_FAILED", message: `CAS recovery disk verification failed: ${(e as Error).message}` });
+          retainedOrphans.push(orphan);
+        }
+        break;
+      }
+      default:
+        retainedOrphans.push(orphan);
+        warnings.push({ code: "GC_SAFETY_REFUSAL", message: `Orphan ${orphan.kind} at ${orphan.path} retained (grace period required)` });
+        break;
+    }
+  }
+
+  if (deletedTempPaths.length > 0) {
+    let dirFd: number | null = null;
+    try {
+      const opened = openDirectoryNoFollow(generations, PROD_OPS);
+      dirFd = opened.fd;
+      PROD_OPS.fsyncSync(dirFd);
+      PROD_OPS.closeSync(dirFd);
+      dirFd = null;
+    } catch (e) {
+      if (dirFd !== null) { try { PROD_OPS.closeSync(dirFd); } catch {} }
+      warnings.push({ code: "GC_DELETE_FAILED", message: `fsync generations/ after orphan temp cleanup failed: ${(e as Error).message}` });
+    }
+  }
+
+  return { project, deletedTempPaths, retainedOrphans, casRecovered, warnings };
+}
