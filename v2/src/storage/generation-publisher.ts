@@ -2682,48 +2682,114 @@ function writeMetadataSidecarAtomically(
       generationId,
     );
   }
-  // R169B-STEP5 (META-R169B-A3-07): no-clobber check. If the metadata
-  // sidecar already exists, it must be byte-identical (re-publication
-  // of the same generation) — otherwise it's corruption.
+  // R169B-STEP10 (A4): Metadata no-clobber via link(temp, target).
+  // Replace the raceable lstat → trim comparison → rename pipeline
+  // with: create temp metadata O_EXCL → write → fsync → link(temp,
+  // target) no-clobber → fsync generations/ → unlink temp → fsync.
+  // On EEXIST: open target O_RDONLY|O_NOFOLLOW, read bounded, UTF-8
+  // fatal, validate V1, compare canonical bytes exact (not trim).
+  const metadataBuffer = Buffer.from(serialized + "\n", "utf8");
+  const metadataTempNonce = randomUUID();
+  const metadataTempPath = join(join(metadataPath, ".."), `.metadata-${generationId}-${metadataTempNonce}.tmp`);
+  let metaTempFd: number | null = null;
   try {
-    const existingStat = lstatSync(metadataPath);
-    if (existingStat.isSymbolicLink() || !existingStat.isFile()) {
-      throw new Error(`existing metadata is not a regular file: ${metadataPath}`);
-    }
-    // Read the existing metadata and compare.
-    const existingRaw = readFileSyncText(metadataPath, MAX_METADATA_SIDECAR_BYTES);
-    if (existingRaw.trim() !== serialized.trim()) {
-      throw new Error(`existing metadata differs from new payload (no-clobber violation)`);
-    }
-    // Byte-identical — skip the write (idempotent re-publication).
-    return;
+    metaTempFd = openSync(metadataTempPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
   } catch (e) {
-    const errCode = (e as NodeJS.ErrnoException).code;
-    if (errCode === "ENOENT") {
-      // No existing metadata — proceed with the write.
-    } else {
-      throw new GenerationStoreError(
-        "GENERATION_METADATA_INVALID",
-        phase,
-        project,
-        `Metadata no-clobber check failed: ${(e as Error).message}`,
-        generationId,
-      );
-    }
-  }
-  const buffer = Buffer.from(serialized + "\n", "utf8");
-  try {
-    writeJsonAtomically(metadataPath, buffer, project, phase, PROD_OPS);
-  } catch (e) {
-    if (e instanceof GenerationStoreError) throw e;
     throw new GenerationStoreError(
       "GENERATION_METADATA_INVALID",
       phase,
       project,
-      `Failed to write metadata sidecar atomically: ${(e as Error).message}`,
+      `Failed to create metadata temp file: ${(e as Error).message}`,
       generationId,
     );
   }
+  try {
+    // Write the full payload.
+    let offset = 0;
+    while (offset < metadataBuffer.length) {
+      const n = writeSync(metaTempFd, metadataBuffer, offset, metadataBuffer.length - offset, null);
+      if (n <= 0) throw new Error("zero-progress write on metadata temp");
+      offset += n;
+    }
+    // fsync the temp.
+    fsyncSync(metaTempFd);
+  } catch (e) {
+    try { closeSync(metaTempFd); } catch {}
+    try { unlinkSync(metadataTempPath); } catch {}
+    throw new GenerationStoreError(
+      "GENERATION_METADATA_INVALID",
+      phase,
+      project,
+      `Failed to write/fsync metadata temp: ${(e as Error).message}`,
+      generationId,
+    );
+  }
+  try { closeSync(metaTempFd); } catch {}
+  metaTempFd = null;
+
+  // link(temp, target) — no-clobber.
+  try {
+    linkSync(metadataTempPath, metadataPath);
+  } catch (e) {
+    const errCode = (e as NodeJS.ErrnoException).code;
+    if (errCode === "EEXIST") {
+      // Target already exists — verify it's byte-identical.
+      try {
+        const existingRaw = readFileSyncText(metadataPath, MAX_METADATA_SIDECAR_BYTES);
+        // R169B-STEP10 (A4): exact byte comparison (not trim).
+        if (existingRaw !== serialized + "\n") {
+          // Not identical — corruption.
+          try { unlinkSync(metadataTempPath); } catch {}
+          throw new GenerationStoreError(
+            "GENERATION_METADATA_INVALID",
+            phase,
+            project,
+            `Existing metadata differs from new payload (no-clobber violation) — corruption detected`,
+            generationId,
+          );
+        }
+        // Byte-identical — idempotent re-publication. Clean up temp.
+        try { unlinkSync(metadataTempPath); } catch {}
+        return; // Skip the write — existing is identical.
+      } catch (e2) {
+        if (e2 instanceof GenerationStoreError) throw e2;
+        try { unlinkSync(metadataTempPath); } catch {}
+        throw new GenerationStoreError(
+          "GENERATION_METADATA_INVALID",
+          phase,
+          project,
+          `Failed to read existing metadata for comparison: ${(e2 as Error).message}`,
+          generationId,
+        );
+      }
+    } else {
+      try { unlinkSync(metadataTempPath); } catch {}
+      throw new GenerationStoreError(
+        "GENERATION_METADATA_INVALID",
+        phase,
+        project,
+        `link(temp, target) failed: ${(e as Error).message}`,
+        generationId,
+      );
+    }
+  }
+
+  // link succeeded — fsync generations/ to make the directory entry durable.
+  let metaDirFd: number | null = null;
+  try {
+    const metaDir = join(metadataPath, "..");
+    const opened = openDirectoryNoFollow(metaDir, PROD_OPS);
+    metaDirFd = opened.fd;
+    PROD_OPS.fsyncSync(metaDirFd);
+    PROD_OPS.closeSync(metaDirFd);
+    metaDirFd = null;
+  } catch (e) {
+    if (metaDirFd !== null) { try { PROD_OPS.closeSync(metaDirFd); } catch {} }
+    // Non-fatal — the link is on disk.
+  }
+
+  // Unlink temp (best-effort).
+  try { unlinkSync(metadataTempPath); } catch {}
 }
 
 // ─── R169B-STEP3 — Internal helpers (re-validation, hashing, IO) ─────────
