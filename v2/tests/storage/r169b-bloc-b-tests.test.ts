@@ -125,7 +125,7 @@ function deleteCatalogEntryRaw(generationId: string): void {
 
 describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
   it("returns an empty orphan list on a clean cache root", () => {
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     expect(plan.orphans.length).toBe(0);
     expect(plan.activeGenerationId).toBeNull();
     expect(plan.casRevision).toBe(0);
@@ -139,7 +139,7 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     const tempPath = join(generations, ".publish-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-abcdef0123456789.db");
     writeFileSync(tempPath, "fake temp content");
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const tempOrphans = plan.orphans.filter((o) => o.kind === "PROMOTION_TEMP");
     expect(tempOrphans.length).toBe(1);
     expect(tempOrphans[0].path).toBe(tempPath);
@@ -154,7 +154,7 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     const fakeDbPath = join(generations, `generation-${fakeUuid}.db`);
     writeFileSync(fakeDbPath, "fake db content");
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const notInCatalog = plan.orphans.filter((o) => o.kind === "NOT_IN_CATALOG");
     expect(notInCatalog.length).toBe(1);
     expect(notInCatalog[0].generationId).toBe(fakeUuid);
@@ -170,7 +170,7 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     );
     if (existsSync(metaPath)) rmSync(metaPath);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const dbOnly = plan.orphans.filter((o) => o.kind === "DB_ONLY");
     expect(dbOnly.length).toBe(1);
     expect(dbOnly[0].generationId).toBe(ids[0]);
@@ -186,7 +186,7 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     );
     if (existsSync(dbPath)) rmSync(dbPath);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const metaOnly = plan.orphans.filter((o) => o.kind === "METADATA_ONLY");
     expect(metaOnly.length).toBe(1);
     expect(metaOnly[0].generationId).toBe(ids[1]);
@@ -199,7 +199,7 @@ describe("R169B-STEP10 (B1) — planGenerationOrphanRecovery", () => {
     // Delete the catalog entry for the active generation via raw SQL.
     deleteCatalogEntryRaw(activeId);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     const activeNotInCatalog = plan.orphans.filter((o) => o.kind === "ACTIVE_NOT_IN_CATALOG");
     expect(activeNotInCatalog.length).toBe(1);
     expect(activeNotInCatalog[0].generationId).toBe(activeId);
@@ -215,8 +215,8 @@ describe("R169B-STEP10 (B1) — applyGenerationOrphanRecovery", () => {
     const tempPath = join(generations, ".publish-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-abcdef0123456789.db");
     writeFileSync(tempPath, "fake temp content");
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
     expect(result.deletedTempPaths.length).toBe(1);
     expect(result.deletedTempPaths[0]).toBe(tempPath);
@@ -231,8 +231,8 @@ describe("R169B-STEP10 (B1) — applyGenerationOrphanRecovery", () => {
     const fakeDbPath = join(generations, `generation-${fakeUuid}.db`);
     writeFileSync(fakeDbPath, "fake db content");
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
     expect(result.deletedTempPaths.length).toBe(0);
     expect(existsSync(fakeDbPath)).toBe(true);
@@ -257,8 +257,8 @@ describe("R169B-STEP10 (B1) — applyGenerationOrphanRecovery", () => {
     );
     if (existsSync(dbPath1)) rmSync(dbPath1);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
     expect(result.deletedTempPaths.length).toBe(0);
     const retainedKinds = result.retainedOrphans.map((o) => o.kind);
@@ -278,10 +278,10 @@ describe("R169B-STEP10 (B2) — CAS recovery disk-aware (ACTIVE_NOT_IN_CATALOG)"
     // (simulates a crash between manifest write and CAS commit).
     deleteCatalogEntryRaw(activeId);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     expect(plan.orphans.some((o) => o.kind === "ACTIVE_NOT_IN_CATALOG" && o.generationId === activeId)).toBe(true);
 
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
     expect(result.casRecovered).toBe(true);
 
     const cas2 = openCasStore(FIXTURE_PROJECT_NAME, cacheRoot);
@@ -322,8 +322,8 @@ describe("R169B-STEP10 (B2) — CAS recovery disk-aware (ACTIVE_NOT_IN_CATALOG)"
     // Delete the catalog entry via raw SQL.
     deleteCatalogEntryRaw(oldActive);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
     expect(result.casRecovered).toBe(false);
     const retained = result.retainedOrphans.filter((o) => o.kind === "ACTIVE_NOT_IN_CATALOG");
@@ -347,8 +347,8 @@ describe("R169B-STEP10 (B2) — CAS recovery disk-aware (ACTIVE_NOT_IN_CATALOG)"
     // Delete the catalog entry via raw SQL.
     deleteCatalogEntryRaw(activeId);
 
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
 
     expect(result.casRecovered).toBe(false);
     const retained = result.retainedOrphans.filter((o) => o.kind === "ACTIVE_NOT_IN_CATALOG");
@@ -479,7 +479,7 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
 
   it("rejects a JSON-cloned plan (new reference, not in the WeakMap)", () => {
     publishNGenerations(1);
-    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     // JSON clone — new reference, NOT in the WeakMap.
     const cloned = JSON.parse(JSON.stringify(realPlan));
     expect(() => applyGenerationOrphanRecovery(cloned, { cacheRoot })).toThrow(/GC_PLAN_UNAUTHENTICATED/);
@@ -487,7 +487,7 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
 
   it("rejects a spread plan (new reference, not in the WeakMap)", () => {
     publishNGenerations(1);
-    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     // Spread — new reference, NOT in the WeakMap.
     const spread = { ...realPlan, orphans: [...realPlan.orphans] };
     expect(() => applyGenerationOrphanRecovery(spread, { cacheRoot })).toThrow(/GC_PLAN_UNAUTHENTICATED/);
@@ -495,7 +495,7 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
 
   it("rejects a plan with a cacheRoot mismatch (GC_PLAN_UNAUTHENTICATED)", () => {
     publishNGenerations(1);
-    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const realPlan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     // Pass a DIFFERENT cacheRoot in options — the applier re-derives
     // cacheRoot and rejects mismatches.
     const otherCacheRoot = freshCacheRoot("r169b-p0-other-");
@@ -521,8 +521,8 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
     const generations = generationsDir(FIXTURE_PROJECT_NAME, cacheRoot);
     const tempPath = join(generations, ".publish-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-abcdef0123456789.db");
     writeFileSync(tempPath, "fake temp content");
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
-    const result = applyGenerationOrphanRecovery(plan, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
+    const result = applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 });
     expect(result.deletedTempPaths.length).toBe(1);
     expect(existsSync(tempPath)).toBe(false);
   });
@@ -544,7 +544,7 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
     // NOT pick up non-canonical names.
     const badTempPath = join(generations, ".publish-not-a-uuid.db");
     writeFileSync(badTempPath, "bad temp content");
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     // The planner should NOT have picked up the non-canonical temp.
     const tempOrphans = plan.orphans.filter((o) => o.kind === "PROMOTION_TEMP");
     expect(tempOrphans.length).toBe(0);
@@ -554,9 +554,9 @@ describe("R169B-STEP10 (P0) — GenerationOrphanPlan authentication", () => {
 
   it("an authentic plan (from planGenerationOrphanRecovery) is accepted", () => {
     publishNGenerations(1);
-    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot });
+    const plan = planGenerationOrphanRecovery(FIXTURE_PROJECT_NAME, { cacheRoot, promotionTempGraceMs: 0 });
     // An authentic plan MUST NOT throw.
-    expect(() => applyGenerationOrphanRecovery(plan, { cacheRoot })).not.toThrow();
+    expect(() => applyGenerationOrphanRecovery(plan, { cacheRoot, promotionTempGraceMs: 0 })).not.toThrow();
   });
 });
 

@@ -580,6 +580,9 @@ export type GenerationStoreWarningCode =
   | "GC_DELETE_FAILED"
   // R169B-STEP3: GC safety-refusal (missing/corrupt metadata, etc.).
   | "GC_SAFETY_REFUSAL"
+  // R169B-STEP10 (§8): orphan plan stale (CAS revision or active
+  // manifest changed between plan and apply).
+  | "GC_PLAN_STALE"
   // R169B-STEP3: GC deletion incomplete (DB/metadata/fsync/commit
   // failure mid-deletion). Status stays DELETING; next GC re-attempts.
   | "GC_DELETE_INCOMPLETE"
@@ -1037,6 +1040,12 @@ export interface GenerationGcOptions {
   readonly retainCount?: number;
   readonly tmpMaxAgeMs?: number;
   readonly pin?: readonly string[];
+  /**
+   * R169B-STEP10 (§7): Grace period in ms for promotion temps. A temp
+   * younger than this is NOT swept — it may belong to an active publisher.
+   * Default: 60000 (60s). Set to 0 for tests.
+   */
+  readonly promotionTempGraceMs?: number;
 }
 
 /**

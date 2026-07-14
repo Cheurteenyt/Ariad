@@ -121,6 +121,16 @@ import { openCasStore } from "./internal/generation-cas-store.js";
 const DEFAULT_RETAIN_COUNT = 2;
 const DEFAULT_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * R169B-STEP10 (§7 POST-PUSH): Grace period for promotion temps.
+ * A promotion temp younger than this is NOT swept — it may belong to
+ * an active publisher that is between fsync(temp) and link(temp, final).
+ * 60 seconds is generous for the copy+hash+fsync+link sequence (which
+ * takes <1s for typical DBs) while still cleaning up crashed publishers
+ * promptly.
+ */
+const PROMOTION_TEMP_GRACE_MS = 60 * 1000;
+
 // ─── Plan authenticity token (private WeakMap) ──────────────────────────
 
 /**
@@ -1162,12 +1172,31 @@ function readFileSyncTextSafe(path: string, maxBytes: number): string {
 
 // ─── B1: Orphan Recovery ────────────────────────────────────────────────
 
+/**
+ * R169B-STEP10 (§7 POST-PUSH): Identity snapshot for an orphan entry.
+ * Captured at plan time so the applier can detect file replacement
+ * (dev/ino/size/mtimeMs change) between plan and apply.
+ */
+export interface OrphanIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
 export interface GenerationOrphanEntry {
   readonly path: string;
   readonly kind: "DB_ONLY" | "METADATA_ONLY" | "NOT_IN_CATALOG" | "PROMOTION_TEMP" | "ACTIVE_NOT_IN_CATALOG";
   readonly generationId: string | null;
   readonly observedAt: string;
   readonly reason: string;
+  /**
+   * R169B-STEP10 (§7): Identity snapshot for PROMOTION_TEMP entries.
+   * The applier re-lstats and compares before unlinking. If the
+   * identity changed (file was replaced by a concurrent publisher),
+   * the applier refuses to delete. null for non-PROMOTION_TEMP entries.
+   */
+  readonly identity: OrphanIdentity | null;
 }
 
 export interface GenerationOrphanPlan {
@@ -1187,6 +1216,7 @@ export function planGenerationOrphanRecovery(
     throw new GenerationStoreError("PROJECT_KEY_INVALID", phase, String(project), "project must be a non-empty string");
   }
   const cacheRoot = options?.cacheRoot ?? getCacheRoot();
+  const graceMs = options?.promotionTempGraceMs ?? PROMOTION_TEMP_GRACE_MS;
   assertTrustedRootNoSymlinks(cacheRoot, project, phase);
 
   const projectStore = projectStoreDir(project, cacheRoot);
@@ -1238,12 +1268,37 @@ export function planGenerationOrphanRecovery(
 
       // Promotion temps.
       if (/^\.publish-[0-9a-f-]+-[0-9a-f-]+\.db$/.test(ent.name)) {
+        const tempPath = join(generations, ent.name);
+        // R169B-STEP10 (§7): Capture identity (dev/ino/size/mtimeMs)
+        // so the applier can detect file replacement between plan and
+        // apply. Also enforce a grace period — only sweep temps older
+        // than PROMOTION_TEMP_GRACE_MS to avoid racing with an active
+        // publisher that is between fsync(temp) and link(temp, final).
+        let identity: OrphanIdentity | null = null;
+        let ageMs = 0;
+        try {
+          const st = lstatSync(tempPath);
+          if (st.isSymbolicLink() || !st.isFile()) {
+            // Not a regular file — skip (will be re-evaluated next pass).
+            continue;
+          }
+          ageMs = Date.now() - st.mtimeMs;
+          if (ageMs < graceMs) {
+            // Too new — might be an active publisher. Skip for now.
+            continue;
+          }
+          identity = { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs };
+        } catch {
+          // lstat failed — skip (file may have been removed).
+          continue;
+        }
         orphans.push({
-          path: join(generations, ent.name),
+          path: tempPath,
           kind: "PROMOTION_TEMP",
           generationId: null,
           observedAt: now,
-          reason: "promotion temp left by failed publication",
+          reason: `promotion temp left by failed publication (age=${Math.round(ageMs / 1000)}s)`,
+          identity,
         });
         continue;
       }
@@ -1256,7 +1311,7 @@ export function planGenerationOrphanRecovery(
         const metaPath = deriveMetadataPath(projectStore, gid);
 
         if (!catalogIds.has(gid) && !protectedIds.has(gid)) {
-          orphans.push({ path: dbPath, kind: "NOT_IN_CATALOG", generationId: gid, observedAt: now, reason: "DB not in CAS catalog" });
+          orphans.push({ path: dbPath, kind: "NOT_IN_CATALOG", generationId: gid, observedAt: now, reason: "DB not in CAS catalog", identity: null });
           continue;
         }
 
@@ -1264,7 +1319,7 @@ export function planGenerationOrphanRecovery(
           lstatSync(metaPath);
         } catch (err2) {
           if ((err2 as NodeJS.ErrnoException).code === "ENOENT") {
-            orphans.push({ path: dbPath, kind: "DB_ONLY", generationId: gid, observedAt: now, reason: "DB exists but metadata missing" });
+            orphans.push({ path: dbPath, kind: "DB_ONLY", generationId: gid, observedAt: now, reason: "DB exists but metadata missing", identity: null });
           }
           continue;
         }
@@ -1282,7 +1337,7 @@ export function planGenerationOrphanRecovery(
           lstatSync(dbPath);
         } catch (err2) {
           if ((err2 as NodeJS.ErrnoException).code === "ENOENT" && !protectedIds.has(gid)) {
-            orphans.push({ path: jsonPath, kind: "METADATA_ONLY", generationId: gid, observedAt: now, reason: "Metadata exists but DB missing" });
+            orphans.push({ path: jsonPath, kind: "METADATA_ONLY", generationId: gid, observedAt: now, reason: "Metadata exists but DB missing", identity: null });
           }
           continue;
         }
@@ -1292,7 +1347,7 @@ export function planGenerationOrphanRecovery(
   }
 
   if (activeGenerationId && !catalogIds.has(activeGenerationId)) {
-    orphans.push({ path: manifestPath, kind: "ACTIVE_NOT_IN_CATALOG", generationId: activeGenerationId, observedAt: now, reason: "Active manifest generation not in CAS catalog" });
+    orphans.push({ path: manifestPath, kind: "ACTIVE_NOT_IN_CATALOG", generationId: activeGenerationId, observedAt: now, reason: "Active manifest generation not in CAS catalog", identity: null });
   }
 
   const plan: GenerationOrphanPlan = {
@@ -1353,6 +1408,65 @@ export function applyGenerationOrphanRecovery(
     );
   }
 
+  // R169B-STEP10 (§8 POST-PUSH): Staleness check. Re-read the CAS
+  // revision and the active manifest. If either changed since the plan
+  // was created, the plan is stale — refuse to apply any mutations.
+  // This prevents the orphan applier from acting on a snapshot that
+  // no longer reflects the current state (e.g., a new publication or
+  // GC pass happened between plan and apply).
+  const casForStaleness = openCasStore(project, cacheRoot);
+  let currentCasRevision: number;
+  try {
+    currentCasRevision = casForStaleness.getRevision();
+  } finally {
+    casForStaleness.close();
+  }
+  if (currentCasRevision !== plan.casRevision) {
+    return {
+      project,
+      deletedTempPaths: [],
+      retainedOrphans: plan.orphans,
+      casRecovered: false,
+      warnings: [{
+        code: "GC_PLAN_STALE",
+        message: `Orphan plan stale: CAS revision changed from ${plan.casRevision} to ${currentCasRevision} between plan and apply`,
+      }],
+    };
+  }
+
+  // R169B-STEP10 (§8): Re-read the active manifest. If it changed, the
+  // plan is stale.
+  const manifestPathForStaleness = activeManifestPath(project, cacheRoot);
+  let currentActiveId: string | null = null;
+  try {
+    const m = readOptionalGenerationManifest(manifestPathForStaleness, project);
+    currentActiveId = m?.generationId ?? null;
+  } catch {
+    // If the manifest is corrupt, fail-closed — refuse to apply.
+    return {
+      project,
+      deletedTempPaths: [],
+      retainedOrphans: plan.orphans,
+      casRecovered: false,
+      warnings: [{
+        code: "GC_SAFETY_REFUSAL",
+        message: `Orphan plan stale: active manifest is corrupt/unreadable`,
+      }],
+    };
+  }
+  if (currentActiveId !== plan.activeGenerationId) {
+    return {
+      project,
+      deletedTempPaths: [],
+      retainedOrphans: plan.orphans,
+      casRecovered: false,
+      warnings: [{
+        code: "GC_PLAN_STALE",
+        message: `Orphan plan stale: active generation changed from ${plan.activeGenerationId} to ${currentActiveId} between plan and apply`,
+      }],
+    };
+  }
+
   assertTrustedRootNoSymlinks(cacheRoot, project, phase);
 
   const projectStore = projectStoreDir(project, cacheRoot);
@@ -1397,6 +1511,23 @@ export function applyGenerationOrphanRecovery(
             warnings.push({ code: "GC_DELETE_FAILED", message: `Orphan temp not a regular file: ${canonicalPath}` });
             retainedOrphans.push(orphan);
             continue;
+          }
+          // R169B-STEP10 (§7 POST-PUSH): Identity check. Compare the
+          // current dev/ino/size/mtimeMs to the plan's snapshot. If
+          // any field changed, the file was replaced by a concurrent
+          // publisher — refuse to delete.
+          if (orphan.identity) {
+            if (st.dev !== orphan.identity.dev ||
+                st.ino !== orphan.identity.ino ||
+                st.size !== orphan.identity.size ||
+                st.mtimeMs !== orphan.identity.mtimeMs) {
+              warnings.push({
+                code: "GC_DELETE_FAILED",
+                message: `Orphan temp identity changed (dev=${st.dev}/${orphan.identity.dev} ino=${st.ino}/${orphan.identity.ino} size=${st.size}/${orphan.identity.size} mtimeMs=${st.mtimeMs}/${orphan.identity.mtimeMs}) — file was replaced, refusing to delete: ${canonicalPath}`,
+              });
+              retainedOrphans.push(orphan);
+              continue;
+            }
           }
           unlinkSync(canonicalPath);
           deletedTempPaths.push(canonicalPath);
