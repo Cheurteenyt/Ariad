@@ -289,8 +289,9 @@ export function openCasStore(
 
   const projectStore = projectStoreDir(project, cacheRoot);
   // R169B-STEP10 (B4): use the shared leaf layout module.
+  // R169B-STEP10 (§11): pass the real parent so it gets fsynced on creation.
   try {
-    ensureDirDurable(projectStore, null);
+    ensureDirDurable(projectStore, dirname(projectStore));
   } catch (e) {
     throw new GenerationStoreError(
       "PUBLICATION_CAS_STATE_CORRUPT",

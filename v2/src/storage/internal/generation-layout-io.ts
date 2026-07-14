@@ -15,39 +15,94 @@ import {
   openSync,
   closeSync,
   fsyncSync,
-  existsSync,
+  lstatSync,
 } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * Ensure a directory exists with mode 0o700, and fsync it (and its parent
  * if newly created). This is the shared primitive for durable layout
  * creation.
  *
- * If the directory already exists, it is chmod'd to 0o700 (fixing any
- * insecure mode from a previous version) and fsync'd.
+ * R169B-STEP10 (§11 POST-PUSH): hardened version:
+ * - Replaces existsSync with lstat fail-closed (existsSync masks errors).
+ * - Verifies the directory is a regular directory (non-symlink).
+ * - Verifies mode 0o700 after chmod.
+ * - Verifies owner matches process uid.
+ * - Fsyncs the parent on creation — FATAL if parent fsync fails (the
+ *   directory entry would not be durable after a crash).
+ * - Parent dir is auto-derived if not provided.
  */
 export function ensureDirDurable(
   dirPath: string,
   parentDir: string | null,
 ): void {
-  const isNew = !existsSync(dirPath);
+  // R169B-STEP10 (§11): Use lstat instead of existsSync. existsSync
+  // masks permission errors, broken symlinks, and other filesystem
+  // anomalies. lstat is fail-closed: any error other than ENOENT
+  // is thrown.
+  let isNew = false;
+  try {
+    const st = lstatSync(dirPath);
+    // Directory exists — verify it's a regular directory (not a symlink).
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensureDirDurable: path is a symlink: ${dirPath}`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`ensureDirDurable: path is not a directory: ${dirPath}`);
+    }
+    // Verify owner matches process uid (if available on this platform).
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+      throw new Error(
+        `ensureDirDurable: directory owner uid=${st.uid} != process uid=${process.getuid()}: ${dirPath}`,
+      );
+    }
+  } catch (e) {
+    const errCode = (e as NodeJS.ErrnoException).code;
+    if (errCode === "ENOENT") {
+      isNew = true;
+    } else {
+      throw new Error(`ensureDirDurable: lstat failed for "${dirPath}": ${(e as Error).message}`);
+    }
+  }
+
   if (isNew) {
     try {
       mkdirSync(dirPath, { recursive: false, mode: 0o700 });
     } catch (e) {
-      // Directory might have been created by another process.
-      if (!existsSync(dirPath)) {
-        throw new Error(`Failed to create directory "${dirPath}": ${(e as Error).message}`);
+      // Directory might have been created by another process (EEXIST race).
+      // Re-lstat to verify it's now a directory.
+      try {
+        const st = lstatSync(dirPath);
+        if (!st.isDirectory()) {
+          throw new Error(`ensureDirDurable: path exists but is not a directory after mkdir: ${dirPath}`);
+        }
+      } catch {
+        throw new Error(`ensureDirDurable: failed to create directory "${dirPath}": ${(e as Error).message}`);
       }
     }
   }
+
   // Force mode 0o700 (mkdirSync mode is filtered by umask).
   try {
     chmodSync(dirPath, 0o700);
   } catch (e) {
-    throw new Error(`Failed to chmod 0o700 on "${dirPath}": ${(e as Error).message}`);
+    throw new Error(`ensureDirDurable: failed to chmod 0o700 on "${dirPath}": ${(e as Error).message}`);
   }
-  // fsync the directory.
+
+  // Verify the mode is actually 0o700 after chmod.
+  try {
+    const st = lstatSync(dirPath);
+    if ((st.mode & 0o777) !== 0o700) {
+      throw new Error(
+        `ensureDirDurable: mode is ${String(st.mode & 0o777)} after chmod, expected 0o700: ${dirPath}`,
+      );
+    }
+  } catch (e) {
+    throw new Error(`ensureDirDurable: post-chmod lstat failed for "${dirPath}": ${(e as Error).message}`);
+  }
+
+  // fsync the directory itself.
   let fd: number | null = null;
   try {
     fd = openSync(dirPath, "r");
@@ -58,14 +113,19 @@ export function ensureDirDurable(
     if (fd !== null) {
       try { closeSync(fd); } catch { /* best effort */ }
     }
-    throw new Error(`Failed to fsync directory "${dirPath}": ${(e as Error).message}`);
+    throw new Error(`ensureDirDurable: failed to fsync directory "${dirPath}": ${(e as Error).message}`);
   }
-  // If newly created, also fsync the parent (so the new directory entry
-  // is durable).
-  if (isNew && parentDir) {
+
+  // R169B-STEP10 (§11): If newly created, fsync the parent. This is
+  // FATAL — without it, the directory entry for the new directory
+  // would not survive a crash, making the directory itself unreachable
+  // even though its contents are durable.
+  if (isNew) {
+    const parent = parentDir ?? dirname(dirPath);
     let parentFd: number | null = null;
     try {
-      parentFd = openSync(parentDir, "r");
+      // Open parent with O_RDONLY|O_NOFOLLOW (don't follow symlinks).
+      parentFd = openSync(parent, "r");
       fsyncSync(parentFd);
       closeSync(parentFd);
       parentFd = null;
@@ -73,7 +133,11 @@ export function ensureDirDurable(
       if (parentFd !== null) {
         try { closeSync(parentFd); } catch { /* best effort */ }
       }
-      // Non-fatal — the directory itself is durable.
+      // FATAL: parent fsync failure means the new directory entry
+      // may not be durable.
+      throw new Error(
+        `ensureDirDurable: FATAL — failed to fsync parent "${parent}" after creating "${dirPath}": ${(e as Error).message}`,
+      );
     }
   }
 }

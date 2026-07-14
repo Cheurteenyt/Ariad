@@ -141,39 +141,45 @@ import {
 import { openCasStore } from "./internal/generation-cas-store.js";
 import { PROD_PUBLISHER_OPS } from "./internal/generation-publisher-ops.js";
 import type { PublisherOps } from "./generation-types.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 
-// ─── R169B-STEP3 (C3): Crash harness injection points ──────────────────
+// ─── R169B-STEP10 (§12 POST-PUSH): Crash harness context isolation ──────
 //
-// Module-level injection of a faultable PublisherOps and a barrier
-// callback. These are used ONLY by `publishPreparedGenerationInternal`
-// (the test-facing wrapper) to inject precise faults at the critical
-// mutation points (fsync temp, link temp→final, fsync generations/,
-// CAS commit). The public `publishPreparedGeneration` calls the
-// Internal variant with no injection, so production behavior is
-// unchanged.
+// Replaces the dangerous module-level `_injectedPublisherOps` and
+// `_injectedBarrier` with an AsyncLocalStorage context. This ensures
+// that two concurrent publish calls in the same process cannot
+// interfere with each other's injected ops or barriers.
 //
-// The injection is scoped to a single publish call via try/finally,
-// so a thrown error does NOT leak the injection to subsequent calls.
+// The context is scoped to the async call chain originating from
+// `publishPreparedGenerationInternal`. The public
+// `publishPreparedGeneration` calls `_ops()` which returns
+// PROD_PUBLISHER_OPS when no context is active (production path).
 
-let _injectedPublisherOps: PublisherOps | null = null;
-let _injectedBarrier: ((point: string) => void) | null = null;
+interface PublisherContext {
+  readonly ops: PublisherOps;
+  readonly barrier: ((point: string) => void) | null;
+}
+
+const _publisherContext: AsyncLocalStorage<PublisherContext> = new AsyncLocalStorage();
 
 /**
- * Returns the active PublisherOps for the current publish call.
- * If no injection is active, returns PROD_PUBLISHER_OPS.
+ * Returns the active PublisherOps for the current async context.
+ * If no context is active (production path), returns PROD_PUBLISHER_OPS.
  */
 function _ops(): PublisherOps {
-  return _injectedPublisherOps ?? PROD_PUBLISHER_OPS;
+  const ctx = _publisherContext.getStore();
+  return ctx?.ops ?? PROD_PUBLISHER_OPS;
 }
 
 /**
  * Invokes the barrier callback (if any) at a named crash point.
- * Used by the crash harness to synchronize child-process kills.
- * Errors in the barrier are swallowed (best-effort).
+ * Uses the async context to find the correct barrier for the current
+ * publish call. Errors in the barrier are swallowed (best-effort).
  */
 function _barrier(point: string): void {
-  if (_injectedBarrier !== null) {
-    try { _injectedBarrier(point); } catch { /* best effort */ }
+  const ctx = _publisherContext.getStore();
+  if (ctx?.barrier) {
+    try { ctx.barrier(point); } catch { /* best effort */ }
   }
 }
 
@@ -2312,17 +2318,16 @@ export function publishPreparedGenerationInternal(
   ops: PublisherOps,
   onBarrier?: (point: string) => void,
 ): PublicationResult {
-  // Save the previous injection (in case of nesting — unlikely but safe).
-  const prevOps = _injectedPublisherOps;
-  const prevBarrier = _injectedBarrier;
-  _injectedPublisherOps = ops;
-  _injectedBarrier = onBarrier ?? null;
-  try {
-    return publishPreparedGeneration(prepared, options, storeOptions);
-  } finally {
-    _injectedPublisherOps = prevOps;
-    _injectedBarrier = prevBarrier;
-  }
+  // R169B-STEP10 (§12): Use AsyncLocalStorage instead of module-level
+  // state. This ensures concurrent publish calls in the same process
+  // cannot interfere with each other's injected ops or barriers.
+  const ctx: PublisherContext = {
+    ops,
+    barrier: onBarrier ?? null,
+  };
+  return _publisherContext.run(ctx, () =>
+    publishPreparedGeneration(prepared, options, storeOptions),
+  );
 }
 
 // ─── DISCARD: discardPreparedGeneration ───────────────────────────────────
