@@ -117,8 +117,11 @@ interface BenchResult {
   errors: number;
 }
 
+// R169B (§23 PERF-04): use performance.now() for sub-millisecond precision.
+import { performance } from "node:perf_hooks";
+
 function nowMs(): number {
-  return Date.now();
+  return performance.now();
 }
 
 function populateStagingDb(dbPath: string, genIndex: number): void {
@@ -249,12 +252,9 @@ function runBenchmark(): BenchResult {
       const t4 = nowMs();
       phases.publishMs.push(t4 - t3);
 
-      // Track DB size.
-      try {
-        const fs = require("node:fs");
-        const st = fs.statSync(reservation.stagingPath);
-        dbSizes.push(st.size);
-      } catch { /* best effort */ }
+      // R169B (§23 PERF-01): Track DB size from prepared.manifest.sizeBytes
+      // (not statSync on staging — staging is deleted after publish).
+      dbSizes.push(prepared.manifest.sizeBytes);
 
       // Verify CAS revision is monotonic.
       if (result.cas.revision <= lastRevision) {
@@ -410,7 +410,7 @@ function formatResult(r: BenchResult): string {
   if (r.barriers) {
     const b = r.barriers;
     lines.push(`  PUBLISH sub-phases (barrier-to-barrier, avg ms/gen):`);
-    lines.push(`    copy+hash (start → pre-fsync-temp)   ${avg(b.preFsyncTemp).toFixed(2)}`);
+    lines.push(`    pre-fsync-temp (CAS+dedup+copy+hash)  ${avg(b.preFsyncTemp).toFixed(2)}`);
     lines.push(`    fsync(temp)                          ${avg(b.fsyncTemp).toFixed(2)}`);
     lines.push(`    lstat check (after-fsync → pre-link) ${avg(b.link).toFixed(2)}`);
     lines.push(`    link(temp, final)                    ${avg(b.linkSync).toFixed(2)}`);
@@ -422,10 +422,11 @@ function formatResult(r: BenchResult): string {
     lines.push(``);
   }
   if (r.dbBytes > 0) {
-    const mb = r.dbBytes / (1024 * 1024);
+    const totalMb = r.dbBytes / (1024 * 1024);
     const publishSec = r.phases.publishTotalMs / 1000;
-    const mbPerSec = publishSec > 0 ? (mb * r.generations) / publishSec : 0;
-    lines.push(`  DB size:      ${(mb / r.generations).toFixed(2)} MB/gen (${r.dbBytes} bytes total)`);
+    // R169B (§23 PERF-02): dbBytes is already the total — don't multiply by generations.
+    const mbPerSec = publishSec > 0 ? totalMb / publishSec : 0;
+    lines.push(`  DB size:      ${(totalMb / r.generations).toFixed(2)} MB/gen (${r.dbBytes} bytes total)`);
     lines.push(`  throughput:   ${mbPerSec.toFixed(1)} MB/s (publish phase)`);
     lines.push(``);
   }
