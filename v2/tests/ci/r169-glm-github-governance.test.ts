@@ -23,6 +23,9 @@ const ci = read(".github/workflows/ci.yml");
 const codeql = read(".github/workflows/codeql.yml");
 const codeowners = read(".github/CODEOWNERS");
 const operations = read("docs/GLM_GITHUB_OPERATIONS.md");
+const quota = read(".github/workflows/quota-report.yml");
+const storagePolicy = read("docs/GITHUB_ACTIONS_STORAGE_POLICY.md");
+const dependabot = read(".github/dependabot.yml");
 
 describe("R169 GLM PR broker", () => {
   it("is limited to same-repository v2/glm checkpoints", () => {
@@ -132,6 +135,26 @@ describe("R169 native authorization and exact-main recovery", () => {
     );
     expect(operations).toContain(
       "staging repository or a narrowly permissioned GitHub App",
+    );
+  });
+});
+
+describe("R169 Actions storage observability", () => {
+  it("uses validated owner configuration without an administrative workflow call", () => {
+    expect(quota).toContain(
+      "CACHE_LIMIT_GB: ${{ vars.ACTIONS_CACHE_LIMIT_GB }}",
+    );
+    expect(quota).toContain(
+      'max_cache_size_gb = positive_int_env("CACHE_LIMIT_GB")',
+    );
+    expect(quota).not.toContain("actions/cache/storage-limit");
+    expect(storagePolicy).toContain("`ACTIONS_CACHE_LIMIT_GB`");
+  });
+
+  it("disables branch-producing version PRs without disabling security updates", () => {
+    expect(dependabot.match(/open-pull-requests-limit: 0/g)).toHaveLength(3);
+    expect(dependabot).toContain(
+      "Repository-level Dependabot security updates remain",
     );
   });
 });
