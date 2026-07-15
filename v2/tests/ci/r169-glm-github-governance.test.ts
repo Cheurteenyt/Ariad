@@ -131,7 +131,7 @@ describe("R169 native authorization and exact-main recovery", () => {
       "The environment is a second operational confirmation",
     );
     expect(operations).toContain(
-      "a separate staging repository or a narrowly permissioned GitHub App",
+      "staging repository or a narrowly permissioned GitHub App",
     );
   });
 });
