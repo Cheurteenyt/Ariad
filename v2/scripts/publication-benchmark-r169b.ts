@@ -11,7 +11,7 @@
 //      reconcile + dedup + link + fsync + atomic manifest + verify +
 //      CAS update + COMMIT).
 //
-// Smoke mode (CBM_BENCH_SMOKE=1): 5 generations, 10 nodes each.
+// Smoke mode (--smoke or CBM_BENCH_SMOKE=1): 5 generations, 10 nodes each.
 // Full mode: 50 generations, 100 nodes each.
 //
 // The benchmark verifies the R169B invariants:
@@ -44,9 +44,13 @@ import {
 } from "../src/storage/generation-paths.js";
 import { CAS_DB_FILENAME } from "../src/storage/internal/generation-cas-store.js";
 import { openCasStore } from "../src/storage/internal/generation-cas-store.js";
-import { initIndexerSchema, updateProjectStats } from "../src/indexer/schema.js";
+import {
+  CURRENT_DISCOVERY_POLICY_VERSION,
+  initIndexerSchema,
+  updateProjectStats,
+} from "../src/indexer/schema.js";
 
-const SMOKE = process.env.CBM_BENCH_SMOKE === "1";
+const SMOKE = process.argv.includes("--smoke") || process.env.CBM_BENCH_SMOKE === "1";
 const N_GENERATIONS = SMOKE ? 5 : 50;
 const N_NODES = SMOKE ? 10 : 100;
 const N_EDGES = N_NODES;
@@ -115,6 +119,7 @@ interface BenchResult {
     casMonotonic: boolean;
   };
   errors: number;
+  errorMessages: string[];
 }
 
 // R169B (§23 PERF-04): use performance.now() for sub-millisecond precision.
@@ -163,7 +168,7 @@ function populateStagingDb(dbPath: string, genIndex: number): void {
     8, // extractorSemanticsVersion
     null, // indexError
     true, // aliasHistoryInitialized
-    2, // discoveryPolicyVersion
+    CURRENT_DISCOVERY_POLICY_VERSION,
     "/canonical/root:123:456",
   );
 
@@ -389,6 +394,7 @@ function runBenchmark(): BenchResult {
       casMonotonic,
     },
     errors: errors.length,
+    errorMessages: errors,
   };
 }
 
@@ -440,6 +446,10 @@ function formatResult(r: BenchResult): string {
   lines.push(`    no WAL sidecars: ${r.invariants.noWalSidecars ? "OK" : "FAIL"}`);
   lines.push(`    CAS monotonic:   ${r.invariants.casMonotonic ? "OK" : "FAIL"}`);
   lines.push(`  errors: ${r.errors}`);
+  if (r.errorMessages.length > 0) {
+    lines.push(`  error details:`);
+    for (const message of r.errorMessages) lines.push(`    - ${message}`);
+  }
   return lines.join("\n");
 }
 
