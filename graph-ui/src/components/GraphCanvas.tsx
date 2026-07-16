@@ -55,6 +55,7 @@ interface SimNode extends GraphNode {
   fy?: number | null;
   anchorX: number;
   anchorY: number;
+  rank: number;
 }
 
 interface SimEdge {
@@ -630,6 +631,28 @@ function nodeRadius(node: Pick<GraphNode, "size">): number {
   return Math.max(MIN_NODE_RADIUS, Math.min(MAX_NODE_RADIUS, size));
 }
 
+function traceEdges(
+  ctx: CanvasRenderingContext2D,
+  edges: SimEdge[],
+  nodeMap: Map<number, SimNode>,
+  selectedNodeId: number | null,
+  selectionOnly = false,
+) {
+  let hasPath = false;
+  for (const edge of edges) {
+    const source = nodeMap.get(simEdgeNodeId(edge.source));
+    const target = nodeMap.get(simEdgeNodeId(edge.target));
+    if (!source || !target) continue;
+    const touchesSelection = selectedNodeId != null
+      && (source.id === selectedNodeId || target.id === selectedNodeId);
+    if (selectionOnly !== touchesSelection) continue;
+    ctx.moveTo(source.x ?? 0, source.y ?? 0);
+    ctx.lineTo(target.x ?? 0, target.y ?? 0);
+    hasPath = true;
+  }
+  return hasPath;
+}
+
 function edgeKey(edge: { source: number; target: number; type: string }): string {
   return `${edge.source}\u0000${edge.target}\u0000${edge.type}`;
 }
@@ -681,6 +704,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   const domainCatalogRef = useRef<Map<string, { node_count: number; file_count: number }>>(new Map());
   const layoutNodeSpacingRef = useRef(DEFAULT_LAYOUT_NODE_SPACING);
   const localEdgesRef = useRef<SimEdge[]>([]);
+  const rawEdgeLayersRef = useRef<[SimEdge[], SimEdge[]]>([[], []]);
   const crossClusterEdgesRef = useRef<SimEdge[]>([]);
   const clusterBundleBatchesRef = useRef<Map<string, OverviewBundle[]>>(new Map());
   const clusterTrafficRef = useRef<Map<number, ScopeTraffic>>(new Map());
@@ -977,6 +1001,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       domainCatalogRef.current = new Map();
       layoutNodeSpacingRef.current = DEFAULT_LAYOUT_NODE_SPACING;
       localEdgesRef.current = [];
+      rawEdgeLayersRef.current = [[], []];
       crossClusterEdgesRef.current = [];
       clusterBundleBatchesRef.current = new Map();
       clusterTrafficRef.current = new Map();
@@ -1055,13 +1080,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     for (const key of incomingEdgeKeys) knownEdgeKeysRef.current.add(key);
     // Rebuild the nodeMap cache (used by draw()).
     const map = new Map<number, SimNode>();
-    for (const n of nodes) map.set(n.id, n);
+    for (const n of nodes) {
+      n.rank = 0;
+      map.set(n.id, n);
+    }
     nodeMapRef.current = map;
     const visibleClusterIds = new Set(nodes.map((node) => node.cluster_id).filter((id): id is number => id != null));
-    clustersRef.current = (data.layout?.clusters ?? []).filter((cluster) => visibleClusterIds.has(cluster.id));
+    clustersRef.current = (data.layout?.clusters ?? [])
+      .filter((cluster) => visibleClusterIds.has(cluster.id))
+      .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
     layoutNodeSpacingRef.current = data.layout?.node_spacing ?? DEFAULT_LAYOUT_NODE_SPACING;
     const visibleDomainIds = new Set(clustersRef.current.map((cluster) => cluster.domain_id));
-    domainsRef.current = (data.layout?.domains ?? []).filter((domain) => visibleDomainIds.has(domain.id));
+    domainsRef.current = (data.layout?.domains ?? [])
+      .filter((domain) => visibleDomainIds.has(domain.id))
+      .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
     domainCatalogRef.current = new Map(
       (data.layout?.domain_catalog?.domains ?? []).map((domain) => [domain.key, domain]),
     );
@@ -1073,15 +1105,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     for (const edge of edges) {
       const source = map.get(simEdgeNodeId(edge.source));
       const target = map.get(simEdgeNodeId(edge.target));
+      if (!source || !target) continue;
+      source.rank += 1;
+      target.rank += 1;
       // Legacy responses without cluster metadata retain their complete force
       // behavior. Hierarchical responses deliberately keep macro links out of
       // d3 so unrelated architecture domains cannot collapse into a hairball.
-      const isLocal = source?.cluster_id == null
-        || target?.cluster_id == null
+      const isLocal = source.cluster_id == null
+        || target.cluster_id == null
         || source.cluster_id === target.cluster_id;
       (isLocal ? localEdges : crossClusterEdges).push(edge);
     }
     localEdgesRef.current = localEdges;
+    let maxDegree = 1;
+    for (const node of nodes) maxDegree = Math.max(maxDegree, node.rank);
+    for (const node of nodes) node.rank = Math.sqrt(node.rank / maxDegree);
+    const localBackboneEdges: SimEdge[] = [];
+    const localDetailEdges: SimEdge[] = [];
+    for (const edge of localEdges) {
+      const source = map.get(simEdgeNodeId(edge.source))!;
+      const target = map.get(simEdgeNodeId(edge.target))!;
+      (source.rank > 0.51 || target.rank > 0.51
+        ? localBackboneEdges
+        : localDetailEdges).push(edge);
+    }
+    rawEdgeLayersRef.current = [localBackboneEdges, localDetailEdges];
     crossClusterEdgesRef.current = crossClusterEdges;
     const clusterBundlePlan = buildOverviewBundleBatches(
       edges,
@@ -1110,11 +1158,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     domainBundleBatchesRef.current = domainBundlePlan.batches;
     domainTrafficTiersRef.current = domainBundlePlan.trafficTiers;
     labelCandidatesRef.current = [...nodes]
-      .sort((nodeA, nodeB) => {
-        const structuralA = ["Project", "Package", "Module", "File", "Class", "Interface"].includes(nodeA.label) ? 0 : 1;
-        const structuralB = ["Project", "Package", "Module", "File", "Class", "Interface"].includes(nodeB.label) ? 0 : 1;
-        return structuralA - structuralB || nodeB.size - nodeA.size || nodeA.id - nodeB.id;
-      })
+      .sort((nodeA, nodeB) => nodeB.rank - nodeA.rank
+        || nodeB.size - nodeA.size || nodeA.id - nodeB.id)
       .slice(0, NEAR_LABEL_LIMIT);
     keyboardVisibleCountsRef.current = {
       domain: domainsRef.current.length,
@@ -1122,8 +1167,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       node: nodes.length,
     };
     keyboardTargetsRef.current = {
-      domain: [...domainsRef.current]
-        .sort((left, right) => right.node_count - left.node_count || left.id - right.id)
+      domain: domainsRef.current
         .slice(0, MAX_KEYBOARD_DOMAINS)
         .map((domain) => ({
           kind: "domain",
@@ -1133,8 +1177,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           y: domain.y,
           radius: domain.radius,
         })),
-      community: [...clustersRef.current]
-        .sort((left, right) => right.node_count - left.node_count || left.id - right.id)
+      community: clustersRef.current
         .slice(0, MAX_KEYBOARD_COMMUNITIES)
         .map((cluster) => ({
           kind: "community",
@@ -1349,6 +1392,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     // readable symbols rather than a hairball.
     const rawNodeOpacity = rawTopologyReveal
       * (0.78 + fadeBetween(projectedNodeSpacing, 22, 26) * 0.22);
+    const rawDetailReveal = fadeBetween(projectedNodeSpacing, 22, 30);
     const localEdgeOpacity = rawTopologyReveal
       * (0.18 + fadeBetween(projectedNodeSpacing, 22, 32) * 0.42);
     const crossEdgeOpacity = rawTopologyReveal
@@ -1640,40 +1684,32 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       ctx.restore();
     }
 
-    // Pass 1: default (non-highlighted) edges — single path, single stroke.
+    // Hub-connected links establish the raw backbone before quiet local
+    // links fade in. Each tier remains a single canvas batch.
     ctx.strokeStyle = rawTopology
       ? "rgba(100, 135, 158, 0.18)"
       : "rgba(100, 135, 158, 0.105)";
     ctx.lineWidth = (rawTopology ? 0.65 : 0.5) / tk;
-    ctx.globalAlpha = localEdgeOpacity;
-    ctx.beginPath();
-    const defaultEdges = localEdgeOpacity > 0 ? localEdgesRef.current : [];
-    for (const edge of defaultEdges) {
-      const sId = simEdgeNodeId(edge.source);
-      const tId = simEdgeNodeId(edge.target);
-      const source = nodeMap.get(sId);
-      const target = nodeMap.get(tId);
-      if (!source || !target) continue;
-      if (selectedNodeId != null && (source.id === selectedNodeId || target.id === selectedNodeId)) continue;
-      ctx.moveTo(source.x ?? 0, source.y ?? 0);
-      ctx.lineTo(target.x ?? 0, target.y ?? 0);
+    if (localEdgeOpacity > 0) {
+      ctx.globalAlpha = localEdgeOpacity;
+      ctx.beginPath();
+      traceEdges(ctx, rawEdgeLayersRef.current[0], nodeMap, selectedNodeId);
+      ctx.stroke();
+      if (rawDetailReveal > 0) {
+        ctx.globalAlpha *= rawDetailReveal;
+        ctx.beginPath();
+        traceEdges(ctx, rawEdgeLayersRef.current[1], nodeMap, selectedNodeId);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
     }
-    ctx.stroke();
-    ctx.globalAlpha = 1;
 
     if (crossEdgeOpacity > 0) {
       ctx.globalAlpha = crossEdgeOpacity;
       ctx.strokeStyle = "rgba(100, 135, 158, 0.18)";
       ctx.lineWidth = 0.65 / tk;
       ctx.beginPath();
-      for (const edge of crossClusterEdgesRef.current) {
-        const source = nodeMap.get(simEdgeNodeId(edge.source));
-        const target = nodeMap.get(simEdgeNodeId(edge.target));
-        if (!source || !target) continue;
-        if (selectedNodeId != null && (source.id === selectedNodeId || target.id === selectedNodeId)) continue;
-        ctx.moveTo(source.x ?? 0, source.y ?? 0);
-        ctx.lineTo(target.x ?? 0, target.y ?? 0);
-      }
+      traceEdges(ctx, crossClusterEdgesRef.current, nodeMap, selectedNodeId);
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
@@ -1684,20 +1720,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       ctx.globalAlpha = rawNodeOpacity;
       ctx.lineWidth = 1.2 / tk;
       for (const [group, groupedEdges] of edgeGroupsRef.current) {
-        let hasPath = false;
         ctx.beginPath();
-        for (const edge of groupedEdges) {
-          const sId = simEdgeNodeId(edge.source);
-          const tId = simEdgeNodeId(edge.target);
-          const source = nodeMap.get(sId);
-          const target = nodeMap.get(tId);
-          if (!source || !target) continue;
-          if (source.id !== selectedNodeId && target.id !== selectedNodeId) continue;
-          ctx.moveTo(source.x ?? 0, source.y ?? 0);
-          ctx.lineTo(target.x ?? 0, target.y ?? 0);
-          hasPath = true;
-        }
-        if (!hasPath) continue;
+        if (!traceEdges(ctx, groupedEdges, nodeMap, selectedNodeId, true)) continue;
         ctx.strokeStyle = EDGE_GROUP_STYLES[group];
         ctx.stroke();
       }
@@ -1712,6 +1736,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       const x = node.x ?? 0;
       const y = node.y ?? 0;
       const isHighlighted = activeHighlightedIds?.has(node.id) ?? false;
+      const isFocused = keyboardFocus?.kind === "node" && keyboardFocus.id === node.id;
+      const priorityReveal = rawDetailReveal
+        + (1 - rawDetailReveal) * (0.12 + 0.88 * node.rank);
+      const nodeOpacity = rawNodeOpacity
+        * (isHighlighted || isFocused || node.id === selectedNodeId ? 1 : priorityReveal);
       // Keep overview dots legible without inflating simulation collision
       // radii. The floor is expressed in screen pixels, so it disappears as
       // soon as semantic zoom makes the real node size readable.
@@ -1723,12 +1752,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fillStyle = color;
-      ctx.globalAlpha = rawNodeOpacity * (activeHighlightedIds && !isHighlighted ? 0.3 : 1);
+      ctx.globalAlpha = nodeOpacity * (activeHighlightedIds && !isHighlighted ? 0.3 : 1);
       ctx.fill();
       ctx.globalAlpha = 1;
 
       if (deadCodeView && node.status) {
-        ctx.globalAlpha = rawNodeOpacity;
+        ctx.globalAlpha = nodeOpacity;
         ctx.strokeStyle = colorForStatus(node.status);
         ctx.lineWidth = 1.4 / tk;
         ctx.stroke();
@@ -1747,7 +1776,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         ctx.globalAlpha = 1;
       }
 
-      if (keyboardFocus?.kind === "node" && keyboardFocus.id === node.id) {
+      if (isFocused) {
         ctx.beginPath();
         ctx.arc(x, y, r + 5 / tk, 0, Math.PI * 2);
         ctx.strokeStyle = "rgba(236, 254, 255, 0.98)";
@@ -1766,8 +1795,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       ctx.globalAlpha = previousAlpha * (1 - communityReveal * 0.55);
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
-      for (const domain of [...domainsRef.current]
-        .sort((left, right) => right.node_count - left.node_count || left.id - right.id)) {
+      for (const domain of domainsRef.current) {
         const title = domain.key;
         const exactDomain = domainCatalogRef.current.get(domain.key);
         const groupLabel = domain.cluster_count === 1 ? "group" : "groups";
@@ -1827,8 +1855,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       for (const cluster of [...clustersRef.current]
         .sort((left, right) => (
           Number(right.id === activeCommunityId) - Number(left.id === activeCommunityId)
-          || right.node_count - left.node_count
-          || left.id - right.id
         ))
         .slice(0, clusterLimit)) {
         const domainKey = domainById.get(cluster.domain_id)?.key;
