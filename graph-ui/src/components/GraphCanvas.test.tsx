@@ -416,6 +416,68 @@ describe("R45 (F5): GraphCanvas sim-reuse (R40 UI-2)", () => {
     expect(ctx.lineTo).toHaveBeenCalledTimes(2);
   });
 
+  it("reveals the connected backbone before quiet raw topology", () => {
+    const ctx = installCanvasMock(800, 600);
+    const ref = createRef<GraphCanvasHandle>();
+    let currentAlpha = 1;
+    const nodeFillAlphas: number[] = [];
+    Object.defineProperty(ctx, "globalAlpha", {
+      configurable: true,
+      get: () => currentAlpha,
+      set: (value: number) => { currentAlpha = value; },
+    });
+    ctx.fill.mockImplementation(() => nodeFillAlphas.push(currentAlpha));
+    const backboneData: GraphData = {
+      nodes: [
+        makeNode(1, "hub", { x: 0, y: 0 }),
+        makeNode(2, "hub-leaf-a", { x: -400, y: -160 }),
+        makeNode(3, "hub-leaf-b", { x: -200, y: 160 }),
+        makeNode(4, "hub-leaf-c", { x: 200, y: -160 }),
+        makeNode(5, "hub-leaf-d", { x: 400, y: 160 }),
+        makeNode(6, "quiet-a", { x: -400, y: 0 }),
+        makeNode(7, "quiet-b", { x: 400, y: 0 }),
+        makeNode(8, "isolated", { x: 0, y: 260 }),
+      ],
+      edges: [
+        { source: 1, target: 2, type: "CALLS" },
+        { source: 1, target: 3, type: "CALLS" },
+        { source: 1, target: 4, type: "CALLS" },
+        { source: 1, target: 5, type: "CALLS" },
+        { source: 6, target: 7, type: "CALLS" },
+      ],
+      total_nodes: 8,
+      topology_revision: "raw-connectivity-backbone",
+    };
+
+    render(
+      <GraphCanvas
+        ref={ref}
+        data={backboneData}
+        highlightedIds={null}
+        deadCodeView={false}
+        onNodeClick={() => {}}
+        onNodeHover={() => {}}
+      />,
+    );
+
+    const initialScale = ctx.scale.mock.calls.at(-1)[0] as number;
+    nodeFillAlphas.length = 0;
+    ctx.lineTo.mockClear();
+    act(() => ref.current?.zoomBy(20 / (16 * initialScale)));
+
+    expect(ctx.lineTo).toHaveBeenCalledTimes(4);
+    expect(nodeFillAlphas).toHaveLength(backboneData.nodes.length);
+    expect(nodeFillAlphas[0]).toBeGreaterThan(nodeFillAlphas[1]);
+    expect(nodeFillAlphas[1]).toBeGreaterThan(nodeFillAlphas[7]);
+
+    nodeFillAlphas.length = 0;
+    ctx.lineTo.mockClear();
+    act(() => ref.current?.zoomBy(32 / 20));
+
+    expect(ctx.lineTo).toHaveBeenCalledTimes(backboneData.edges.length);
+    expect(nodeFillAlphas).toEqual(backboneData.nodes.map(() => 1));
+  });
+
   it("restores cached positions after every node is filtered out", async () => {
     const { forceSimulation } = await import("d3-force");
     const ctx = installCanvasMock(800, 600);
