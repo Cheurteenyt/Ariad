@@ -11,10 +11,15 @@ describe("Stellar overview label information", () => {
     "add",
     "closeSync",
     "commit",
+    "fail",
     "handle",
+    "main",
     "option",
+    "parser",
     "request",
     "run",
+    "schema",
+    "sqlite",
   ])("rejects low-context project labels such as %s", (label) => {
     expect(LOW_CONTEXT_STELLAR_OVERVIEW_LABEL.test(label)).toBe(true);
   });
@@ -22,10 +27,7 @@ describe("Stellar overview label information", () => {
   it.each([
     "GraphTab",
     "CodeGraphReader",
-    "parser",
     "runBenchmark",
-    "schema",
-    "sqlite",
     "registerHumanCommand",
     "applyGenerationOrphanRecovery",
   ])("keeps specific project labels such as %s", (label) => {
