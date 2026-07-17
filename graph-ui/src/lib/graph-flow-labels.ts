@@ -8,10 +8,10 @@ export interface StellarFlowLabelAnchor {
 
 /**
  * Reserve the project-overview attention budget for names that carry context.
- * Generic operation identifiers remain available through search, zoom and
- * focus, but do not displace specific names in the initial constellation.
+ * Short isolated identifiers remain available through search, zoom and focus,
+ * but do not displace specific names in the initial constellation.
  */
-export const LOW_CONTEXT_STELLAR_OVERVIEW_LABEL = /^(?:anonymous.*|add|close(?:sync)?|commit|[gs]et|handle|now|option|push|request|run|st(?:art|op))$/i;
+export const LOW_CONTEXT_STELLAR_OVERVIEW_LABEL = /^(?:anonymous.*|closeSync|[a-z][a-z0-9_]{0,6})$/;
 
 /**
  * Put overview labels on the outside of the constellation. The radial anchor
