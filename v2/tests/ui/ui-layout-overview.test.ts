@@ -436,7 +436,18 @@ describe('Graph UI balanced overview contract', () => {
       exact: true,
       scope: { kind: 'directory', key: 'src', total_nodes: 3, total_internal_edges: 2 },
       page: { node_limit: 1, edge_limit: 1, returned_nodes: 1, returned_edges: 0 },
+      layout: {
+        strategy: 'exact-directory-file-v1',
+        node_spacing: 16,
+        counts_scope: 'all_nodes',
+      },
     });
+    expect(directoryScope.body.layout.domains).toEqual([
+      expect.objectContaining({ key: 'src', node_count: 3, cluster_count: 3 }),
+    ]);
+    expect(directoryScope.body.layout.clusters.map((cluster: { key: string }) => cluster.key))
+      .toEqual(['src/a.ts', 'src/anchor.ts', 'src/b.ts']);
+    expect(directoryScope.body.nodes[0].cluster_id).toEqual(expect.any(Number));
     expect(directoryScope.body.page.next_cursor).toEqual(expect.any(String));
 
     const nextScope = await fixture.getJson(
@@ -444,6 +455,7 @@ describe('Graph UI balanced overview contract', () => {
     );
     expect(nextScope.body.nodes.map((node: { id: number }) => node.id)).toEqual([2]);
     expect(nextScope.body.edges.map((edge: { id: number }) => edge.id)).toEqual([1]);
+    expect(nextScope.body.layout).toBeUndefined();
     expect((await fixture.getJson(
       `/api/scope?kind=domain&key=src&limit=1&cursor=${encodeURIComponent(scope.body.page.next_cursor)}`,
     )).status).toBe(400);

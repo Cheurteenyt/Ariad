@@ -395,3 +395,33 @@ tests**. Targeted backend scope/route tests, both typechecks, the Graph UI build
 and `build:package` pass. Existing gzip limits remain unchanged at Graph
 **39.09 / 40 KiB**, manifest CSS **11.81 KiB**, and manifest JavaScript
 **124.99 / 125 KiB**.
+
+## Structure exact-hierarchy follow-up - 2026-07-17
+
+The exact-directory fix made `v2/src` truthful, but its first 125 ID-ordered
+symbols occupied only three of the twelve directories in the scope. The former
+uniform disk and the first hierarchy draft therefore produced the same product
+failure in different forms: a sparse frame that did not communicate the code
+structure without loading more pages.
+
+The backend now computes one deterministic directory -> file -> symbol plan
+from the complete revision-bound membership. It is capped at 12 directory
+surfaces, 48 selected files, and at most one aggregate file surface per
+directory (60 file surfaces maximum). The first exact response for `v2/src`
+contains 12 directories and 54 file surfaces with exact all-node counts while
+still returning only 125 / 1,634 symbols and 125 edges. GraphCanvas paints that
+complete bounded architecture, but raw nodes and edges remain limited to the
+pages actually loaded.
+
+The layout metadata is 7,438 bytes inside a 64,562-byte first response. Five
+warm requests measured 14.0, 12.8, 12.4, 12.8, and 12.5 ms locally (12.8 ms
+median). Continuations omit the already retained layout: the immediate
+edge-only page drops from 9,000 to 1,552 bytes, and the next node-bearing page
+drops from 64,524 to 57,076 bytes. The plan is cached with exact membership;
+node coordinates are hash-stable across pages, and no Canvas per-frame scan,
+second renderer, or additional frontend request was added.
+
+The frontend passes **22 files / 176 tests**; the targeted V2 layout/route
+regressions pass, both V2 typechecks pass, and `build:package` passes. The
+unchanged limits remain green at Graph **39.14 / 40 KiB**, manifest CSS
+**11.76 KiB**, and manifest JavaScript **124.98 / 125 KiB**.

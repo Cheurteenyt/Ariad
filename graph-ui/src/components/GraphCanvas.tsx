@@ -1032,7 +1032,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   const onScopeSelectRef = useRef(onScopeSelect);
   const onNodeHoverRef = useRef(onNodeHover);
   useEffect(() => { onNodeClickRef.current = onNodeClick; }, [onNodeClick]);
-  useEffect(() => { onScopeSelectRef.current = onScopeSelect; }, [onScopeSelect]);
+  useEffect(() => {
+    onScopeSelectRef.current = detailMode ? undefined : onScopeSelect;
+  }, [detailMode, onScopeSelect]);
   useEffect(() => { onNodeHoverRef.current = onNodeHover; }, [onNodeHover]);
 
   const dragRef = useRef<{ node: SimNode | null; startX: number; startY: number }>({
@@ -1111,9 +1113,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   }, [animateToTransform, cancelPendingAutoFit]);
 
   const cycleKeyboardTarget = useCallback((kind: KeyboardTargetKind, direction: 1 | -1) => {
-    if (visualModeRef.current === "stellar" && kind !== "node") {
+    if (kind !== "node" && visualModeRef.current === "stellar") {
       if (keyboardStatusRef.current) {
-        keyboardStatusRef.current.textContent = "Dependencies browses symbols. Switch to Structure to browse domains and communities.";
+        keyboardStatusRef.current.textContent = "Symbols only in this view.";
       }
       return;
     }
@@ -1279,14 +1281,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       map.set(n.id, n);
     }
     nodeMapRef.current = map;
+    const completeLayout = data.layout?.counts_scope === "all_nodes";
     const visibleClusterIds = new Set(nodes.map((node) => node.cluster_id).filter((id): id is number => id != null));
     clustersRef.current = (data.layout?.clusters ?? [])
-      .filter((cluster) => visibleClusterIds.has(cluster.id))
+      .filter((cluster) => completeLayout || visibleClusterIds.has(cluster.id))
       .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
     layoutNodeSpacingRef.current = data.layout?.node_spacing ?? DEFAULT_LAYOUT_NODE_SPACING;
     const visibleDomainIds = new Set(clustersRef.current.map((cluster) => cluster.domain_id));
     domainsRef.current = (data.layout?.domains ?? [])
-      .filter((domain) => visibleDomainIds.has(domain.id))
+      .filter((domain) => completeLayout || visibleDomainIds.has(domain.id))
       .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
     domainCatalogRef.current = new Map(
       (data.layout?.domain_catalog?.domains ?? []).map((domain) => [domain.key, domain]),
@@ -2587,7 +2590,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       ctx.globalAlpha = previousAlpha;
     }
 
-    const structureLabelReveal = domainOverview ? 0.62 : communityReveal;
+    const structureLabelReveal = detailMode ? 1 : domainOverview ? 0.62 : communityReveal;
     if (!stellarFlow && structureLabelReveal && clustersRef.current.length) {
       const previousAlpha = ctx.globalAlpha;
       ctx.globalAlpha = previousAlpha * structureLabelReveal * (1 - rawTopologyReveal * 0.55);
@@ -2611,9 +2614,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const label = cluster.key.slice(prefix.length);
         const showSummary = cluster.id === activeCommunityId;
         const traffic = clusterTrafficRef.current.get(cluster.id);
+        const countScope = detailMode ? "exact" : "shown";
         const summary = traffic
-          ? `${compactArchitectureCount(cluster.node_count)} shown nodes · ${compactArchitectureCount(traffic.incoming)} in · ${compactArchitectureCount(traffic.outgoing)} out`
-          : `${compactArchitectureCount(cluster.node_count)} shown nodes`;
+          ? `${compactArchitectureCount(cluster.node_count)} ${countScope} nodes · ${compactArchitectureCount(traffic.incoming)} in · ${compactArchitectureCount(traffic.outgoing)} out`
+          : `${compactArchitectureCount(cluster.node_count)} ${countScope} nodes`;
         const labelX = cluster.x;
         const labelY = cluster.y - cluster.radius + 9 / tk;
         ctx.font = `650 ${clusterFontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
@@ -3531,7 +3535,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       <span id={keyboardInstructionsId} className="sr-only">
         {visualMode === "stellar"
           ? "Dependencies graph. Press N or Shift+N to browse up to 64 representative nodes. Select a node to place incoming relations on the left and outgoing relations on the right. Numbered rails show visible hop depth; relation colors and dash patterns are named in the guide. "
-          : "Structure map. Press D or Shift+D to browse up to 32 visible domains, C or Shift+C for up to 64 communities, and N or Shift+N for up to 64 representative nodes. "}
+          : detailMode
+            ? "Exact Structure. Press N to browse loaded symbols; the breadcrumb changes directory. "
+            : "Structure map. Press D or Shift+D to browse up to 32 visible domains, C or Shift+C for up to 64 communities, and N or Shift+N for up to 64 representative nodes. "}
         Press Enter or Space to activate the announced target.
         Arrow keys pan, plus and minus zoom, zero fits the active frame, and Escape goes up.
       </span>

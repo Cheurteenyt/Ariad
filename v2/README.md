@@ -100,7 +100,10 @@ drill-downs across the complete indexed project:
   reconstructs a domain or directory community on demand. Node batches are
   id-ordered; dense internal edges use bounded continuation pages. Every edge
   is emitted with the batch that introduces its highest-id endpoint, so merged
-  pages contain no duplicates or dangling links.
+  pages contain no duplicates or dangling links. The first page also carries the
+  revision-stable `exact-directory-file-v1` layout for the complete scope: at
+  most 12 directory surfaces and 60 file surfaces (48 selected files plus at
+  most one aggregate per directory), with exact all-node counts.
 - `GET /api/layout?project=my-app&max_nodes=2000` returns the sampled visual
   layout plus `layout.domain_catalog`, whose domain counts and representatives
   cover the complete project rather than only the visual sample.

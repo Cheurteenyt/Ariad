@@ -600,6 +600,56 @@ describe("R45 (F5): GraphCanvas sim-reuse (R40 UI-2)", () => {
     expect(sim.restart).not.toHaveBeenCalled();
   });
 
+  it("renders exact directory/file surfaces without false hierarchy drill-down", () => {
+    const ctx = installCanvasMock(800, 600);
+    const onScopeSelect = vi.fn();
+    const hierarchy: GraphData = {
+      nodes: [
+        makeNode(1, "login", { x: -20, y: 0, cluster_id: 0, file_path: "src/auth/login.ts" }),
+        makeNode(2, "token", { x: 20, y: 0, cluster_id: 1, file_path: "src/auth/token.ts" }),
+      ],
+      edges: [{ source: 1, target: 2, type: "CALLS" }],
+      total_nodes: 20,
+      topology_revision: "exact-hierarchy",
+      layout: {
+        strategy: "exact-directory-file-v1",
+        node_spacing: 16,
+        counts_scope: "all_nodes",
+        domains: [
+          { id: 0, key: "src/auth", x: 0, y: 0, radius: 150, node_count: 20, cluster_count: 2 },
+          { id: 1, key: "src/audit", x: 260, y: 0, radius: 70, node_count: 6, cluster_count: 1 },
+        ],
+        clusters: [
+          { id: 0, domain_id: 0, key: "src/auth/login.ts", x: -55, y: 0, radius: 45, node_count: 12 },
+          { id: 1, domain_id: 0, key: "src/auth/token.ts", x: 55, y: 0, radius: 45, node_count: 8 },
+          { id: 2, domain_id: 1, key: "src/audit/audit.ts", x: 260, y: 0, radius: 45, node_count: 6 },
+        ],
+      },
+    };
+
+    const { container } = render(
+      <GraphCanvas
+        data={hierarchy}
+        detailMode
+        highlightedIds={null}
+        deadCodeView={false}
+        onNodeClick={() => {}}
+        onScopeSelect={onScopeSelect}
+        onNodeHover={() => {}}
+      />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    expect(canvas).toHaveAttribute("aria-keyshortcuts", "D Shift+D C Shift+C N Shift+N Enter Space");
+    expect(ctx.fillText.mock.calls.some(([text]) => text === "src/auth")).toBe(true);
+    expect(ctx.fillText.mock.calls.some(([text]) => text === "login.ts")).toBe(true);
+    expect(ctx.fillText.mock.calls.some(([text]) => text === "src/audit")).toBe(true);
+    expect(ctx.fillText.mock.calls.some(([text]) => text === "audit.ts")).toBe(true);
+
+    fireEvent.keyDown(canvas, { key: "c" });
+    fireEvent.keyDown(canvas, { key: "Enter" });
+    expect(onScopeSelect).not.toHaveBeenCalled();
+  });
+
   it("reuses the same simulation across data changes (does not explode the graph)", async () => {
     const { forceSimulation } = await import("d3-force");
     const noop = () => {};

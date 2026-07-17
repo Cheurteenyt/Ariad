@@ -1,6 +1,6 @@
 # V2 Architecture — Codebase Memory V2
 
-> **Last verified:** 2026-07-15 at 0.76.0. R169A and R169B are merged;
+> **Last verified:** 2026-07-17 at 0.77.0-alpha.1. R169A and R169B are merged;
 > R169B is on `main` at
 > `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`.
 > **Activation boundary:** the generation-store resolver, publisher, CAS,
@@ -204,6 +204,18 @@ LRU order. This avoids both the former key collision with a homonymous
 community and an eager full-project descendant map. Selecting a community or a
 non-domain tree path enables the exact page immediately; continuation and edge
 membership stay in SQLite through a materialized `json_each` CTE.
+
+The exact scope is not laid out as one uniform symbol disk. Once per cached
+membership, the read bridge derives a deterministic `exact-directory-file-v1`
+plan from all exact nodes. Immediate directories become domains, files become
+communities, and symbols keep a stable hash-derived position inside their file.
+The plan is bounded to 12 directory surfaces and 48 selected files, with at
+most one `(other files)` aggregate per directory (60 file surfaces maximum).
+Counts are explicitly `all_nodes`; the Canvas therefore paints the complete
+bounded architecture even when the first page contains only 125 symbols. This
+uses the existing domain/community paths, collision packing, Canvas, and d3
+simulation. It adds no renderer, per-paint graph scan, eager descendant index,
+or extra frontend request.
 
 The UI is built and embedded in the npm package at `dist/ui/`. Runtime
 resolution uses `import.meta.url` so it works from any working directory.

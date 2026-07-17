@@ -25,7 +25,7 @@ vi.mock("./GraphCanvas", async () => {
       onNodeClick,
       onScopeSelect,
     }: {
-      data: { nodes: any[] };
+      data: { nodes: any[]; layout?: { strategy: string } };
       onNodeClick: (node: any) => void;
       onScopeSelect?: (scope: any) => void;
     },
@@ -41,6 +41,7 @@ vi.mock("./GraphCanvas", async () => {
     return (
       <>
         <output data-testid="graph-canvas-node-count">{data.nodes.length}</output>
+        <output data-testid="graph-canvas-layout">{data.layout?.strategy ?? "flat"}</output>
         <button
           type="button"
           aria-label="Select first graph node"
@@ -125,8 +126,18 @@ const exactScopeState = (loadMore = vi.fn()) => ({
       total_nodes: 3,
       total_internal_edges: 1,
     },
-    nodes: [makeNode(10, "exact-ten"), makeNode(20, "exact-twenty")],
+    nodes: [
+      { ...makeNode(10, "exact-ten"), cluster_id: 0 },
+      { ...makeNode(20, "exact-twenty"), cluster_id: 0 },
+    ],
     edges: [{ id: 1, source: 10, target: 20, type: "CALLS" }],
+    layout: {
+      strategy: "exact-directory-file-v1",
+      node_spacing: 16,
+      counts_scope: "all_nodes" as const,
+      clusters: [{ id: 0, domain_id: 0, key: "src/exact.ts", x: 0, y: 0, radius: 60, node_count: 3 }],
+      domains: [{ id: 0, key: "src", x: 0, y: 0, radius: 110, node_count: 3, cluster_count: 1 }],
+    },
     complete: false,
     page: {
       node_limit: 125,
@@ -371,6 +382,7 @@ describe("GraphTab server-refresh state reconciliation", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Open exact scope" }));
 
     await waitFor(() => expect(screen.getByTestId("graph-canvas-node-count")).toHaveTextContent("2"));
+    expect(screen.getByTestId("graph-canvas-layout")).toHaveTextContent("exact-directory-file-v1");
     expect(screen.getByText(/3 exact nodes/i)).toBeInTheDocument();
     expect(useExactScopeMock).toHaveBeenLastCalledWith(
       "test",
