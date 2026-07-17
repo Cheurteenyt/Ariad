@@ -105,6 +105,7 @@ function exactScopeGraphData(scope: GraphScopeData): GraphData {
     // Stable across pages in one scope so GraphCanvas retains the settled
     // physics objects while genuinely new nodes gently join the simulation.
     topology_revision: `scope:${scope.graph_revision}:${scope.scope.kind}:${scope.scope.key}`,
+    layout: scope.layout,
   };
 }
 
@@ -1002,7 +1003,6 @@ export function GraphTab({ project, active = true }: GraphTabProps) {
                       {highlightedIds.size.toLocaleString()} selected
                     </span>
                   )}
-                  <span className="ml-auto whitespace-nowrap font-sans text-[9px] uppercase tracking-[0.14em] text-foreground/35 group-open:text-cyan-200/60">Fidelity</span>
                 </summary>
                 <div className="border-t border-white/[0.07] px-3 py-2 font-mono leading-relaxed text-foreground/48">
                   <p>

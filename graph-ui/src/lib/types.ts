@@ -77,8 +77,8 @@ export interface GraphData {
     strategy: string;
     /** World-space node spacing used by semantic zoom thresholds. */
     node_spacing: number;
-    /** Hierarchy counts describe returned overview nodes, not hidden samples. */
-    counts_scope: "returned_nodes";
+    /** Whether hierarchy counts describe returned nodes or the complete exact scope. */
+    counts_scope: "returned_nodes" | "all_nodes";
     clusters: Array<{
       id: number;
       domain_id: number;
@@ -165,6 +165,8 @@ export interface GraphScopeData {
   };
   nodes: GraphNode[];
   edges: Array<GraphEdge & { id: number }>;
+  /** Stable exact hierarchy: directory domains contain bounded file groups. */
+  layout?: GraphData["layout"];
   complete: boolean;
   page: {
     node_limit: number;

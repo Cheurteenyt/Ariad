@@ -10,24 +10,29 @@ import { sendJson, colorForLabel } from '../helpers.js';
 import type { RouteContext } from '../types.js';
 import type { CodeNode, ExactScopeKind } from '../../bridge/sqlite-ro.js';
 import { architectureDomainKey, graphCommunityKey } from '../../graph-scope.js';
+import {
+  GOLDEN_ANGLE,
+  packGraphCircles,
+  roundGraphCoordinate,
+  stableGraphHash,
+  stableStringCompare,
+} from '../../graph-layout-primitives.js';
+import {
+  positionExactScopeLayoutNode,
+  type ExactScopeLayoutPlan,
+} from '../../exact-scope-layout.js';
 
 const STRUCTURAL_LABELS = new Set([
   'File', 'Module', 'Package', 'Namespace', 'Class', 'Interface', 'Trait', 'Enum',
 ]);
 const CALLABLE_LABELS = new Set(['Function', 'Method', 'Constructor']);
-const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 const CLUSTER_NODE_SPACING = 16;
 const CLUSTER_PADDING = 28;
 const CLUSTER_GAP = 36;
 const CLUSTER_SPIRAL_STEP = 48;
-const MIN_SPATIAL_CELL_SIZE = 128;
 const DOMAIN_PADDING = 58;
 const DOMAIN_GAP = 92;
 const DOMAIN_SPIRAL_STEP = 80;
-
-function stableStringCompare(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
 
 interface ClusterableNode {
   id: number;
@@ -98,19 +103,6 @@ function computeTopologyRevision(
   }
   for (const edge of edges) hash.update(`e:${edge.source}:${edge.target}:${edge.type};`);
   return `architecture-domain-v1:${hash.digest('base64url').slice(0, 22)}`;
-}
-
-function stableHash(value: string): number {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-function roundCoordinate(value: number): number {
-  return Math.round(value * 100) / 100;
 }
 
 export function ensureArchitectureDomainCoverage<T extends ClusterableNode>(
@@ -185,100 +177,6 @@ export function ensureArchitectureDomainCoverage<T extends ClusterableNode>(
   return nodes;
 }
 
-function packCircleItems<T extends { key: string; radius: number; x: number; y: number }>(
-  items: T[],
-  gap: number,
-  spiralStep: number,
-): void {
-  const packingOrder = [...items]
-    .sort((a, b) => b.radius - a.radius || stableStringCompare(a.key, b.key));
-  const medianRadius = packingOrder[Math.floor(packingOrder.length / 2)]?.radius ?? 0;
-  const typicalDiameter = medianRadius * 2 + gap;
-  const spatialCellSize = Math.max(MIN_SPATIAL_CELL_SIZE, typicalDiameter);
-  // Large nested domains need steps proportional to their envelope. Keep the
-  // established compact cluster geometry for ordinary small circles.
-  const effectiveSpiralStep = typicalDiameter > MIN_SPATIAL_CELL_SIZE * 2
-    ? Math.max(spiralStep, typicalDiameter * 0.5)
-    : spiralStep;
-  const placed: T[] = [];
-  let outerRadius = 0;
-  const spatialCells = new Map<string, Set<T>>();
-  const forEachSpatialCell = (
-    x: number,
-    y: number,
-    radius: number,
-    visit: (cellKey: string) => void,
-  ) => {
-    const minCellX = Math.floor((x - radius) / spatialCellSize);
-    const maxCellX = Math.floor((x + radius) / spatialCellSize);
-    const minCellY = Math.floor((y - radius) / spatialCellSize);
-    const maxCellY = Math.floor((y + radius) / spatialCellSize);
-    for (let cellX = minCellX; cellX <= maxCellX; cellX += 1) {
-      for (let cellY = minCellY; cellY <= maxCellY; cellY += 1) {
-        visit(`${cellX},${cellY}`);
-      }
-    }
-  };
-  const indexItem = (item: T) => {
-    forEachSpatialCell(item.x, item.y, item.radius, (cellKey) => {
-      const cell = spatialCells.get(cellKey);
-      if (cell) cell.add(item);
-      else spatialCells.set(cellKey, new Set([item]));
-    });
-  };
-  const overlapsPlaced = (item: T, candidateX: number, candidateY: number): boolean => {
-    const nearby = new Set<T>();
-    forEachSpatialCell(candidateX, candidateY, item.radius + gap, (cellKey) => {
-      for (const other of spatialCells.get(cellKey) ?? []) nearby.add(other);
-    });
-    for (const other of nearby) {
-      if (
-        Math.hypot(candidateX - other.x, candidateY - other.y)
-          < item.radius + other.radius + gap
-      ) return true;
-    }
-    return false;
-  };
-
-  let spiralIndex = 0;
-  for (const item of packingOrder) {
-    if (placed.length === 0) {
-      item.x = 0;
-      item.y = 0;
-      placed.push(item);
-      outerRadius = item.radius;
-      indexItem(item);
-      continue;
-    }
-
-    let found = false;
-    for (let attempt = 0; attempt < 50_000; attempt += 1) {
-      spiralIndex += 1;
-      const distance = effectiveSpiralStep * Math.sqrt(spiralIndex);
-      const angle = spiralIndex * GOLDEN_ANGLE;
-      const candidateX = Math.cos(angle) * distance;
-      const candidateY = Math.sin(angle) * distance;
-      if (overlapsPlaced(item, candidateX, candidateY)) continue;
-      item.x = candidateX;
-      item.y = candidateY;
-      found = true;
-      break;
-    }
-
-    if (!found) {
-      // The spiral bound is intentionally finite. Its fallback must still be
-      // collision-safe for adversarial radius distributions: place the item
-      // beyond the complete packed envelope rather than merely after the last
-      // item, which could overlap an earlier, larger circle.
-      item.x = outerRadius + item.radius + gap;
-      item.y = 0;
-    }
-    placed.push(item);
-    outerRadius = Math.max(outerRadius, Math.hypot(item.x, item.y) + item.radius);
-    indexItem(item);
-  }
-}
-
 /**
  * Seed a deterministic 2D technical map before d3 performs its gentle local
  * refinement. V1's strongest visual property was its directory clustering;
@@ -329,7 +227,7 @@ export function buildStructuredOverview(
     .sort(([keyA], [keyB]) => stableStringCompare(keyA, keyB))
     .map(([key, clusters], id) => {
       for (const cluster of clusters) cluster.domainId = id;
-      packCircleItems(clusters, CLUSTER_GAP, CLUSTER_SPIRAL_STEP);
+      packGraphCircles(clusters, CLUSTER_GAP, CLUSTER_SPIRAL_STEP);
 
       let minX = Number.POSITIVE_INFINITY;
       let minY = Number.POSITIVE_INFINITY;
@@ -364,7 +262,7 @@ export function buildStructuredOverview(
   // Keep top-level architecture domains visually distinct. Communities are
   // packed inside their domain first, then domains are packed as larger
   // collision-aware circles. This prevents unrelated roots from intermixing.
-  packCircleItems(domains, DOMAIN_GAP, DOMAIN_SPIRAL_STEP);
+  packGraphCircles(domains, DOMAIN_GAP, DOMAIN_SPIRAL_STEP);
   for (const domain of domains) {
     for (const cluster of domain.clusters) {
       cluster.x += domain.x;
@@ -374,7 +272,7 @@ export function buildStructuredOverview(
 
   const positions = new Map<number, StructuredPosition>();
   for (const cluster of alphabetical) {
-    const phase = (stableHash(cluster.key) / 0xffffffff) * Math.PI * 2;
+    const phase = (stableGraphHash(cluster.key) / 0xffffffff) * Math.PI * 2;
     const rankedNodes = [...cluster.nodes].sort((nodeA, nodeB) => {
       const structuralA = STRUCTURAL_LABELS.has(nodeA.label) ? 0 : 1;
       const structuralB = STRUCTURAL_LABELS.has(nodeB.label) ? 0 : 1;
@@ -390,8 +288,8 @@ export function buildStructuredOverview(
       const radius = index === 0 ? 0 : 14 + Math.sqrt(index) * CLUSTER_NODE_SPACING;
       const angle = phase + index * GOLDEN_ANGLE;
       positions.set(node.id, {
-        x: roundCoordinate(cluster.x + Math.cos(angle) * radius),
-        y: roundCoordinate(cluster.y + Math.sin(angle) * radius),
+        x: roundGraphCoordinate(cluster.x + Math.cos(angle) * radius),
+        y: roundGraphCoordinate(cluster.y + Math.sin(angle) * radius),
         clusterId: cluster.id,
       });
     });
@@ -403,16 +301,16 @@ export function buildStructuredOverview(
       id: cluster.id,
       domain_id: cluster.domainId,
       key: cluster.key,
-      x: roundCoordinate(cluster.x),
-      y: roundCoordinate(cluster.y),
+      x: roundGraphCoordinate(cluster.x),
+      y: roundGraphCoordinate(cluster.y),
       radius: cluster.radius,
       node_count: cluster.nodes.length,
     })),
     domains: domains.map((domain) => ({
       id: domain.id,
       key: domain.key,
-      x: roundCoordinate(domain.x),
-      y: roundCoordinate(domain.y),
+      x: roundGraphCoordinate(domain.x),
+      y: roundGraphCoordinate(domain.y),
       radius: domain.radius,
       node_count: domain.nodeCount,
       cluster_count: domain.clusters.length,
@@ -828,25 +726,9 @@ function decodeScopeCursor(
 
 function positionExactScopeNodes(
   nodes: ReturnType<typeof serializeUnpositionedGraphNodes>,
-  totalNodes: number,
-  kind: ExactScopeKind,
-  key: string,
+  layout: ExactScopeLayoutPlan,
 ) {
-  const radius = Math.max(80, Math.sqrt(Math.max(1, totalNodes)) * 20);
-  return nodes.map((node) => {
-    // Two independent deterministic hashes produce a uniform disk. Positions
-    // do not depend on page order, so loading more detail never teleports the
-    // nodes already being inspected.
-    const radialUnit = stableHash(`${kind}:${key}:${node.id}:radius`) / 0x1_0000_0000;
-    const angularUnit = stableHash(`${kind}:${key}:${node.id}:angle`) / 0x1_0000_0000;
-    const nodeRadius = Math.sqrt(radialUnit) * radius;
-    const angle = angularUnit * Math.PI * 2;
-    return {
-      ...node,
-      x: roundCoordinate(Math.cos(angle) * nodeRadius),
-      y: roundCoordinate(Math.sin(angle) * nodeRadius),
-    };
-  });
+  return nodes.map((node) => positionExactScopeLayoutNode(layout, node));
 }
 
 function decodeSearchCursor(
@@ -1050,14 +932,15 @@ export async function routeScope(
     return {
       page,
       nextCursor,
-      nodes: positionExactScopeNodes(serializedNodes, page.total_nodes, kind, key),
+      nodes: positionExactScopeNodes(serializedNodes, page.structure_layout),
+      layout: page.structure_layout.layout,
     };
   });
   if (!snapshot.ok) {
     sendGraphRevisionMismatch(res, snapshot.expected_graph_revision, snapshot.graph_revision);
     return;
   }
-  const { page, nextCursor, nodes } = snapshot.value;
+  const { page, nextCursor, nodes, layout } = snapshot.value;
 
   sendJson(res, 200, {
     contract_version: 1,
@@ -1070,6 +953,7 @@ export async function routeScope(
       total_internal_edges: page.total_internal_edges,
     },
     nodes,
+    layout: encodedCursor == null ? layout : undefined,
     edges: page.edges.map((edge) => ({
       id: edge.id,
       source: edge.source_id,

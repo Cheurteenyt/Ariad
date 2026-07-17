@@ -44,11 +44,9 @@ function ExactScopeHud({
             {selectedCount.toLocaleString()} selected
           </span>
         )}
-        <span className="ml-auto whitespace-nowrap text-[9px] uppercase text-foreground/35">Fidelity</span>
       </summary>
       <div className="border-t border-white/[0.07] px-3 py-2 font-mono leading-relaxed text-foreground/48">
         <p>{visibleEdges.toLocaleString()} visible edges · {totalInternalEdges.toLocaleString()} internal edges</p>
-        <p className="text-sky-200/45">Raw topology · revision</p>
       </div>
     </details>
   );

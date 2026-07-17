@@ -1136,3 +1136,36 @@ puis 8,1 ms et 7,0 ms à chaud ; le premier cadre utile a été visible en envir
 les régressions backend ciblées passent, `build:package` passe et les budgets
 restent inchangés : Graph **39,09 / 40 Kio**, CSS manifeste **11,81 Kio** et
 JavaScript manifeste **124,99 / 125 Kio**.
+
+## Addendum — hiérarchie exacte à l'intérieur de Structure (2026-07-17)
+
+Le scope `v2/src` était devenu exact, mais sa première page triée par identifiant
+ne couvrait visuellement que trois répertoires sur douze. Le disque uniforme
+historique et la première hiérarchie partielle avaient donc le même défaut
+produit : un grand espace vide qui obligeait à charger davantage de symboles
+pour comprendre l'architecture.
+
+Le backend calcule maintenant, une seule fois par appartenance mise en cache,
+un plan déterministe `répertoire -> fichier -> symbole` sur les 1 634 nœuds
+exacts. Le plan conserve au maximum douze surfaces répertoire, 48 fichiers
+sélectionnés et un agrégat `(other files)` par répertoire, soit au plus 60
+surfaces fichier. Les comptes portent explicitement sur tous les nœuds du
+scope. La première page peut ainsi montrer les douze répertoires et 54 groupes
+fichier tout en ne dessinant que les 125 symboles et 125 arêtes effectivement
+chargés.
+
+Cette hiérarchie réutilise le packing collision-safe, les chemins de rendu
+domaines/communautés, le même Canvas et la même simulation d3. Elle n'ajoute ni
+second moteur, ni scan par frame, ni requête frontend. Les coordonnées des
+symboles sont dérivées par hash stable et ne bougent pas entre les pages. Les
+surfaces de contexte ne sont pas transformées en faux drill-downs sémantiques.
+
+Sur la base produit, les métadonnées de layout pèsent 7 438 octets dans une
+première réponse totale de 64 562 octets. Cinq requêtes chaudes donnent une
+médiane de 12,8 ms. Les continuations ne répètent pas ce plan déjà conservé :
+la page d'arêtes suivante passe de 9 000 à 1 552 octets et la page suivante
+portant des nœuds de 64 524 à 57 076 octets. La suite frontend passe **22
+fichiers / 176 tests**, les régressions V2 ciblées et les deux
+typechecks passent, `build:package` passe, et les limites restent strictes :
+Graph **39,14 / 40 Kio**, CSS manifeste **11,76 Kio**, JavaScript manifeste
+**124,98 / 125 Kio**.

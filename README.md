@@ -313,7 +313,10 @@ d3-force canvas and two task views over the same graph:
     under persistent graph controls
   - **Exact scope** (on demand): selecting a community or filesystem directory
     replaces the representative frame with a revision-bound exact page inside
-    the same canvas; raw internal topology is shown immediately and dense
+    the same canvas. The backend adds a deterministic directory -> file ->
+    symbol plan computed from the complete exact membership, so the first page
+    already shows the whole bounded architecture while drawing only the loaded
+    symbols. Raw internal topology remains available immediately and dense
     scopes expose an explicit Load more action
 - **Projects tab**: Project list with node/edge counts and health status
 - **Control tab**: System info

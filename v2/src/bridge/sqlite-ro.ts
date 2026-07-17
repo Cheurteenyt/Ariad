@@ -12,6 +12,10 @@ import {
   graphNodeBelongsToDirectory,
   normalizeGraphPath,
 } from '../graph-scope.js';
+import {
+  buildExactScopeLayout,
+  type ExactScopeLayoutPlan,
+} from '../exact-scope-layout.js';
 
 export interface CodeNode {
   id: number;
@@ -74,6 +78,7 @@ export interface ExactScopePage {
   edges: CodeEdge[];
   total_nodes: number;
   total_internal_edges: number;
+  structure_layout: ExactScopeLayoutPlan;
   next_cursor: ExactScopeCursorState | null;
 }
 
@@ -171,6 +176,7 @@ interface ExactScopeMembership {
   nodeIds: number[];
   nodeIdsJson: string;
   totalInternalEdges: number | null;
+  structureLayout: ExactScopeLayoutPlan | null;
 }
 
 interface ProjectExactScopeIndex {
@@ -768,10 +774,14 @@ export class CodeGraphReader {
       this.exactScopeIndexes.set(cacheKey, index);
     }
 
-    const finalizeMembership = (nodeIds: number[]): ExactScopeMembership => ({
+    const finalizeMembership = (
+      nodeIds: number[],
+      layoutRows?: readonly ExactScopeIndexRow[],
+    ): ExactScopeMembership => ({
       nodeIds,
       nodeIdsJson: JSON.stringify(nodeIds),
       totalInternalEdges: null,
+      structureLayout: layoutRows ? buildExactScopeLayout(layoutRows, key) : null,
     });
 
     if (kind === 'directory') {
@@ -804,9 +814,12 @@ export class CodeGraphReader {
             normalizedKey.replace(/\//gu, '\\'),
             `${escapeLike(normalizedKey.replace(/\//gu, '\\'))}\\\\%`,
           ) as ExactScopeIndexRow[];
-      const membership = finalizeMembership(rows
-        .filter((row) => graphNodeBelongsToDirectory(row.file_path, row.label, normalizedKey))
-        .map((row) => row.id));
+      const matchingRows = rows
+        .filter((row) => graphNodeBelongsToDirectory(row.file_path, row.label, normalizedKey));
+      const membership = finalizeMembership(
+        matchingRows.map((row) => row.id),
+        matchingRows,
+      );
       while (index.directories.size >= MAX_EXACT_DIRECTORY_MEMBERSHIPS) {
         const oldest = index.directories.keys().next().value as string | undefined;
         if (oldest == null) break;
@@ -846,6 +859,7 @@ export class CodeGraphReader {
       nodeIds: [],
       nodeIdsJson: '[]',
       totalInternalEdges: 0,
+      structureLayout: buildExactScopeLayout([], key),
     };
   }
 
@@ -883,6 +897,17 @@ export class CodeGraphReader {
       : 0;
     const membership = this.getExactScopeMembership(project, kind, key);
     const totalNodes = membership.nodeIds.length;
+    if (membership.structureLayout == null) {
+      const layoutRows = this.db.prepare(
+        `SELECT id, file_path, label
+         FROM nodes
+         WHERE project = ?
+           AND id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+         ORDER BY id ASC`,
+      ).all(project, membership.nodeIdsJson) as ExactScopeIndexRow[];
+      membership.structureLayout = buildExactScopeLayout(layoutRows, key);
+    }
+    const structureLayout = membership.structureLayout;
     if (membership.totalInternalEdges == null) {
       membership.totalInternalEdges = (this.db.prepare(
         `WITH scope_nodes AS MATERIALIZED (
@@ -932,6 +957,7 @@ export class CodeGraphReader {
         edges: [],
         total_nodes: totalNodes,
         total_internal_edges: totalInternalEdges,
+        structure_layout: structureLayout,
         next_cursor: null,
       };
     }
@@ -991,6 +1017,7 @@ export class CodeGraphReader {
       edges,
       total_nodes: totalNodes,
       total_internal_edges: totalInternalEdges,
+      structure_layout: structureLayout,
       next_cursor: nextCursor,
     };
   }
