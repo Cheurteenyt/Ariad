@@ -446,5 +446,5 @@ No endpoint, simulation, renderer, or Canvas paint-loop scan was added. The
 frontend passes **22 files / 176 tests**, including regressions for exact-scope
 retention, visible relation emphasis, and loaded-only keyboard targets. Both
 frontend and V2 typechecks pass, `build:package` passes, and the unchanged gzip
-limits remain green at Graph **39.16 / 40 KiB**, manifest CSS **11.76 KiB**, and
-manifest JavaScript **125.00 / 125 KiB**.
+limits remain green at Graph **39.14 / 40 KiB**, manifest CSS **11.76 KiB**, and
+manifest JavaScript **124.98 / 125 KiB**.

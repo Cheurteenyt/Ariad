@@ -1191,5 +1191,5 @@ symboles chargés ; aucun zoom vide n'est donc proposé.
 Le correctif n'ajoute ni endpoint, ni requête, ni renderer, ni scan dans la
 boucle Canvas. La suite frontend passe **22 fichiers / 176 tests**, les
 typechecks frontend et V2 passent, `build:package` passe, et les budgets gzip
-restent stricts : Graph **39,16 / 40 Kio**, CSS manifeste **11,76 Kio** et
-JavaScript manifeste **125,00 / 125 Kio**.
+restent stricts : Graph **39,14 / 40 Kio**, CSS manifeste **11,76 Kio** et
+JavaScript manifeste **124,98 / 125 Kio**.
