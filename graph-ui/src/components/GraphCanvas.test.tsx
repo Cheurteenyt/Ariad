@@ -320,6 +320,46 @@ describe("R45 (F5): GraphCanvas sim-reuse (R40 UI-2)", () => {
     expect(labels.some((label) => String(label).startsWith("other ·"))).toBe(false);
   });
 
+  it("backfills colliding priority labels without scanning the complete graph per frame", () => {
+    const ctx = installCanvasMock(800, 600);
+    const ref = createRef<GraphCanvasHandle>();
+    const colliding = Array.from({ length: 18 }, (_, index) => makeNode(index + 1, `priority-${index + 1}`, {
+      x: 0,
+      y: 0,
+      size: 100 - index,
+    }));
+    const backfill = Array.from({ length: 20 }, (_, index) => makeNode(index + 19, `backfill-${index + 1}`, {
+      x: (index % 5 - 2) * 150,
+      y: (Math.floor(index / 5) - 1.5) * 80,
+      size: 10,
+    }));
+
+    render(
+      <GraphCanvas
+        ref={ref}
+        data={{
+          nodes: [...colliding, ...backfill],
+          edges: [],
+          total_nodes: colliding.length + backfill.length,
+          topology_revision: "adaptive-label-backfill",
+        }}
+        detailMode
+        highlightedIds={null}
+        deadCodeView={false}
+        onNodeClick={() => {}}
+        onNodeHover={() => {}}
+      />,
+    );
+
+    ctx.fillText.mockClear();
+    act(() => ref.current?.zoomBy(1));
+    const labels = ctx.fillText.mock.calls.map(([label]) => String(label));
+    expect(labels.length).toBeGreaterThan(3);
+    expect(labels.length).toBeLessThanOrEqual(18);
+    expect(labels.some((label) => label.startsWith("backfill-"))).toBe(true);
+    expect(labels.filter((label) => label.startsWith("priority-"))).toHaveLength(3);
+  });
+
   it("initializes a Stellar simulation without constructing discarded Architecture forces", async () => {
     const { forceSimulation } = await import("d3-force");
     render(

@@ -26,7 +26,6 @@ import {
 } from "../lib/graph-flow-labels";
 import {
   composeStellarFocusViewport,
-  stellarFocusLabelBudget,
   stellarFocusWorldBoxFitsViewport,
 } from "../lib/graph-focus-composer";
 import {
@@ -144,8 +143,6 @@ const MAX_CANVAS_PIXELS = 16_000_000;
 const DEFERRED_INITIAL_FIT_NODE_THRESHOLD = 500;
 const STELLAR_OVERVIEW_SIMULATION_NODE_THRESHOLD = 500;
 const MID_LABEL_LIMIT = 24;
-const NEAR_LABEL_LIMIT = 64;
-const STELLAR_OVERVIEW_LABEL_LIMIT = 12;
 const LOW_INFORMATION_STELLAR_LABEL = /^(?:anonymous#|add$|close(?:sync)?$|get$|handle$|now$|push$|request$|run$|set$|start$|stop$)/iu;
 const DEFAULT_LAYOUT_NODE_SPACING = 16;
 const DOMAIN_OVERVIEW_MAX_PROJECTED_SPACING = 7;
@@ -2803,26 +2800,29 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       width: width / backingScale.x,
       height: height / backingScale.y,
     };
-    const labelLimit = stellarFlow
-      ? (stellarFocused ? stellarFocusLabelBudget(viewport) : STELLAR_OVERVIEW_LABEL_LIMIT)
-      : rawTopologyReveal
-        && (denseSelection
-          ? 12
-          : projectedNodeSpacing < 32
-            ? MID_LABEL_LIMIT
-            : NEAR_LABEL_LIMIT);
+    const labelLimit = rawTopologyReveal
+      ? denseSelection
+        ? 12
+        : Math.max(8, Math.min(
+            stellarFocused ? 32 : stellarOverview ? 18 : projectedNodeSpacing < 32 ? 24 : 64,
+            Math.floor(viewport.width * viewport.height / 36_000),
+          ))
+      : 0;
+    const labelScanLimit = Math.min(labelLimit * 4, 96);
     const labelNodes: SimNode[] = [];
     const labelKeys = new Set<number | string>();
-    // The exact selected node remains first in the raw-topology label budget.
-    // Every other label, including a large highlighted neighborhood, shares
-    // the same bounded semantic-zoom budget.
+    // Required interaction targets remain first. The bounded scan then keeps
+    // looking past colliding candidates until the paint budget is actually
+    // filled, instead of spending the budget before placement.
     const addLabelNode = (node: SimNode | undefined) => {
-      if (!node || labelKeys.has(denseSelection ? node.name : node.id) || labelNodes.length >= labelLimit) return;
+      if (!node || labelKeys.has(denseSelection ? node.name : node.id) || labelNodes.length >= labelScanLimit) return;
       labelKeys.add(denseSelection ? node.name : node.id);
       labelNodes.push(node);
     };
+    addLabelNode(selectedNodeId != null ? nodeMap.get(selectedNodeId) : undefined);
+    addLabelNode(stellarPreviewNodeId != null ? nodeMap.get(stellarPreviewNodeId) : undefined);
+    addLabelNode(keyboardFocus?.kind === "node" ? nodeMap.get(keyboardFocus.id) : undefined);
     if (stellarFocused) {
-      addLabelNode(selectedNodeId != null ? nodeMap.get(selectedNodeId) : undefined);
       if (activeHighlightedIds) {
         for (const node of stellarFlowLabelCandidatesRef.current) {
           if (activeHighlightedIds.has(node.id)) addLabelNode(node);
@@ -2830,7 +2830,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }
       for (const node of stellarFlowLabelCandidatesRef.current) addLabelNode(node);
     } else {
-      addLabelNode(rawTopologyReveal && selectedNodeId != null ? nodeMap.get(selectedNodeId) : undefined);
       if (activeHighlightedIds && !denseSelection) {
         for (const id of activeHighlightedIds) addLabelNode(nodeMap.get(id));
       }
@@ -2846,7 +2845,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           || Math.abs((node.y ?? 0) * tk + ty) > height / backingScale.y / 2
         )) continue;
         addLabelNode(node);
-        if (labelNodes.length >= labelLimit) break;
+        if (labelNodes.length >= labelScanLimit) break;
       }
     }
 
@@ -2874,7 +2873,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }
     }
 
+    let placedLabelCount = 0;
     for (const node of labelNodes) {
+      if (placedLabelCount >= labelLimit) break;
       const rawLabel = node.name || node.qualified_name || String(node.id);
       const label = rawLabel.length > 34 ? `${rawLabel.slice(0, 31)}…` : rawLabel;
       const nodeX = node.x ?? 0;
@@ -2895,7 +2896,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
               nodeRadius(node),
               1 / tk,
             )
-        : [{ x: nodeX + nodeRadius(node) + 4 / tk, y: nodeY, align: "left" as const }];
+          : stellarFlowLabelAnchors(
+              undefined,
+              nodeX,
+              nodeY,
+              nodeRadius(node),
+              1 / tk,
+            );
       let placement: (typeof anchors)[number] | undefined;
       let placementBox: { left: number; right: number; top: number; bottom: number } | undefined;
       for (const anchor of anchors) {
@@ -2905,10 +2912,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           top: anchor.y - labelHeight / 2,
           bottom: anchor.y + labelHeight / 2,
         };
-        if (
-          stellarFocused
-          && !stellarFocusWorldBoxFitsViewport(box, transformRef.current, viewport)
-        ) continue;
+        if (!stellarFocusWorldBoxFitsViewport(box, transformRef.current, viewport)) continue;
         const collides = hitsOccupied(box, occupied);
         if (!collides || node.id === selectedNodeId) {
           placement = anchor;
@@ -2918,6 +2922,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }
       if (!placement || !placementBox) continue;
       occupied.push(placementBox);
+      placedLabelCount += 1;
       ctx.textAlign = placement.align;
       ctx.strokeStyle = "rgba(3, 8, 14, 0.94)";
       ctx.lineWidth = 3 / tk;

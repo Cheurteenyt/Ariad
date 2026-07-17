@@ -493,3 +493,29 @@ already precomputed flow batches and appear only in the Canvas focus label.
 The frontend passes **22 files / 180 tests**. Typecheck and production build
 pass without raising budgets: Graph **39.15 / 40 KiB**, manifest CSS
 **11.63 KiB**, and manifest JavaScript **125.00 / 125 KiB**.
+
+## Adaptive label placement follow-up - 2026-07-17
+
+The previous label pass ranked useful symbols correctly but spent its budget
+before collision placement. A dense center could therefore reject most of the
+first candidates without allowing later, readable symbols to fill the remaining
+attention slots. Structure also exposed only one right-facing anchor, and the
+safe viewport check applied only to a selected Dependencies frame.
+
+The shared Canvas pass now derives its paint budget from screen area with
+scene-specific caps. Selection, keyboard focus, and transient preview targets
+enter first; ranked candidates continue until the number of successfully placed
+labels reaches the paint budget. The candidate scan is at most four times that
+budget and never exceeds 96, independently of the 1,000-node sample. Structure
+reuses the three deterministic outside-first anchors from the flow grammar, and
+every symbol label now passes the graph-control viewport guard.
+
+No request, node scan, simulation mutation, coordinate change, or continuous
+optimizer was added. A regression starts with 18 deliberately colliding
+priority symbols and proves that useful lower-ranked labels backfill the frame
+without exceeding the adaptive limit. The frontend passes **22 files / 181
+tests**; frontend and V2 typechecks, the production build, and `build:package`
+pass. Unchanged limits remain green at Graph **39.15 / 40 KiB**, manifest CSS
+**11.63 KiB**, and manifest JavaScript **125.00 / 125 KiB**. The final packaged
+asset was served locally; keyboard preview, zoom, and view switching produced no
+browser log errors.

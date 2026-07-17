@@ -110,11 +110,3 @@ export function stellarFocusWorldBoxFitsViewport(
     && originY + box.top * transform.k >= 62 * verticalScale
     && originY + box.bottom * transform.k <= viewport.height - 124 * verticalScale;
 }
-
-/** Bounded attention budget derived from available label lanes, not node count. */
-export function stellarFocusLabelBudget(viewport: StellarFocusViewport): number {
-  const capacity = Math.floor(
-    Math.max(0, viewport.width - 100) * Math.max(0, viewport.height - 200) / 23_000,
-  );
-  return Math.max(10, Math.min(32, capacity));
-}

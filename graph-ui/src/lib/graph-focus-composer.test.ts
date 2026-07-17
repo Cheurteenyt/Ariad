@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   composeStellarFocusViewport,
-  stellarFocusLabelBudget,
   stellarFocusWorldBoxFitsViewport,
 } from "./graph-focus-composer";
 import type { StellarFlowTarget } from "./graph-stellar-layout";
@@ -93,11 +92,5 @@ describe("Stellar focus composer", () => {
       transform,
       viewport,
     )).toBe(false);
-  });
-
-  it("bounds label attention by the actual viewport", () => {
-    expect(stellarFocusLabelBudget({ width: 520, height: 760 })).toBe(10);
-    expect(stellarFocusLabelBudget({ width: 720, height: 900 })).toBe(18);
-    expect(stellarFocusLabelBudget({ width: 1_360, height: 900 })).toBe(32);
   });
 });
