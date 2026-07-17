@@ -23,6 +23,19 @@ describe("Stellar flow label anchors", () => {
     expect(first.map((anchor) => anchor.y)).toEqual([20, 6, 34]);
   });
 
+  it("gives Structure nodes stable outside-first collision fallbacks", () => {
+    expect(stellarFlowLabelAnchors(undefined, -40, 20, 8, 1)).toEqual([
+      { x: -54, y: 20, align: "right" },
+      { x: -54, y: 6, align: "right" },
+      { x: -54, y: 34, align: "right" },
+    ]);
+    expect(stellarFlowLabelAnchors(undefined, 40, -20, 8, 1)[0]).toEqual({
+      x: 54,
+      y: -20,
+      align: "left",
+    });
+  });
+
   it("anchors overview labels radially outside both sides of the constellation", () => {
     const left = stellarOverviewLabelAnchors(-180, 40, 8, 1);
     const right = stellarOverviewLabelAnchors(180, -40, 8, 1);

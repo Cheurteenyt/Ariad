@@ -164,7 +164,7 @@ In the unfocused frame, top-level project paths form contiguous elliptical
 sectors and small path families collapse into one quiet `other` sector. Colored
 boundary arcs and exact representative counts expose project structure without
 duplicating the Structure domain renderer. The hub halo and stronger
-backbone remain batched; a separate 12-label overview budget uses radial
+backbone remain batched; a separate 8–18 label screen-area budget uses radial
 collision candidates and excludes low-information names. Sector summaries,
 hub membership, and label candidates are all precomputed on semantic-frame
 changes, so the additional hierarchy does not add a graph scan per paint.
@@ -185,7 +185,13 @@ fan-outs retain the existing 760-unit vertical cap. This balances the directed
 frame before the camera fit instead of hiding nodes or applying a non-uniform
 transform. Labels are ranked once per semantic-frame change, receive a
 viewport-derived bounded budget, and are omitted before they can cross the safe
-screen rectangle.
+screen rectangle. Selection, keyboard focus, and the transient Dependencies
+preview enter the placement queue first. A collision consumes no paint slot:
+the pass continues through at most four budget windows and never beyond 96
+candidates. Structure symbols use the same three outside-first anchors as
+directed flow labels; only the direction policy differs. This backfills useful
+labels without scanning the complete graph, mutating d3, or introducing a
+per-frame optimizer.
 
 This boundary is deliberate: changing task view reuses every d3 node object,
 event listener, exactness contract, and canvas allocation. A view/focus change

@@ -317,9 +317,11 @@ d3-force canvas and two task views over the same graph:
     breadcrumb, and detail panel; panel/viewport resizes update that camera
     without reheating d3. Distant depths use monotonic compressed spacing and
     moderate fan-outs expand vertically, so constrained canvases can enlarge
-    the directed frame without merging rails. The label budget follows
-    available screen area and rejects text that would be clipped or hidden
-    under persistent graph controls
+    the directed frame without merging rails. Symbol labels share an adaptive
+    screen-area budget, deterministic outside-first collision fallbacks, and a
+    viewport guard that rejects text clipped or hidden under persistent graph
+    controls. Colliding priority labels are backfilled from at most four budget
+    windows, capped at 96 candidates per paint rather than the complete graph
   - **Exact scope** (on demand): selecting a community or filesystem directory
     replaces the representative frame with a revision-bound exact page inside
     the same canvas. The backend adds a deterministic directory -> file ->
@@ -361,10 +363,12 @@ undifferentiated particle ring. Major top-level paths occupy contiguous
 elliptical sectors with
 bounded colored arcs and exact representative counts; tiny paths collapse into
 one unlabeled `other` sector. Hub halos and the backbone remain visible, while
-the overview admits at most 12 radially anchored, collision-checked symbol
-labels and rejects generic names such as `now`, `close`, and `handle`. Sector,
-hub, and label plans are computed only when the semantic frame changes, not on
-Canvas paints. Inside those sectors, at most six server-authored communities
+the overview admits an 8–18 label screen-area budget of radially anchored,
+collision-checked symbols and rejects generic names such as `now`, `close`, and
+`handle`. Pointer/keyboard targets enter first, but labels consume the budget
+only after a valid placement is found. Sector, hub, and candidate plans are
+computed only when the semantic frame changes, not on Canvas paints. Inside
+those sectors, at most six server-authored communities
 with four or more shown nodes receive a muted path/count caption anchored to
 their highest-ranked informative symbol. These captions reuse the same collision
 boxes as sector, hub, and symbol labels. Non-semantic inner guide rings are

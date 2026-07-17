@@ -670,10 +670,13 @@ WebSocket pendant recherche, détail et pagination.
 Rendre la règle visible, ajouter éventuellement les filtres au contrat serveur
 et lier tout curseur aux filtres actifs.
 
-#### P1-5 — Budget adaptatif et profil dense
+#### P1-5 — Partiel : budget de labels adaptatif, profil dense restant
 
-Mesurer le coût par nœuds, arêtes, labels et DPR. Adapter le niveau de détail ou
-le nombre de représentants sans provoquer de saut de topologie.
+Le budget de labels suit maintenant la surface du viewport avec des plafonds
+propres à Structure, Dependencies overview et focus. Les collisions sont
+backfillées dans un scan borné à 96 candidats, sans saut de topologie. Le profil
+croisé nœuds + arêtes + labels + DPR reste nécessaire avant d'adapter le nombre
+de représentants ou les autres niveaux de détail.
 
 #### P1-6 — Partiel : parcours clavier renforcé, AA à auditer
 
@@ -689,7 +692,8 @@ Tester :
 - profondeur d’appel sous forme de couches 2D ;
 - légende relationnelle compacte ;
 - distinction plus forte entre surface de domaine et communauté ;
-- labels qui restent stables pendant le zoom.
+- labels stables pendant le zoom : ancres déterministes, garde viewport et
+  budget par paliers maintenant intégrés ; comparaison perceptuelle restante.
 
 Chaque variante doit être évaluée par tâche et non par préférence isolée.
 
@@ -1240,3 +1244,33 @@ dans le libellé Canvas du focus.
 La suite frontend passe **22 fichiers / 180 tests**. Le typecheck et le build de
 production passent sans relever les plafonds : Graph **39,15 / 40 Kio**, CSS
 manifeste **11,63 Kio** et JavaScript manifeste **125,00 / 125 Kio**.
+
+## Addendum — placement adaptatif des labels (2026-07-17)
+
+Le contrôle produit a isolé une faiblesse qui n'apparaissait pas dans le simple
+compte de candidats : le budget était consommé avant la collision. Douze labels
+prioritaires pouvaient donc produire beaucoup moins de douze noms visibles,
+sans laisser les candidats suivants occuper les espaces libres. Structure ne
+proposait en outre qu'une ancre à droite, et seul le focus Dependencies rejetait
+les boîtes passant sous le chrome du canvas.
+
+Le pipeline partagé applique désormais quatre règles :
+
+- le budget dépend de la surface du canvas et de paliers de densité, avec des
+  plafonds séparés pour Structure, Dependencies overview et focus ;
+- sélection, cible clavier et aperçu transitoire entrent avant les candidats
+  préclassés ; un label ne consomme le budget qu'après placement effectif ;
+- chaque symbole Structure possède trois ancres outside-first déterministes,
+  tandis que Dependencies conserve sa direction entrante/sortante ;
+- toutes les boîtes de symboles respectent les marges du viewport. Le backfill
+  examine au plus quatre fois le budget et jamais plus de 96 candidats.
+
+Il n'y a ni scan complet par frame, ni nouvel endpoint, ni mutation de la
+simulation, ni optimizer continu. La régression construit volontairement un
+front de candidats prioritaires superposés et vérifie que des candidats utiles
+suivants sont peints sans dépasser le budget. La validation courante passe
+**22 fichiers / 181 tests**, les typechecks frontend/V2, le build frontend et
+`build:package`. Les plafonds restent inchangés : Graph **39,15 / 40 Kio**,
+CSS manifeste **11,63 Kio** et JavaScript manifeste **125,00 / 125 Kio**. Le
+paquet final a été servi localement ; navigation clavier, zoom et changement de
+vue passent sans erreur navigateur.
