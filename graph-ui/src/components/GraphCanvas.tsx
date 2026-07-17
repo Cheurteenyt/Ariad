@@ -1287,7 +1287,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       .filter((cluster) => completeLayout || visibleClusterIds.has(cluster.id))
       .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
     layoutNodeSpacingRef.current = data.layout?.node_spacing ?? DEFAULT_LAYOUT_NODE_SPACING;
-    const visibleDomainIds = new Set(clustersRef.current.map((cluster) => cluster.domain_id));
+    const visibleDomainIds = new Set((data.layout?.clusters ?? [])
+      .filter((cluster) => visibleClusterIds.has(cluster.id))
+      .map((cluster) => cluster.domain_id));
     domainsRef.current = (data.layout?.domains ?? [])
       .filter((domain) => completeLayout || visibleDomainIds.has(domain.id))
       .sort((left, right) => right.node_count - left.node_count || left.id - right.id);
@@ -1377,13 +1379,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       .filter((node) => !/^anonymous#/.test(node.name))
       .sort((nodeA, nodeB) => nodeB.rank - nodeA.rank
         || nodeB.size - nodeA.size || nodeA.id - nodeB.id);
+    const keyboardDomains = completeLayout
+      ? domainsRef.current.filter((domain) => visibleDomainIds.has(domain.id))
+      : domainsRef.current;
+    const keyboardClusters = completeLayout
+      ? clustersRef.current.filter((cluster) => visibleClusterIds.has(cluster.id))
+      : clustersRef.current;
     keyboardVisibleCountsRef.current = {
-      domain: domainsRef.current.length,
-      community: clustersRef.current.length,
+      domain: keyboardDomains.length,
+      community: keyboardClusters.length,
       node: nodes.length,
     };
     keyboardTargetsRef.current = {
-      domain: domainsRef.current
+      domain: keyboardDomains
         .slice(0, MAX_KEYBOARD_DOMAINS)
         .map((domain) => ({
           kind: "domain",
@@ -1393,7 +1401,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           y: domain.y,
           radius: domain.radius,
         })),
-      community: clustersRef.current
+      community: keyboardClusters
         .slice(0, MAX_KEYBOARD_COMMUNITIES)
         .map((cluster) => ({
           kind: "community",
@@ -3536,7 +3544,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         {visualMode === "stellar"
           ? "Dependencies graph. Press N or Shift+N to browse up to 64 representative nodes. Select a node to place incoming relations on the left and outgoing relations on the right. Numbered rails show visible hop depth; relation colors and dash patterns are named in the guide. "
           : detailMode
-            ? "Exact Structure. Press N to browse loaded symbols; the breadcrumb changes directory. "
+            ? "Exact Structure. Press N to browse loaded symbols. "
             : "Structure map. Press D or Shift+D to browse up to 32 visible domains, C or Shift+C for up to 64 communities, and N or Shift+N for up to 64 representative nodes. "}
         Press Enter or Space to activate the announced target.
         Arrow keys pan, plus and minus zoom, zero fits the active frame, and Escape goes up.
