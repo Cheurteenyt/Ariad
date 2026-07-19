@@ -553,3 +553,106 @@ or about stronger non-MCP baselines.
 Any additional failure, invalid run, unavailable native metric, prompt
 deviation, or environment discrepancy discovered during execution must be
 appended here before publication.
+
+## 11. Corrected exact-lookup round (2026-07-20)
+
+This section appends a new controlled run; it does not replace or reinterpret
+the original result in section 8. The target checkout, twelve questions,
+reference answers, mechanical grading, model, reasoning effort, OS, and
+alternating condition order remained unchanged. The product candidate was
+`0.78.0-alpha.1` at `00ce12aa38847358e3cf895419b7425c5f2b0b60`, whose
+implementation commit is `6f1cb935e7adbc58dbd02a5f6e491fd279741b1f`.
+
+The only intended condition change was the addition of the read-only
+`lookup_source_text` tool to the MCP allow-list. It performs bounded,
+case-sensitive literal lookup over graph-owned source paths. The seven
+pre-existing tool names and contracts were unchanged. The grep/read condition
+was repeated unchanged so the paired comparison would use contemporaneous
+model and cache conditions.
+
+### 11.1 Run integrity and extraction
+
+- Codex CLI `0.144.4`, `gpt-5.6-sol`, reasoning `medium`, Windows 11,
+  Node.js `v24.15.0`, and npm `11.12.1` were unchanged.
+- A fresh full index of target `5915e0624ed4376611fdc1f824d1d65a327c4a2f`
+  contained 512 files, 10,665 nodes, 19,597 edges, and zero errors.
+- Odd tasks ran MCP then grep/read; even tasks ran grep/read then MCP. Every
+  measured task used a fresh ephemeral read-only Codex process.
+- An initial preflight series passed multiline prompts positionally. Windows
+  command-line parsing truncated or split some prompts. The defect was found
+  before T05; the entire series, including otherwise usable early runs, was
+  discarded and the experiment restarted from T01 using stdin. No result was
+  cherry-picked. Only logs prefixed `M-` were measured.
+- Before measured T10 MCP, one launcher invocation failed while parsing the
+  Windows TOML argument array. It produced a zero-byte JSONL file and no model
+  turn. The empty file and stderr were retained under an `invalid-` prefix, a
+  separate configuration preflight validated quoting, and T10 then received
+  its single measured model execution.
+- The complete raw JSONL and stderr streams are retained outside the target
+  checkout under `D:\benchmark\r171-results`; they are not committed because
+  they contain large runtime payloads. An inline PowerShell parser read only
+  `M-T*-*.jsonl`, selected the last completed agent message and native
+  `turn.completed.usage`, and counted completed `mcp_tool_call` or
+  `command_execution` items. It did not answer or semantically grade tasks.
+- All 24 measured answers exactly matched their pre-registered references.
+  The call audit found only the six allowed read-only MCP tools in the MCP arm
+  and only `rg`, `rg --files`, `Get-Content`, or `Select-String` evidence in the
+  grep/read arm. No write tool or forbidden evidence source was used.
+
+### 11.2 Aggregate comparison
+
+| Round | Condition | Runs | Input tokens | Cached input | Output tokens | Total tokens | Tool calls | PASS | PARTIAL | FAIL |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Original section 8 | MCP | 12 | 5,295,413 | 4,723,456 | 30,881 | 5,326,294 | 421 | 7 | 2 | 3 |
+| Original section 8 | grep/read | 12 | 581,005 | 484,608 | 3,715 | 584,720 | 23 | 12 | 0 | 0 |
+| Corrected exact lookup | MCP | 12 | 1,364,618 | 1,167,104 | 8,162 | 1,372,780 | 106 | 12 | 0 | 0 |
+| Contemporaneous repeat | grep/read | 12 | 560,258 | 461,568 | 3,612 | 563,870 | 23 | 12 | 0 | 0 |
+
+Against the original MCP round, the corrected MCP used **3,953,514 fewer
+tokens (74.2%)**, made **315 fewer calls (74.8%)**, and improved from seven
+exact passes to twelve. This directly repairs the observed accuracy failures
+and most of the retry-loop cost.
+
+It still does **not** beat the contemporaneous grep/read baseline. Corrected
+MCP used **1,372,780** total tokens versus **563,870**: 2.43 times as many, or
+a **-143.5% token reduction** under the pre-registered formula
+`1 - MCP_total / grep_total`. It made 106 calls versus 23 (4.61 times as many).
+Mean totals were 114,398 tokens per MCP task and 46,989 per grep/read task.
+The negative value remains a regression, not token savings.
+
+### 11.3 Corrected per-task results
+
+| Agent | Task | Condition | Input | Cached | Output | Total | Tool calls | Grade | Normalized answer |
+|---|---|---|---:|---:|---:|---:|---:|---|---|
+| Codex | T01 | MCP | 133,275 | 108,800 | 919 | 134,194 | 7 | PASS | Exact reference |
+| Codex | T01 | grep/read | 80,659 | 60,160 | 548 | 81,207 | 4 | PASS | Exact reference |
+| Codex | T02 | MCP | 49,066 | 40,192 | 195 | 49,261 | 1 | PASS | Exact reference |
+| Codex | T02 | grep/read | 30,913 | 30,208 | 159 | 31,072 | 1 | PASS | Exact reference |
+| Codex | T03 | MCP | 49,511 | 40,192 | 200 | 49,711 | 1 | PASS | Exact reference |
+| Codex | T03 | grep/read | 31,224 | 28,160 | 94 | 31,318 | 1 | PASS | Exact reference |
+| Codex | T04 | MCP | 69,686 | 58,368 | 355 | 70,041 | 2 | PASS | Exact reference |
+| Codex | T04 | grep/read | 46,883 | 33,024 | 295 | 47,178 | 2 | PASS | Exact reference |
+| Codex | T05 | MCP | 49,715 | 40,192 | 244 | 49,959 | 1 | PASS | Exact reference |
+| Codex | T05 | grep/read | 31,756 | 30,208 | 225 | 31,981 | 1 | PASS | Exact reference |
+| Codex | T06 | MCP | 49,258 | 40,192 | 200 | 49,458 | 1 | PASS | Exact reference |
+| Codex | T06 | grep/read | 31,466 | 26,112 | 253 | 31,719 | 1 | PASS | Exact reference |
+| Codex | T07 | MCP | 105,937 | 98,816 | 536 | 106,473 | 4 | PASS | Exact reference |
+| Codex | T07 | grep/read | 47,792 | 45,312 | 201 | 47,993 | 2 | PASS | Exact reference |
+| Codex | T08 | MCP | 127,897 | 107,776 | 801 | 128,698 | 10 | PASS | Exact reference |
+| Codex | T08 | grep/read | 72,128 | 51,456 | 370 | 72,498 | 2 | PASS | Exact reference |
+| Codex | T09 | MCP | 188,418 | 158,464 | 1,182 | 189,600 | 9 | PASS | Exact reference |
+| Codex | T09 | grep/read | 69,810 | 63,488 | 580 | 70,390 | 5 | PASS | Exact reference |
+| Codex | T10 | MCP | 49,266 | 44,288 | 384 | 49,650 | 1 | PASS | Exact reference |
+| Codex | T10 | grep/read | 31,909 | 24,064 | 255 | 32,164 | 1 | PASS | Exact reference |
+| Codex | T11 | MCP | 83,207 | 72,448 | 435 | 83,642 | 3 | PASS | Exact reference |
+| Codex | T11 | grep/read | 47,789 | 39,168 | 251 | 48,040 | 2 | PASS | Exact reference |
+| Codex | T12 | MCP | 409,382 | 357,376 | 2,711 | 412,093 | 66 | PASS | Exact reference |
+| Codex | T12 | grep/read | 37,929 | 30,208 | 381 | 38,310 | 1 | PASS | Exact reference |
+
+Input totals remain cumulative provider-reported input across model turns;
+cached input is a subset and was not subtracted. T12 is the clear remaining
+outlier: MCP eventually answered exactly, but used 412,093 tokens and 66 calls,
+more than its original 212,652 tokens and 54 calls. The new literal lookup is
+therefore validated for exact source evidence, while compact architecture/file
+inventory remains an independently measurable optimization target. This round
+does not justify adding another tool without a separately pre-registered scope.

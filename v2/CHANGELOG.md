@@ -19,6 +19,11 @@
   target commit. `nodes` and `call_sites` contain the correct 1-based lines;
   the observed wrong answers came from missing source-occurrence evidence in
   the existing payloads, not an indexer off-by-one.
+- Repeated the pre-registered 12-task benchmark with only the exact lookup
+  added to the MCP condition. MCP improved from 7 PASS / 2 PARTIAL / 3 FAIL to
+  12 PASS, reduced total tokens from 5,326,294 to 1,372,780 (74.2%), and cut
+  calls from 421 to 106 (74.8%). This is not presented as a baseline win:
+  contemporaneous grep/read still used only 563,870 tokens and 23 calls.
 
 ## 0.77.0-alpha.1 — structured and exact Graph UI (2026-07-16)
 

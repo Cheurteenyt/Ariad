@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/codebase-mirror
 branch: v2/r171-exact-lookup
 base_sha: 52a2dbb4745f29a6c353a5537079546140cbe4e3
-last_completed_code_sha: 6f1cb935e7adbc58dbd02a5f6e491fd279741b1f
+last_completed_code_sha: 00ce12aa38847358e3cf895419b7425c5f2b0b60
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-19T23:17:45Z
+updated_at_utc: 2026-07-19T23:41:09Z
 implementer_role: codex
 ```
 
@@ -93,7 +93,13 @@ working_directory: v2
 exit_code: 1
 result_summary: 1,525 passed / 534 failed across 152 files; failures are outside this change and reproduce unsupported Windows assumptions (`chmod`, `ls`, `2>/dev/null`, Unix mode checks, extensionless node_modules/.bin/tsx) plus resulting EPERM/timeout cascades. The affected exact-lookup/MCP/reader tests pass. Linux CI remains the broad-suite gate.
 
-not_run: exact 12-task post-fix agent benchmark; GitHub CI still pending
+command: 24 fresh ephemeral Codex executions, alternating MCP and grep/read
+working_directory: detached target D:\\benchmark\\codebase-mirror-5915e06
+exit_code: 0 for every measured run
+result_summary: all 24 answers exact; corrected MCP 12 PASS, 1,372,780 total tokens and 106 calls versus original MCP 7 PASS / 2 PARTIAL / 3 FAIL, 5,326,294 tokens and 421 calls; contemporaneous grep/read 12 PASS, 563,870 tokens and 23 calls
+raw_logs: D:\\benchmark\\r171-results\\M-T*-*.jsonl (external evidence, not committed)
+
+not_run: GitHub CI on the benchmark-evidence commit
 ```
 
 ## Reset recovery
@@ -121,12 +127,12 @@ npx vitest run tests/mcp/exact-source-lookup.test.ts
 
 - **Last completed finding:** R171-BENCH-F003 bounded exact-source lookup,
   targeted regressions, version/docs, and exact-target smoke.
-- **Current finding:** exact 12-task post-fix benchmark and CI evidence.
+- **Current finding:** GitHub CI, final audit, archive, merge, and mirror evidence.
 - **Dirty files expected:** `docs/ai/CURRENT_HANDOFF.md` until this checkpoint.
 - **Unpushed commits expected:** `0` before first checkpoint.
 - **Known blocker:** none.
-- **Single next action:** verify the pushed product checkpoint in GitHub CI,
-  then run the exact alternating 12-task MCP/grep benchmark without reruns.
+- **Single next action:** commit and push the benchmark evidence, then verify
+  GitHub CI on the exact candidate SHA.
 
 ## Security confirmation
 
