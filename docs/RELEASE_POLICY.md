@@ -1,7 +1,7 @@
 # Release Policy — Codebase Memory V2
 
 > **Status:** current
-> **Last verified:** 0.77.0-alpha.1 / 2026-07-16 audit
+> **Last verified:** 0.78.0-alpha.1 / 2026-07-20 exact-source lookup
 
 ## Overview
 
@@ -39,7 +39,7 @@ It is NOT bumped for:
 
 A GitHub Release is a public distribution event. It requires:
 
-1. **Immutable tag** (`v<version>`, e.g. `v0.77.0-alpha.1`).
+1. **Immutable tag** (`v<version>`, e.g. `v0.78.0-alpha.1`).
 2. **Full CI green** on the tagged commit.
 3. **Package smoke test**: `npm pack` + install in temp dir + `cbm-v2 --version`
    + `cbm-v2 --help` + UI serves from arbitrary cwd.
@@ -56,7 +56,7 @@ The first public release (a **pre-release**) should happen only after:
 - R169E: atomic generation publication activated and validated end to end
 - R170: project lease/fencing
 
-Suggested first pre-release: `v0.77.0-alpha.1`.
+Suggested first pre-release: `v0.78.0-alpha.1`.
 
 Do NOT create retroactive tags for past versions (0.73.x, 0.74.x). These
 were internal rounds, not public releases.
