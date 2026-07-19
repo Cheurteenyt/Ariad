@@ -1,6 +1,6 @@
 # V2 Current State — Codebase Memory V2
 
-> **Authoritative snapshot of the current product state (2026-07-15).**
+> **Authoritative snapshot of the current product state (2026-07-20).**
 > R169A and R169B are merged; R169B is on `main` at
 > `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`. Its reserve,
 > prepare/WAL/validate, fd copy+hash, temp fsync/no-clobber link, metadata,
@@ -18,7 +18,7 @@ Codebase Memory V2 is a **hybrid** code intelligence system:
 
 1. **V2 Native WASM Indexer** — 112 languages via `tree-sitter-wasm`; it indexes without invoking V1 and has its strongest cross-file precision on TS/JS.
 2. **V1 C Engine** — 158 languages via tree-sitter C. It is an optional, separately run database producer and historical reference, not an automatic fallback.
-3. **V2 Human Memory Layer** — ADRs, bug notes, refactor plans, conventions, risk assessments. Obsidian vault sync. Graph UI. 7 MCP tools.
+3. **V2 Human Memory Layer** — ADRs, bug notes, refactor plans, conventions, risk assessments. Obsidian vault sync. Graph UI. 8 MCP tools.
 
 `CodeGraphReader` can read databases produced by either indexer, but V2 does
 not launch V1 or hand work to it. A V1 database must be produced separately
@@ -1117,7 +1117,7 @@ Do NOT hardcode version numbers or test counts in documentation — always refer
   traversal on Windows
 - FTS5 full-text search (BM25 ranking)
 - Graph UI (2D d3-force, dashboard, filters, WebSocket)
-- 7 MCP tools (including flagship `prepare_edit_context`)
+- 8 MCP tools (including bounded exact source lookup and flagship `prepare_edit_context`)
 - Reports: hotspots, undocumented, risk
 - Backup: export/import JSON
 

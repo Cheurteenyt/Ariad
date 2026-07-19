@@ -1,5 +1,30 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.1 — bounded exact source lookup (2026-07-20)
+
+### MCP precision and token economy
+
+- Added the read-only `lookup_source_text` MCP tool for batched,
+  case-sensitive literal lookup with exact 1-based path, line, column, and
+  declaration text. It fills the source-evidence gap without changing any of
+  the seven existing tool names or contracts.
+- Confined reads to distinct graph-owned paths under the published project
+  root, with canonical symlink containment and explicit incomplete-scan
+  reasons. Calls are bounded to 10 literals, 20,000 indexed paths, 4 MiB per
+  file, 128 MiB total, and 50 returned occurrences per literal.
+- Added focused regressions for batched CRLF line accounting, independent
+  result truncation, traversal and symlink escape refusal, invalid batches,
+  MCP discovery, and the read-only tool annotations.
+- Audited the benchmark T07/T08 mismatch against a fresh index of the exact
+  target commit. `nodes` and `call_sites` contain the correct 1-based lines;
+  the observed wrong answers came from missing source-occurrence evidence in
+  the existing payloads, not an indexer off-by-one.
+- Repeated the pre-registered 12-task benchmark with only the exact lookup
+  added to the MCP condition. MCP improved from 7 PASS / 2 PARTIAL / 3 FAIL to
+  12 PASS, reduced total tokens from 5,326,294 to 1,372,780 (74.2%), and cut
+  calls from 421 to 106 (74.8%). This is not presented as a baseline win:
+  contemporaneous grep/read still used only 563,870 tokens and 23 calls.
+
 ## 0.77.0-alpha.1 — structured and exact Graph UI (2026-07-16)
 
 ### Graph fidelity and navigation

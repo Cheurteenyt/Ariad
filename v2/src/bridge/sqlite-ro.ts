@@ -1364,6 +1364,26 @@ export class CodeGraphReader {
   }
 
   /**
+   * Return distinct indexed source paths in deterministic order.
+   *
+   * Source-text lookup deliberately starts from graph-owned paths instead of
+   * walking the repository. This keeps the MCP read surface confined to the
+   * published project and avoids exposing ignored or unrelated files.
+   */
+  listProjectFilePaths(project: string, limit = 20_001): string[] {
+    const safeLimit = Math.max(0, Math.min(100_000, Math.floor(limit)));
+    if (safeLimit === 0) return [];
+    const rows = this.db.prepare(`
+      SELECT DISTINCT file_path
+      FROM nodes
+      WHERE project = ? AND file_path IS NOT NULL AND file_path != ''
+      ORDER BY file_path COLLATE BINARY ASC
+      LIMIT ?
+    `).all(project, safeLimit) as Array<{ file_path: string }>;
+    return rows.map((row) => row.file_path);
+  }
+
+  /**
    * Count incoming edges of one semantic type for a set of nodes.
    *
    * A node's generic in-degree includes structural CONTAINS/IMPORTS edges and

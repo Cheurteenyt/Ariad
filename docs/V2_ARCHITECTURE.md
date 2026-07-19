@@ -1,6 +1,6 @@
 # V2 Architecture — Codebase Memory V2
 
-> **Last verified:** 2026-07-17 at 0.77.0-alpha.1. R169A and R169B are merged;
+> **Last verified:** 2026-07-20 at 0.78.0-alpha.1. R169A and R169B are merged;
 > R169B is on `main` at
 > `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`.
 > **Activation boundary:** the generation-store resolver, publisher, CAS,
@@ -16,7 +16,7 @@ Codebase Memory V2 is a hybrid code intelligence system that combines:
 - A **native WASM indexer** (112 languages via tree-sitter) that builds a
   code graph in SQLite without requiring a C engine.
 - A **human memory graph** (SQLite) for notes, ADRs, and Obsidian sync.
-- An **MCP server** exposing 7 tools for code graph queries and human
+- An **MCP server** exposing 8 tools for code graph queries and human
   memory CRUD.
 - A **web-based graph UI** (React/Vite) served by the V2 backend.
 
@@ -97,7 +97,7 @@ V2 syncs human memory to/from Obsidian vaults:
 
 ## 8. MCP Server
 
-The MCP (Model Context Protocol) server exposes these 7 tools:
+The MCP (Model Context Protocol) server exposes these 8 tools:
 
 1. `get_project_overview` — summarize graph, human-memory, coverage, and freshness state
 2. `get_module_context` — return code and human context for one module or file
@@ -105,10 +105,11 @@ The MCP (Model Context Protocol) server exposes these 7 tools:
 4. `create_human_note` — create a human-memory note and optionally link code nodes
 5. `link_note_to_code_node` — link an existing note to an existing code node
 6. `search_code_and_memory` — search the code graph and human memory together
-7. `prepare_edit_context` — assemble dependency, risk, freshness, and note context before editing
+7. `lookup_source_text` — find bounded exact literals with 1-based source locations
+8. `prepare_edit_context` — assemble dependency, risk, freshness, and note context before editing
 
 Obsidian synchronization is a separate CLI/watch responsibility; none of the
-seven MCP tools is a vault-sync command.
+eight MCP tools is a vault-sync command.
 The stdio server negotiates MCP `2025-11-25`, `2025-06-18`, or legacy
 `2024-11-05`, rejects JSON-RPC batches, and keeps `tools/call` closed until a
 standalone initialize request is followed by `notifications/initialized`.

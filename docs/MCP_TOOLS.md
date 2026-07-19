@@ -1,8 +1,8 @@
 # MCP Tools Reference — Codebase Memory V2
 
-> Updated 2026-07-15 for version 0.76.0.
+> Updated 2026-07-20 for version 0.78.0-alpha.1.
 
-V2 exposes **7 MCP tools** via JSON-RPC 2.0 over stdio. This document describes each tool's input, output, and usage.
+V2 exposes **8 MCP tools** via JSON-RPC 2.0 over stdio. This document describes each tool's input, output, and usage.
 
 ## Connection
 
@@ -32,7 +32,7 @@ The server implements:
 - `tools/list` and `tools/call` methods
 - 10MB max line length (configurable via `MCP_MAX_LINE_LENGTH`)
 
-For MCP 2025 revisions, every listed tool includes the [standard MCP behavioral hints](https://modelcontextprotocol.io/specification/2025-11-25/schema#toolannotations). The five query
+For MCP 2025 revisions, every listed tool includes the [standard MCP behavioral hints](https://modelcontextprotocol.io/specification/2025-11-25/schema#toolannotations). The six query
 tools are marked read-only, idempotent, non-destructive, and closed-world. The
 two human-memory writers are marked additive, non-idempotent, non-destructive,
 and closed-world. These fields are advisory hints, not an authorization or
@@ -254,7 +254,59 @@ shortened by `limit`.
 
 **Output**: Balanced results with `rank`, `type` (`code` or `human`), and source-specific fields.
 
-### 7. `prepare_edit_context` ⭐ Flagship
+### 7. `lookup_source_text`
+
+**Purpose**: Resolve exact declaration values and source occurrence lines when
+the requested evidence is literal file text rather than a code-graph node name.
+It is intentionally not a regex engine, shell proxy, or broad composite search.
+
+**Input**:
+```json
+{
+  "project": "my-app",
+  "queries": ["MAX_RETRIES", "Dependency atlas:"],
+  "max_results_per_query": 20
+}
+```
+
+`queries` must contain 1 to 10 unique, case-sensitive, single-line literals,
+each at most 256 characters. `max_results_per_query` defaults to 20 and is
+bounded to `1..50`. Batching related literals avoids repeated agent round trips.
+
+**Output**:
+```json
+{
+  "project": "my-app",
+  "results": [
+    {
+      "query": "MAX_RETRIES",
+      "matches": [
+        {
+          "path": "src/config.ts",
+          "line": 12,
+          "column": 7,
+          "text": "const MAX_RETRIES = 5;"
+        }
+      ],
+      "matches_truncated": false
+    }
+  ],
+  "files_scanned": 42,
+  "bytes_scanned": 180234,
+  "scan_complete": true
+}
+```
+
+Paths use `/`; lines and columns are 1-based. Source text is capped to a
+500-character excerpt and marked `text_truncated` when shortened. The tool
+searches only distinct paths already owned by the selected code graph, resolves
+the published project root, follows each path to its real target, and refuses
+traversal or symlink escapes. It scans at most 20,000 indexed paths, 4 MiB per
+file, and 128 MiB total. Unsafe, unreadable, binary, oversized, or budget-skipped
+files make `scan_complete` false and appear in `scan_incomplete_reasons`; an
+answer must not be treated as exhaustive in that state.
+
+### 8. `prepare_edit_context` ⭐ Flagship
 
 **Purpose**: Call this BEFORE editing any source file. Returns everything the agent needs to know: code structure, dependencies, linked human notes, blast radius, risk assessment, conventions, and stale data warnings.
 

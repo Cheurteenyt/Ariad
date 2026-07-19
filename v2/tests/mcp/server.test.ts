@@ -77,7 +77,7 @@ describe('MCP server protocol compliance', () => {
     expect(pingResp!.result).toEqual({});
   });
 
-  it('lists 7 tools', async () => {
+  it('lists 8 tools', async () => {
     const responses = await runMcpSession(
       [
         JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
@@ -96,7 +96,8 @@ describe('MCP server protocol compliance', () => {
     expect(toolNames).toContain('link_note_to_code_node');
     expect(toolNames).toContain('search_code_and_memory');
     expect(toolNames).toContain('prepare_edit_context');
-    expect(toolNames.length).toBe(7);
+    expect(toolNames).toContain('lookup_source_text');
+    expect(toolNames.length).toBe(8);
 
     const readOnlyTools = listResp!.result.tools.filter((tool: any) =>
       !['create_human_note', 'link_note_to_code_node'].includes(tool.name),
@@ -125,6 +126,12 @@ describe('MCP server protocol compliance', () => {
       type: 'integer',
       minimum: 1,
       maximum: 200,
+    });
+    const lookupTool = listResp!.result.tools.find((tool: any) => tool.name === 'lookup_source_text');
+    expect(lookupTool.inputSchema.properties.queries).toMatchObject({
+      type: 'array',
+      minItems: 1,
+      maxItems: 10,
     });
   });
 
@@ -214,7 +221,7 @@ describe('MCP server protocol compliance', () => {
     );
     expect(responses.find((r) => r.id === 1)?.result.protocolVersion).toBe('2024-11-05');
     const tools = responses.find((r) => r.id === 2)?.result.tools;
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(8);
     expect(tools.every((tool: any) => tool.annotations === undefined)).toBe(true);
   });
 

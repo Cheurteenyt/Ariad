@@ -41,7 +41,7 @@ v2/
 │   ├── human/          # Human memory DB (SQLite, CRUD, schema)
 │   ├── obsidian/       # Vault sync (generator, importer, frontmatter, wikilinks)
 │   ├── bridge/         # Read-only access to code graph (V1 or V2 native)
-│   ├── mcp/            # MCP server + 7 tools
+│   ├── mcp/            # MCP server + 8 tools
 │   ├── intelligence/   # Graph status, freshness, SWR cache
 │   ├── cli/            # CLI commands (commander-based, including `index`)
 │   ├── reports/        # Hotspots, undocumented, risk reports

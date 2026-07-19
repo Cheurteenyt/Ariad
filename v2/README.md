@@ -50,7 +50,8 @@ node dist/cli/index.js mcp --project my-app
 
 ## MCP integration
 
-The MCP server exposes 7 tools for code graph queries and human memory CRUD.
+The MCP server exposes 8 tools for code graph queries and human memory CRUD,
+including bounded exact-literal source lookup with 1-based locations.
 Those tools do not synchronize the Obsidian vault; use the separate
 `cbm-v2 obsidian ...` commands or `cbm-v2 watch` for vault synchronization.
 See the [MCP Tools documentation](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/MCP_TOOLS.md)
@@ -140,5 +141,5 @@ mixing two graph states.
 ## Pre-release notice
 
 This package is not yet published to npm. The first public release will
-be a pre-release (`v0.77.0-alpha.1`) after atomic generation publication
+be a pre-release (`v0.78.0-alpha.1`) after atomic generation publication
 (R169) and project lease/fencing (R170) are complete.

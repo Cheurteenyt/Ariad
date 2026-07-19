@@ -126,9 +126,10 @@ For a team of 10 developers: **~$41/month, ~$492/year**.
 
 1. **Always call `prepare_edit_context` before editing** — it's the single most token-efficient call
 2. **Call `get_project_overview` first** — it tells you if data is stale and what needs attention
-3. **Use `search_code_and_memory` for exploration** — unified search saves a round-trip
-4. **Create notes via `create_human_note`** — one DB call can create and link the note; run Obsidian sync separately when vault output is required
-5. **Check `graph_status.freshness_label`** — if STALE or worse, recommend re-indexing before trusting the data
-6. **Respect the `recommendation` field** — it tells you "SAFE TO EDIT" or "PROCEED WITH CAUTION" with specific warnings
-7. **Use `blast_radius` to gauge impact** — if `affected_routes > 0`, your edit could break HTTP endpoints
+3. **Use `lookup_source_text` for known literals or constants** — batch up to 10 exact strings and get their values and 1-based lines in one bounded call
+4. **Use `search_code_and_memory` for exploration** — unified graph/memory search saves a round-trip, but it does not search arbitrary source text
+5. **Create notes via `create_human_note`** — one DB call can create and link the note; run Obsidian sync separately when vault output is required
+6. **Check `graph_status.freshness_label`** — if STALE or worse, recommend re-indexing before trusting the data
+7. **Respect the `recommendation` field** — it tells you "SAFE TO EDIT" or "PROCEED WITH CAUTION" with specific warnings
+8. **Use `blast_radius` to gauge impact** — if `affected_routes > 0`, your edit could break HTTP endpoints
 

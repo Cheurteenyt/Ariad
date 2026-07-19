@@ -1,6 +1,6 @@
 # Documentation Index
 
-> **Last verified:** 0.77.0-alpha.1 / 2026-07-17 Graph UI audit
+> **Last verified:** 0.78.0-alpha.1 / 2026-07-20 exact-source lookup
 
 ## Current Documentation
 
