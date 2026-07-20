@@ -340,6 +340,10 @@ async function main() {
           if (!selectedConditions.has(condition)) continue;
           const prompt = initialPrompt(condition, target, task, false);
           const paths = artifactPaths(runtime.results_root, phase, mode, target, condition, task, attempt);
+          if (options.skip_existing && existsSync(paths.metadata)) {
+            console.log(`SKIP existing ${phase} ${mode} ${target.id} ${task.id} ${condition}`);
+            continue;
+          }
           const args = commonCodexArgs(target, prompt, true);
           args.splice(args.length - 1, 0, ...mcpConfig(condition, target, runtime, paths.mcp_trace));
           console.log(`RUN ${phase} ${mode} ${target.id} ${task.id} ${condition}`);
@@ -364,6 +368,9 @@ async function main() {
         if (options.task && options.task !== task.id) throw new Error('--task filtering is not valid for continuous sessions');
         const prompt = taskIndex === 0 ? initialPrompt(condition, target, task, true) : continuationPrompt(task);
         const paths = artifactPaths(runtime.results_root, phase, mode, target, condition, task, attempt);
+        if (options.skip_existing && existsSync(paths.metadata)) {
+          throw new Error('--skip-existing cannot resume a partially completed continuous session; rerun the full session with a new phase or attempt.');
+        }
         let args;
         if (taskIndex === 0) {
           args = commonCodexArgs(target, prompt, false);
