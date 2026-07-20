@@ -115,6 +115,40 @@ export interface ArchitectureDomainDependencySummary {
   count: number;
 }
 
+export interface DirectCallerSummary {
+  name: string;
+  qualified_name: string;
+  path: string;
+  definition_line: number;
+  call_sites: number;
+}
+
+export interface DirectCallerAggregation {
+  symbol: string;
+  target_candidates: Array<{
+    qualified_name: string;
+    path: string;
+    definition_line: number;
+  }>;
+  callers: DirectCallerSummary[];
+  callers_by_name: Record<string, number>;
+  total_call_sites: number;
+  callers_truncated: boolean;
+  complete: boolean;
+  incomplete_reasons: string[];
+}
+
+export interface ProjectCallSiteStatus {
+  complete: boolean;
+  incomplete_reasons: string[];
+}
+
+export interface StaticCallLinkSummary {
+  owner_qualified_name: string;
+  symbol: string;
+  line: number;
+}
+
 export type GraphSnapshotResult<T> =
   | { ok: true; graph_revision: string; value: T }
   | {
@@ -275,6 +309,18 @@ interface ProjectRootRow {
   root_path: string | null;
 }
 
+interface DirectCallerRow {
+  source_qn: string;
+  file_path: string;
+  call_sites: number;
+  first_call_line: number;
+}
+
+interface ProjectCallSiteStatusRow {
+  cross_file_calls_stale: number | null;
+  call_sites_initialized: number | null;
+}
+
 /** Normalize either Windows or POSIX separators for portable DB searches. */
 function normalizePathForSearch(value: string): string {
   return value
@@ -286,6 +332,25 @@ function normalizePathForSearch(value: string): string {
 /** Escape a literal value for a LIKE expression using backslash as ESCAPE. */
 function escapeLike(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/[%_]/g, '\\$&');
+}
+
+function callerOwnerQualifiedName(qualifiedName: string): string {
+  const parts = qualifiedName.split('::');
+  while (parts.length > 1 && /^(?:anonymous#\d+|<anonymous>)$/u.test(parts[parts.length - 1])) {
+    parts.pop();
+  }
+  return parts.join('::');
+}
+
+function isTestSourcePath(filePath: string): boolean {
+  const normalized = normalizePathForSearch(filePath).toLowerCase();
+  return normalized.startsWith('test/')
+    || normalized.startsWith('tests/')
+    || normalized.startsWith('__tests__/')
+    || normalized.includes('/test/')
+    || normalized.includes('/tests/')
+    || normalized.includes('/__tests__/')
+    || /\.(?:test|spec)\.[^/]+$/u.test(normalized);
 }
 
 interface NeighborhoodCountRow {
@@ -1361,6 +1426,284 @@ export class CodeGraphReader {
       // Legacy/minimal code databases may not contain the projects table.
       return undefined;
     }
+  }
+
+  findNodesByNames(project: string, names: readonly string[], limit = 1000): CodeNode[] {
+    const uniqueNames = [...new Set(names.filter(Boolean))].slice(0, 512);
+    if (uniqueNames.length === 0) return [];
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const rows = this.db.prepare(
+      `SELECT n.*
+       FROM nodes n
+       JOIN json_each(?) requested ON n.name = CAST(requested.value AS TEXT)
+       WHERE n.project = ?
+       ORDER BY n.name COLLATE BINARY ASC, n.file_path COLLATE BINARY ASC,
+                n.start_line ASC, n.id ASC
+       LIMIT ?`,
+    ).all(JSON.stringify(uniqueNames), project, safeLimit) as CodeNodeRow[];
+    return rows.map(deserializeCodeNode);
+  }
+
+  findNodesContainingLine(
+    project: string,
+    filePath: string,
+    line: number,
+    limit = 20,
+  ): CodeNode[] {
+    const safeLine = Math.max(1, Math.floor(line));
+    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    const normalizedPath = normalizePathForSearch(filePath);
+    const rows = this.db.prepare(
+      `SELECT *
+       FROM nodes
+       WHERE project = ?
+         AND REPLACE(file_path, CHAR(92), '/') = ?
+         AND start_line <= ? AND end_line >= ?
+       ORDER BY (end_line - start_line) ASC, start_line DESC, id ASC
+       LIMIT ?`,
+    ).all(project, normalizedPath, safeLine, safeLine, safeLimit) as CodeNodeRow[];
+    return rows.map(deserializeCodeNode);
+  }
+
+  getProjectCallSiteStatus(project: string): ProjectCallSiteStatus {
+    const reasons: string[] = [];
+    try {
+      const status = this.db.prepare(
+        `SELECT cross_file_calls_stale, call_sites_initialized
+         FROM projects WHERE name = ? LIMIT 1`,
+      ).get(project) as ProjectCallSiteStatusRow | undefined;
+      if (!status) reasons.push('project_status_unavailable');
+      else {
+        if (status.call_sites_initialized !== 1) reasons.push('call_sites_not_initialized');
+        if (status.cross_file_calls_stale !== 0) reasons.push('cross_file_call_status_unknown_or_stale');
+      }
+    } catch {
+      reasons.push('project_status_unavailable');
+    }
+    return { complete: reasons.length === 0, incomplete_reasons: reasons };
+  }
+
+  listProjectCallSites(
+    project: string,
+    options: { includeTests?: boolean; limit?: number } = {},
+  ): { call_sites: StaticCallLinkSummary[]; truncated: boolean; available: boolean } {
+    const safeLimit = Math.max(1, Math.min(250_000, Math.floor(options.limit ?? 200_000)));
+    const normalizedPath = `LOWER(REPLACE(file_path, CHAR(92), '/'))`;
+    const productionFilter = options.includeTests === true
+      ? ''
+      : `AND NOT (
+          ${normalizedPath} LIKE '%/test/%'
+          OR ${normalizedPath} LIKE '%/tests/%'
+          OR ${normalizedPath} LIKE '%/__tests__/%'
+          OR ${normalizedPath} LIKE 'test/%'
+          OR ${normalizedPath} LIKE 'tests/%'
+          OR ${normalizedPath} LIKE '__tests__/%'
+          OR ${normalizedPath} LIKE '%.test.%'
+          OR ${normalizedPath} LIKE '%.spec.%'
+        )`;
+    let rows: Array<{ source_qn: string; last_segment: string; line: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT source_qn, last_segment, line
+         FROM call_sites
+         WHERE project = ?
+         ${productionFilter}
+         LIMIT ?`,
+      ).all(project, safeLimit + 1) as typeof rows;
+    } catch {
+      return { call_sites: [], truncated: false, available: false };
+    }
+    const truncated = rows.length > safeLimit;
+    return {
+      call_sites: rows.slice(0, safeLimit).map((row) => ({
+        owner_qualified_name: callerOwnerQualifiedName(row.source_qn),
+        symbol: row.last_segment,
+        line: row.line,
+      })),
+      truncated,
+      available: true,
+    };
+  }
+
+  /**
+   * Aggregate direct static call-sites for one exact symbol in SQLite.
+   *
+   * `call_sites` preserves every syntactic occurrence, unlike the deduplicated
+   * CALLS edge table. Nested anonymous callbacks are rolled up to their nearest
+   * named owner so one caller receives its real static call count. Ambiguous
+   * target names and stale/legacy call-site metadata are returned explicitly
+   * instead of presenting a partial result as exhaustive.
+   */
+  listDirectCallers(
+    project: string,
+    symbol: string,
+    options: { includeTests?: boolean; limit?: number } = {},
+  ): DirectCallerAggregation {
+    const safeLimit = Math.max(1, Math.min(1000, Math.floor(options.limit ?? 200)));
+    const includeTests = options.includeTests === true;
+    const incompleteReasons: string[] = [];
+
+    const targetProbe = this.findNodesByName(project, symbol, undefined, 1001);
+    if (targetProbe.length > 1000) incompleteReasons.push('target_search_truncated');
+    const targetCandidates = targetProbe.slice(0, 1000)
+      .filter((node) => includeTests || !isTestSourcePath(node.file_path))
+      .map((node) => ({
+        qualified_name: node.qualified_name,
+        path: normalizePathForSearch(node.file_path),
+        definition_line: node.start_line,
+      }));
+    if (targetCandidates.length === 0) incompleteReasons.push('target_not_found');
+    if (targetCandidates.length > 1) incompleteReasons.push('target_ambiguous');
+    if (targetCandidates.length > 20) {
+      targetCandidates.length = 20;
+      incompleteReasons.push('target_candidates_truncated');
+    }
+
+    try {
+      const status = this.db
+        .prepare(
+          `SELECT cross_file_calls_stale, call_sites_initialized
+           FROM projects WHERE name = ? LIMIT 1`,
+        )
+        .get(project) as ProjectCallSiteStatusRow | undefined;
+      if (!status) incompleteReasons.push('project_status_unavailable');
+      else {
+        if (status.call_sites_initialized !== 1) incompleteReasons.push('call_sites_not_initialized');
+        if (status.cross_file_calls_stale === 1) incompleteReasons.push('cross_file_calls_stale');
+        else if (status.cross_file_calls_stale !== 0) incompleteReasons.push('cross_file_call_status_unknown');
+      }
+    } catch {
+      incompleteReasons.push('project_status_unavailable');
+    }
+
+    const normalizedPath = `LOWER(REPLACE(file_path, CHAR(92), '/'))`;
+    const productionFilter = includeTests
+      ? ''
+      : `AND NOT (
+          ${normalizedPath} LIKE '%/test/%'
+          OR ${normalizedPath} LIKE '%/tests/%'
+          OR ${normalizedPath} LIKE '%/__tests__/%'
+          OR ${normalizedPath} LIKE 'test/%'
+          OR ${normalizedPath} LIKE 'tests/%'
+          OR ${normalizedPath} LIKE '__tests__/%'
+          OR ${normalizedPath} LIKE '%.test.%'
+          OR ${normalizedPath} LIKE '%.spec.%'
+        )`;
+
+    let rows: DirectCallerRow[];
+    let totalCallSites = 0;
+    try {
+      rows = this.db.prepare(
+        `SELECT source_qn, file_path, COUNT(*) AS call_sites, MIN(line) AS first_call_line
+         FROM call_sites
+         WHERE project = ? AND last_segment = ?
+         ${productionFilter}
+         GROUP BY source_qn, file_path
+         ORDER BY source_qn COLLATE BINARY ASC, file_path COLLATE BINARY ASC
+         LIMIT ?`,
+      ).all(project, symbol, safeLimit + 1) as DirectCallerRow[];
+      const count = this.db.prepare(
+        `SELECT COUNT(*) AS c
+         FROM call_sites
+         WHERE project = ? AND last_segment = ?
+         ${productionFilter}`,
+      ).get(project, symbol) as CountRow;
+      totalCallSites = count.c;
+    } catch {
+      return {
+        symbol,
+        target_candidates: targetCandidates,
+        callers: [],
+        callers_by_name: {},
+        total_call_sites: 0,
+        callers_truncated: false,
+        complete: false,
+        incomplete_reasons: [...new Set([...incompleteReasons, 'call_sites_unavailable'])].sort(),
+      };
+    }
+
+    const callersTruncated = rows.length > safeLimit;
+    if (callersTruncated) {
+      rows = rows.slice(0, safeLimit);
+      incompleteReasons.push('callers_truncated');
+    }
+
+    const grouped = new Map<string, {
+      qualifiedName: string;
+      filePath: string;
+      callSites: number;
+      firstCallLine: number;
+    }>();
+    for (const row of rows) {
+      const qualifiedName = callerOwnerQualifiedName(row.source_qn);
+      const key = `${qualifiedName}\0${normalizePathForSearch(row.file_path)}`;
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.callSites += row.call_sites;
+        existing.firstCallLine = Math.min(existing.firstCallLine, row.first_call_line);
+      } else {
+        grouped.set(key, {
+          qualifiedName,
+          filePath: normalizePathForSearch(row.file_path),
+          callSites: row.call_sites,
+          firstCallLine: row.first_call_line,
+        });
+      }
+    }
+
+    const ownerQualifiedNames = [...new Set([...grouped.values()].map((row) => row.qualifiedName))];
+    const ownerNodes = new Map<string, CodeNode>();
+    if (ownerQualifiedNames.length > 0) {
+      const ownerRows = this.db.prepare(
+        `SELECT n.* FROM nodes n
+         JOIN json_each(?) q ON n.qualified_name = CAST(q.value AS TEXT)
+         WHERE n.project = ?
+         ORDER BY n.id ASC`,
+      ).all(JSON.stringify(ownerQualifiedNames), project) as CodeNodeRow[];
+      for (const row of ownerRows) {
+        const node = deserializeCodeNode(row);
+        if (!ownerNodes.has(node.qualified_name)) ownerNodes.set(node.qualified_name, node);
+      }
+    }
+
+    const callers = [...grouped.values()].map((row): DirectCallerSummary => {
+      const owner = ownerNodes.get(row.qualifiedName);
+      const name = owner?.name ?? row.qualifiedName.split('::').at(-1) ?? row.qualifiedName;
+      return {
+        name,
+        qualified_name: row.qualifiedName,
+        path: normalizePathForSearch(owner?.file_path ?? row.filePath),
+        definition_line: owner?.start_line ?? row.firstCallLine,
+        call_sites: row.callSites,
+      };
+    }).sort((left, right) => (
+      (left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+      || (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+      || left.definition_line - right.definition_line
+      || (left.qualified_name < right.qualified_name ? -1 : left.qualified_name > right.qualified_name ? 1 : 0)
+    ));
+
+    const callersByName: Record<string, number> = {};
+    const callerNameOwners = new Map<string, number>();
+    for (const caller of callers) {
+      callersByName[caller.name] = (callersByName[caller.name] ?? 0) + caller.call_sites;
+      callerNameOwners.set(caller.name, (callerNameOwners.get(caller.name) ?? 0) + 1);
+    }
+    if ([...callerNameOwners.values()].some((count) => count > 1)) {
+      incompleteReasons.push('caller_names_ambiguous');
+    }
+
+    const reasons = [...new Set(incompleteReasons)].sort();
+    return {
+      symbol,
+      target_candidates: targetCandidates,
+      callers,
+      callers_by_name: callersByName,
+      total_call_sites: totalCallSites,
+      callers_truncated: callersTruncated,
+      complete: reasons.length === 0,
+      incomplete_reasons: reasons,
+    };
   }
 
   /**

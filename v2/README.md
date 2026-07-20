@@ -50,8 +50,13 @@ node dist/cli/index.js mcp --project my-app
 
 ## MCP integration
 
-The MCP server exposes 8 tools for code graph queries and human memory CRUD,
-including bounded exact-literal source lookup with 1-based locations.
+The MCP server exposes 8 tools for code graph queries and human memory CRUD.
+Its backward-compatible `lookup_source_text` profiles provide bounded exact
+literals, persistent direct-caller aggregation, bounded route/CLI call chains,
+and tracked top-level repository inventory with explicit completeness
+metadata. Use exact profiles for exact questions and graph context tools only
+when relationships, blast radius, architecture, or human memory affect the
+task.
 Those tools do not synchronize the Obsidian vault; use the separate
 `cbm-v2 obsidian ...` commands or `cbm-v2 watch` for vault synchronization.
 See the [MCP Tools documentation](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/MCP_TOOLS.md)
@@ -134,6 +139,7 @@ mixing two graph states.
 - [Architecture](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/V2_ARCHITECTURE.md)
 - [CLI Reference](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/CLI_REFERENCE.md)
 - [Current State](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/V2_CURRENT_STATE.md)
+- [V1/V2 Token Truth Audit](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/V1_V2_TOKEN_TRUTH_AUDIT_2026-07-20.md) — Native V1, V2, grep/read, and hybrid results
 - [Changelog](CHANGELOG.md) — version history
 - [Contributing](https://github.com/Cheurteenyt/codebase-mirror/blob/main/CONTRIBUTING.md)
 - [Release Policy](https://github.com/Cheurteenyt/codebase-mirror/blob/main/docs/RELEASE_POLICY.md)
