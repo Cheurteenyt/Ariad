@@ -981,3 +981,32 @@ counterbalanced order, allowed tools, invalid-run handling, grading, native
 usage extraction, cost attribution, aggregation formulas, and engineering
 targets before any measured run. Baseline and post-fix result tables will be
 added only after their respective immutable checkpoints.
+
+### 13.1 Immutable pre-fix baseline results
+
+The complete native-accounting baseline was executed without changing V2
+behavior. Canonical aggregate, ratio, per-task, selected-run CSV, invalid-run,
+and raw-checksum evidence is published in
+[`V1_V2_TOKEN_TRUTH_AUDIT_2026-07-20.md`](V1_V2_TOKEN_TRUTH_AUDIT_2026-07-20.md#13-immutable-pre-fix-baseline-checkpoint)
+and [`docs/benchmarks/v1-v2-token-truth-baseline-2026-07-20`](benchmarks/v1-v2-token-truth-baseline-2026-07-20/aggregate-and-ratios.md).
+
+| Usage | Target | V1 MCP | V2 MCP | grep/read | Hybrid |
+|---|---|---:|---:|---:|---:|
+| one-shot | small | 2,383,672 | 1,186,699 | 505,583 | 542,834 |
+| one-shot | large | 1,809,874 | 1,363,515 | 792,453 | 566,927 |
+| continuous | small | 18,258,502 | 5,411,852 | 4,054,555 | 3,367,281 |
+| continuous | large | 10,769,027 | 8,492,285 | 3,458,487 | 3,274,293 |
+
+These are raw provider-native input-plus-output totals. V2 beats reproducible
+V1 in all four matched cells, but neither MCP-only arm beats optimized
+grep/read. Hybrid beats grep/read in three cells and loses one; it made zero
+MCP evidence calls, so that result supports exact-source routing rather than an
+MCP savings claim. Large-target T08 is a shared strict-reference failure, and
+large-target T12 exposes missing index coverage/completeness semantics.
+
+Three selected cells remain explicitly invalid after exhausting their single
+clean rerun: V1 one-shot small T01, V1 continuous small T10, and hybrid
+continuous small T10. Their native costs and grades remain in the aggregate;
+they are never silently discarded. The raw manifest covers 1,206 artifacts
+(16,018,972 bytes), with tree SHA-256
+`d9339ca4cfde52f33c012f6be39de4c8ff60be9f6644b1f9c09614f9246fa073`.

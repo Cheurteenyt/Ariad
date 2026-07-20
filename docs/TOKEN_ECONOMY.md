@@ -1,4 +1,4 @@
-# Token Economy — How V2 Saves API Tokens
+# Token Economy — Design, Historical Estimates, and Measured Boundaries
 
 > Updated 2026-07-07 for version 0.15.9.
 >
@@ -7,6 +7,14 @@
 > MCP transport or a model tokenizer. The 2026-07-15 compact-vs-pretty benchmark
 > is separate and measures only JSON whitespace bytes; see
 > [PERFORMANCE_TOKEN_UI_AUDIT_2026-07-15.md](PERFORMANCE_TOKEN_UI_AUDIT_2026-07-15.md).
+>
+> **Native-agent baseline (2026-07-20):** under identical Codex native
+> accounting, reproducible V2 MCP-only used fewer tokens than official V1 in
+> all four target/usage-model aggregates, but neither MCP-only arm beat an
+> optimized grep/read baseline. The cost-aware hybrid beat grep/read in three
+> of four aggregates, but used source commands and made no MCP evidence calls.
+> See
+> [V1_V2_TOKEN_TRUTH_AUDIT_2026-07-20.md](V1_V2_TOKEN_TRUTH_AUDIT_2026-07-20.md#13-immutable-pre-fix-baseline-checkpoint).
 
 V2 is designed to **minimize the number of API calls and tokens** an AI agent needs to understand and modify a codebase.
 
@@ -21,11 +29,18 @@ Without V2, an AI agent exploring a codebase must:
 
 Each step requires multiple API calls (grep, read, search), consuming thousands of tokens.
 
-## The V2 Solution
+## The V2 Design
 
-V2 consolidates all these steps into **single MCP tool calls** that return pre-computed, structured data. Internally, V2 uses **bulk queries** to avoid N+1 patterns — a single MCP call may execute only 4 SQL queries even when analyzing 5000 nodes.
+V2 is designed to consolidate graph and human-memory questions into bounded,
+structured MCP calls. Internally, it uses bulk queries to avoid N+1 patterns.
+Fewer SQL queries do not by themselves prove fewer agent tokens: tool schemas,
+payload size, exploration, completeness, and previous-context reprocessing all
+contribute to the native total.
 
-## Token Savings by Scenario
+## Historical Estimated Token Savings by Scenario
+
+The three scenarios below are preserved as the v0.15.9 design model. They are
+not current transport measurements and must not be used as measured savings.
 
 ### Scenario 1: Preparing to edit a file
 
@@ -118,18 +133,20 @@ project; these values were not remeasured for the current package:
 | Tokens consumed | ~560K | ~150K | **-410K tokens** |
 | Latency | ~35 min | ~5 min | **-30 min** |
 
-At typical LLM pricing ($0.01/1K tokens), that's **~$4.10/month saved** per developer.
+Under the historical model's hypothetical $0.01/1K-token price, that would be
+**~$4.10/month saved** per developer. It is not a price or savings measurement
+for the current `gpt-5.6-sol` benchmark runtime.
 
 For a team of 10 developers: **~$41/month, ~$492/year**.
 
 ## Best Practices for Agents
 
-1. **Always call `prepare_edit_context` before editing** — it's the single most token-efficient call
-2. **Call `get_project_overview` first** — it tells you if data is stale and what needs attention
-3. **Use `lookup_source_text` for known literals or constants** — batch up to 10 exact strings and get their values and 1-based lines in one bounded call
-4. **Use `search_code_and_memory` for exploration** — unified graph/memory search saves a round-trip, but it does not search arbitrary source text
-5. **Create notes via `create_human_note`** — one DB call can create and link the note; run Obsidian sync separately when vault output is required
-6. **Check `graph_status.freshness_label`** — if STALE or worse, recommend re-indexing before trusting the data
-7. **Respect the `recommendation` field** — it tells you "SAFE TO EDIT" or "PROCEED WITH CAUTION" with specific warnings
-8. **Use `blast_radius` to gauge impact** — if `affected_routes > 0`, your edit could break HTTP endpoints
+1. **Route exact literals, known paths, and filesystem inventory to the cheapest exact source operation** when the client permits focused source reads.
+2. **Use graph tools for call relationships, blast radius, architecture, and human memory** when the graph can answer directly and completely.
+3. **Do not call `get_project_overview` automatically** — call it when project health, freshness, or broad architecture is part of the question.
+4. **Use `lookup_source_text` for bounded exact lookups in MCP-only workflows** — batch up to 10 exact strings and inspect its coverage metadata.
+5. **Use `prepare_edit_context` when an edit needs blast-radius, risk, or human-memory context**, not as unconditional startup overhead.
+6. **Do not duplicate MCP and source evidence** unless completeness is uncertain or verification is necessary.
+7. **Use `search_code_and_memory` for exploration** — it combines graph and memory search but does not replace arbitrary source-text search.
+8. **Check freshness and completeness fields** before treating an answer as exhaustive; reindex or verify source when coverage is incomplete.
 

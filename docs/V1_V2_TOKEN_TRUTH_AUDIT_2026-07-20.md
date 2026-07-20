@@ -441,3 +441,171 @@ proxy now adds truthful MCP annotations to those ten filtered schemas:
 schemas, requests, responses, or V1 execution. This client-compatibility
 metadata is measured as part of V1's fixed schema overhead and is validated by
 a non-benchmark Codex call before any attempt-2 run.
+
+## 13. Immutable pre-fix baseline checkpoint
+
+The complete baseline contains 192 selected cells: 2 targets x 2 usage models
+x 4 conditions x 12 tasks. The machine-readable checkpoint is split into:
+
+- [`aggregate-and-ratios.md`](benchmarks/v1-v2-token-truth-baseline-2026-07-20/aggregate-and-ratios.md);
+- [`per-task.md`](benchmarks/v1-v2-token-truth-baseline-2026-07-20/per-task.md);
+- [`selected-runs.csv`](benchmarks/v1-v2-token-truth-baseline-2026-07-20/selected-runs.csv), which retains every selected attribution field;
+- [`raw-artifact-manifest.json`](benchmarks/v1-v2-token-truth-baseline-2026-07-20/raw-artifact-manifest.json).
+
+The raw logs remain outside both target checkouts under
+`D:/Mycodex/benchmark-results/r173-v1-v2-truth`. The manifest covers 1,206
+retained baseline, invalid-attempt, and preflight artifacts totaling 16,018,972
+bytes. Its deterministic tree SHA-256 is
+`d9339ca4cfde52f33c012f6be39de4c8ff60be9f6644b1f9c09614f9246fa073`.
+Derived summaries are deliberately excluded because their own checksums are
+reproducible from the manifested raw inputs.
+
+### 13.1 Raw native aggregates
+
+`A` is official V1 MCP-only, `B` is pre-fix V2 MCP-only, `C` is optimized
+grep/read, and `D` is the pre-registered cost-aware hybrid policy. Cached input
+is a subset of input and is not subtracted from the primary raw total.
+
+| Usage | Target | Arm | Raw tokens | Uncached + output | Calls | Response bytes | PASS/PARTIAL/FAIL | Selected invalid |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| one-shot | small | A | 2,383,672 | 353,848 | 142 | 1,089,704 | 10/1/1 | 1 |
+| one-shot | small | B | 1,186,699 | 236,683 | 100 | 2,509,357 | 12/0/0 | 0 |
+| one-shot | small | C | 505,583 | 141,295 | 23 | 67,645 | 12/0/0 | 0 |
+| one-shot | small | D | 542,834 | 128,626 | 23 | 76,342 | 12/0/0 | 0 |
+| one-shot | large | A | 1,809,874 | 276,946 | 146 | 402,424 | 9/2/1 | 0 |
+| one-shot | large | B | 1,363,515 | 200,507 | 109 | 1,031,390 | 10/1/1 | 0 |
+| one-shot | large | C | 792,453 | 146,565 | 29 | 318,947 | 10/1/1 | 0 |
+| one-shot | large | D | 566,927 | 112,271 | 20 | 280,279 | 10/1/1 | 0 |
+| continuous | small | A | 18,258,502 | 1,176,646 | 294 | 4,243,655 | 12/0/0 | 1 |
+| continuous | small | B | 5,411,852 | 587,276 | 25 | 113,876 | 12/0/0 | 0 |
+| continuous | small | C | 4,054,555 | 383,515 | 20 | 66,944 | 12/0/0 | 0 |
+| continuous | small | D | 3,367,281 | 383,089 | 19 | 37,676 | 12/0/0 | 1 |
+| continuous | large | A | 10,769,027 | 632,195 | 117 | 337,876 | 9/2/1 | 0 |
+| continuous | large | B | 8,492,285 | 705,789 | 49 | 246,739 | 10/0/2 | 0 |
+| continuous | large | C | 3,458,487 | 344,759 | 19 | 66,648 | 10/1/1 | 0 |
+| continuous | large | D | 3,274,293 | 408,885 | 18 | 35,133 | 10/1/1 | 0 |
+
+The grade and protocol-validity axes are separate. An exact answer from an
+invalid cell remains mechanically `PASS`, but it is explicitly flagged and is
+not represented as a clean product success.
+
+### 13.2 Pre-registered ratios
+
+| Usage | Target | V2/V1 tokens | V1/grep | V2/grep | Hybrid/grep | V2/V1 calls |
+|---|---|---:|---:|---:|---:|---:|
+| one-shot | small | 0.498 | 4.715 | 2.347 | 1.074 | 0.704 |
+| one-shot | large | 0.753 | 2.284 | 1.721 | 0.715 | 0.747 |
+| continuous | small | 0.296 | 4.503 | 1.335 | 0.830 | 0.085 |
+| continuous | large | 0.789 | 3.114 | 2.455 | 0.947 | 0.419 |
+
+V2 uses 50.22%, 24.66%, 70.36%, and 21.14% fewer raw tokens than V1 in
+the four matched cells respectively. That is a reproducible V2-over-V1 result,
+not an MCP-over-source-search result: V2 MCP-only still costs 1.335x to 2.455x
+grep/read.
+
+Hybrid beats grep/read in large one-shot (28.46% fewer), small continuous
+(16.95% fewer), and large continuous (5.33% fewer), but loses small one-shot
+(7.37% more). Every hybrid evidence call in this baseline is a source command;
+the agent made zero V2 MCP calls. These results support cost-aware routing, but
+they do **not** prove that graph queries produced the savings.
+
+### 13.3 Invalid runs and strict-reference effects
+
+All invalid attempts remain in the raw manifest. Three selected cells exhausted
+the registered two-attempt limit:
+
+1. one-shot small A/T01: V1's OEM stderr and missing read annotations prevented
+   a traced tool call; attempt 2 is invalid/FAIL at 97,426 tokens;
+2. continuous small A/T10: attempt 2 returned the exact answer but has 216
+   completed JSONL calls versus 217 proxy calls; it remains invalid/PASS at
+   4,704,005 tokens and no third run is allowed;
+3. continuous small D/T10: attempt 2 used forbidden `Sort-Object` before a
+   compliant repeat; it remains invalid/PASS at 495,779 tokens.
+
+The manual audit examined all 170 completed C/D source commands. The allowed
+focused-read form includes `Get-Content | Select-Object -Skip/-First` only to
+bound returned lines. `Sort-Object` and `Get-ChildItem` were treated as answer-
+computing evidence, invalidated, and rerun once. The large D/T09 and small
+D/T12 reruns are clean; the small D/T10 rerun above is not.
+
+Large-target T08 is a strict-reference limitation shared by all four arms. The
+registered first label is `test command@...:41`; agents returned the actual
+identifier-like labels `test@...:41` or `addTestCommand@...:40`. The reference
+cannot be changed after pre-registration, so all remain FAIL. It does not
+create a relative advantage for an arm. Large T12 exposes a real coverage
+boundary: both V1 and V2 indexes omit tracked `.claude`; V2 one-shot is PARTIAL
+and V2 continuous additionally emits wrong `.vscode`, making it FAIL.
+
+### 13.4 Task-level cost attribution
+
+T09 and T12 are the clearest pre-fix V2 cost drivers:
+
+| Usage | Target | T09 tokens/calls/grade | T12 tokens/calls/grade | Combined tokens | Share of V2 |
+|---|---|---|---|---:|---:|
+| one-shot | small | 85,105 / 4 / PASS | 260,928 / 55 / PASS | 346,033 | 29.16% |
+| one-shot | large | 452,519 / 26 / PASS | 155,200 / 43 / PARTIAL | 607,719 | 44.57% |
+| continuous | small | 653,161 / 3 / PASS | 1,035,957 / 5 / PASS | 1,689,118 | 31.21% |
+| continuous | large | 1,164,589 / 19 / PASS | 1,683,578 / 10 / FAIL | 2,848,167 | 33.54% |
+
+One-shot V2 makes 88 exploratory calls on small and 97 on large. T12/small
+alone returns 2,363,780 bytes over 55 calls. T09/large returns 224,693 bytes
+over 26 calls. These loops dominate the fixed schema response: V1's measured
+schema is 5,050 bytes and V2's is 7,959 bytes.
+
+Continuous sessions do not amortize total native input under cumulative agent
+accounting. Each resumed turn reprocesses prior context. Summed observed prior-
+context bytes for V2 are 507,069 (small) and 1,015,013 (large); continuous V2
+raw totals are 4.56x and 6.23x their one-shot totals. This is a real session
+cost, not an MCP query-engine token counter. No auditable public price mapping
+exists for the measured `gpt-5.6-sol` runtime, so this audit reports native raw
+and uncached units and does not invent a dollar estimate.
+
+### 13.5 Ranked root causes
+
+1. **Missing exact server aggregation plus agent exploration.** Caller sets,
+   chains, and repository inventory force iterative search/result inspection.
+   T09/T12 consume 29.16% to 44.57% of V2 tokens and up to 69 calls together.
+2. **Oversized, weakly scoped response contracts.** The agent repeatedly
+   receives code and metadata it does not need; V2 one-shot response payloads
+   total 2.51 MB small and 1.03 MB large.
+3. **Incomplete coverage/completeness semantics.** The graph cannot certify
+   tracked-directory inventory and does not clearly say what was skipped,
+   causing T12 verification loops and wrong completion.
+4. **Prior-context reprocessing.** It dominates continuous raw totals for every
+   arm and means schema amortization alone cannot establish token savings.
+5. **Fixed schema overhead.** V2 exposes 2,909 more schema bytes than V1, but
+   this is secondary to multi-megabyte payloads and exploration loops.
+6. **Query latency.** V2 query time is higher (up to 68.9 seconds aggregate in
+   large one-shot), but latency is reported separately and is not the cause of
+   native model-token growth.
+
+Indexing quality is therefore an accuracy cause for coverage-sensitive T12,
+not the primary aggregate token cause. Tool contracts, exact aggregation,
+response size, and agent routing rank higher.
+
+### 13.6 Direct answers and claim boundaries
+
+1. **Does reproducible V1 beat V2?** No. V2 uses fewer raw tokens and calls in
+   all four matched aggregates and has equal or better measured task success.
+2. **Does either MCP-only arm beat optimized grep/read?** No. Every V1/grep and
+   V2/grep raw-token ratio is above 1.0.
+3. **Does intended hybrid beat grep/read?** In three of four aggregates, yes,
+   at equal task grades; however it used no MCP evidence, so this validates the
+   routing policy rather than graph-query savings.
+4. **Do benefits improve with repository size?** Not consistently. One-shot
+   V2/grep improves from 2.347x to 1.721x, while continuous worsens from 1.335x
+   to 2.455x. Repository size alone is not a sufficient predictor.
+5. **Which claims survive?** The historical V1 paper/README numbers remain
+   incomparable because their prompts, raw logs, and native accounting mapping
+   are absent. The claim that this reproducible V1 is more token-efficient than
+   V2 is unsupported. Current estimated `-67%` to `-87%` V2 scenario savings
+   are not native transport measurements and must remain historical estimates.
+   The measured claim that V2 beats reproducible V1 on these targets is
+   supported; an MCP-only advantage over optimized source search is not.
+6. **What is the main problem?** Tool contract and selection behavior, followed
+   by response size and coverage/completeness. Fixed schema cost and query
+   latency are measurable but secondary.
+
+This is the immutable pre-fix evidence boundary. No V2 product behavior was
+changed before these artifacts, tables, claim boundaries, and root causes were
+generated.
