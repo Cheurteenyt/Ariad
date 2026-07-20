@@ -110,11 +110,15 @@ use `--ignore-user-config`, read-only sandboxing, the explicit model, and:
 ```text
 -c model_reasoning_effort="medium"
 -c project_doc_max_bytes=0
+-c approval_policy="never"
 ```
 
 `project_doc_max_bytes=0` is verified with `codex debug prompt-input`: it
 prevents the small target's `AGENTS.md` from entering the model context. This
 removes a condition-specific routing bias without changing source evidence.
+`approval_policy="never"` is required because benchmark processes are
+non-interactive; read-only MCP calls must execute instead of waiting for a user
+approval that cannot be supplied.
 
 ## 4. Fresh index identities and coverage audit
 
@@ -385,3 +389,27 @@ SHA-256 for every retained raw artifact is committed at each results
 checkpoint.
 
 Baseline results intentionally do not appear in this pre-registration.
+
+### Pre-valid-run launcher addendum
+
+After pre-registration commit `377e39f4a13dc3d08204691db7b2b043a9e3c171`
+was pushed, the first attempted A/small/T01 process completed a turn but Codex
+cancelled all six MCP calls for lack of a non-interactive approval policy. The
+proxy received initialization and `tools/list`, but zero `tools/call` requests.
+This is invalid under the already registered trace-matching rule, not a product
+FAIL. Its raw logs and 111,060 native tokens are retained as attempt 1.
+
+Before any valid measured run, the launcher was corrected by explicitly fixing
+`approval_policy="never"`; the summarizer was corrected to enforce the already
+documented MCP trace-count rule, and `record-invalid.mjs` was added to retain
+the reason mechanically. Questions, references, prompts, conditions, order,
+grading, formulas, success criteria, products, and targets did not change.
+Only the single registered attempt-2 rerun is permitted for this cell.
+
+Corrected launcher/auditor SHA-256 identities are:
+
+| Artifact | SHA-256 |
+|---|---|
+| `run.mjs` | `082AFF5B13564B73E97A7B2375DF72D19195D7E428A052DF6758FE7C38A6BD0F` |
+| `summarize.mjs` | `43C43108B2702482D18B5E5FEFA2EBCBC3D60BEFB7D225A7D34096B4928A14FB` |
+| `record-invalid.mjs` | `95BE5DF63725B6FC215F353AABFDACB1944C4DB8FDD2CC3120793ADAA26926F2` |

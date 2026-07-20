@@ -102,6 +102,7 @@ function commonCodexArgs(target, prompt, ephemeral) {
     '-m', 'gpt-5.6-sol',
     '-c', 'model_reasoning_effort="medium"',
     '-c', 'project_doc_max_bytes=0',
+    '-c', 'approval_policy="never"',
     '-C', target.checkout,
   ];
   if (ephemeral) args.push('--ephemeral');
@@ -118,6 +119,7 @@ function resumeCodexArgs(sessionId, prompt) {
     '-c', 'model_reasoning_effort="medium"',
     '-c', 'project_doc_max_bytes=0',
     '-c', 'sandbox_mode="read-only"',
+    '-c', 'approval_policy="never"',
     sessionId,
     prompt,
   ];
@@ -347,7 +349,7 @@ async function main() {
             checkout: target.checkout, target_sha: target.sha,
             v1_project: target.v1_project, v2_project: target.v2_project,
             model: 'gpt-5.6-sol', reasoning: 'medium', codex_version: codexVersion,
-            project_doc_max_bytes: 0, prompt,
+            project_doc_max_bytes: 0, approval_policy: 'never', prompt,
           });
         }
       }
@@ -377,7 +379,7 @@ async function main() {
           checkout: target.checkout, target_sha: target.sha,
           v1_project: target.v1_project, v2_project: target.v2_project,
           model: 'gpt-5.6-sol', reasoning: 'medium', codex_version: codexVersion,
-          project_doc_max_bytes: 0, prompt, session_id: sessionId ?? null,
+          project_doc_max_bytes: 0, approval_policy: 'never', prompt, session_id: sessionId ?? null,
         });
         if (!sessionId) sessionId = completed.thread_id;
       }

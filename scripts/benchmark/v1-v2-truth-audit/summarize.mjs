@@ -222,6 +222,9 @@ function parseRun(metaPath, invalidReasons) {
     }
   }
   if (meta.condition === 'C' && toolSequence.some((item) => item.startsWith('mcp:'))) violations.push('MCP call in grep/read condition');
+  const completedMcpCalls = toolPayloads.filter((item) => item.kind === 'mcp').length;
+  const tracedMcpCalls = mcpTrace.filter((entry) => entry.method === 'tools/call').length;
+  if (completedMcpCalls !== tracedMcpCalls) violations.push(`MCP trace mismatch: ${completedMcpCalls} completed JSONL calls, ${tracedMcpCalls} traced calls`);
   if (!usage) violations.push('missing native turn.completed usage');
   if (raw.malformed.length) violations.push(`malformed JSONL lines: ${raw.malformed.join(',')}`);
   const listedInvalid = invalidReasons.get(invalidKey(meta));
