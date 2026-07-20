@@ -21,6 +21,17 @@
 - Added regressions for deterministic grouping, bounds, duplicate symbols,
   legacy and stale metadata, Git fallback, path normalization, unchanged
   literal requests, read-only annotations, and stable eight-tool discovery.
+- Added the bounded `call_chain` profile for exact HTTP-route and CLI-command
+  traces. It builds one production call-site map, rolls anonymous callbacks
+  into named owners, recovers omitted multiline calls from bounded definition
+  text, prunes duplicate symbol names through reverse reachability, and returns
+  a deterministic shortest chain with explicit alternatives, caps, freshness,
+  ambiguity, and completeness metadata.
+- `call_chain` also accepts a semantic `target_hint` when the task does not
+  reveal the exact terminal name. Lexical resolution is restricted to symbols
+  in the bounded production call-site map, returns scores and alternatives,
+  and fails completeness closed on a tie. The ready-to-copy `formatted_chain`
+  prevents label and path reformatting errors.
 - Added the read-only `lookup_source_text` MCP tool for batched,
   case-sensitive literal lookup with exact 1-based path, line, column, and
   declaration text. It fills the source-evidence gap without changing any of

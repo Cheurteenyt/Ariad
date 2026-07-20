@@ -138,6 +138,17 @@ export interface DirectCallerAggregation {
   incomplete_reasons: string[];
 }
 
+export interface ProjectCallSiteStatus {
+  complete: boolean;
+  incomplete_reasons: string[];
+}
+
+export interface StaticCallLinkSummary {
+  owner_qualified_name: string;
+  symbol: string;
+  line: number;
+}
+
 export type GraphSnapshotResult<T> =
   | { ok: true; graph_revision: string; value: T }
   | {
@@ -329,6 +340,17 @@ function callerOwnerQualifiedName(qualifiedName: string): string {
     parts.pop();
   }
   return parts.join('::');
+}
+
+function isTestSourcePath(filePath: string): boolean {
+  const normalized = normalizePathForSearch(filePath).toLowerCase();
+  return normalized.startsWith('test/')
+    || normalized.startsWith('tests/')
+    || normalized.startsWith('__tests__/')
+    || normalized.includes('/test/')
+    || normalized.includes('/tests/')
+    || normalized.includes('/__tests__/')
+    || /\.(?:test|spec)\.[^/]+$/u.test(normalized);
 }
 
 interface NeighborhoodCountRow {
@@ -1406,6 +1428,103 @@ export class CodeGraphReader {
     }
   }
 
+  findNodesByNames(project: string, names: readonly string[], limit = 1000): CodeNode[] {
+    const uniqueNames = [...new Set(names.filter(Boolean))].slice(0, 512);
+    if (uniqueNames.length === 0) return [];
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const rows = this.db.prepare(
+      `SELECT n.*
+       FROM nodes n
+       JOIN json_each(?) requested ON n.name = CAST(requested.value AS TEXT)
+       WHERE n.project = ?
+       ORDER BY n.name COLLATE BINARY ASC, n.file_path COLLATE BINARY ASC,
+                n.start_line ASC, n.id ASC
+       LIMIT ?`,
+    ).all(JSON.stringify(uniqueNames), project, safeLimit) as CodeNodeRow[];
+    return rows.map(deserializeCodeNode);
+  }
+
+  findNodesContainingLine(
+    project: string,
+    filePath: string,
+    line: number,
+    limit = 20,
+  ): CodeNode[] {
+    const safeLine = Math.max(1, Math.floor(line));
+    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    const normalizedPath = normalizePathForSearch(filePath);
+    const rows = this.db.prepare(
+      `SELECT *
+       FROM nodes
+       WHERE project = ?
+         AND REPLACE(file_path, CHAR(92), '/') = ?
+         AND start_line <= ? AND end_line >= ?
+       ORDER BY (end_line - start_line) ASC, start_line DESC, id ASC
+       LIMIT ?`,
+    ).all(project, normalizedPath, safeLine, safeLine, safeLimit) as CodeNodeRow[];
+    return rows.map(deserializeCodeNode);
+  }
+
+  getProjectCallSiteStatus(project: string): ProjectCallSiteStatus {
+    const reasons: string[] = [];
+    try {
+      const status = this.db.prepare(
+        `SELECT cross_file_calls_stale, call_sites_initialized
+         FROM projects WHERE name = ? LIMIT 1`,
+      ).get(project) as ProjectCallSiteStatusRow | undefined;
+      if (!status) reasons.push('project_status_unavailable');
+      else {
+        if (status.call_sites_initialized !== 1) reasons.push('call_sites_not_initialized');
+        if (status.cross_file_calls_stale !== 0) reasons.push('cross_file_call_status_unknown_or_stale');
+      }
+    } catch {
+      reasons.push('project_status_unavailable');
+    }
+    return { complete: reasons.length === 0, incomplete_reasons: reasons };
+  }
+
+  listProjectCallSites(
+    project: string,
+    options: { includeTests?: boolean; limit?: number } = {},
+  ): { call_sites: StaticCallLinkSummary[]; truncated: boolean; available: boolean } {
+    const safeLimit = Math.max(1, Math.min(250_000, Math.floor(options.limit ?? 200_000)));
+    const normalizedPath = `LOWER(REPLACE(file_path, CHAR(92), '/'))`;
+    const productionFilter = options.includeTests === true
+      ? ''
+      : `AND NOT (
+          ${normalizedPath} LIKE '%/test/%'
+          OR ${normalizedPath} LIKE '%/tests/%'
+          OR ${normalizedPath} LIKE '%/__tests__/%'
+          OR ${normalizedPath} LIKE 'test/%'
+          OR ${normalizedPath} LIKE 'tests/%'
+          OR ${normalizedPath} LIKE '__tests__/%'
+          OR ${normalizedPath} LIKE '%.test.%'
+          OR ${normalizedPath} LIKE '%.spec.%'
+        )`;
+    let rows: Array<{ source_qn: string; last_segment: string; line: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT source_qn, last_segment, line
+         FROM call_sites
+         WHERE project = ?
+         ${productionFilter}
+         LIMIT ?`,
+      ).all(project, safeLimit + 1) as typeof rows;
+    } catch {
+      return { call_sites: [], truncated: false, available: false };
+    }
+    const truncated = rows.length > safeLimit;
+    return {
+      call_sites: rows.slice(0, safeLimit).map((row) => ({
+        owner_qualified_name: callerOwnerQualifiedName(row.source_qn),
+        symbol: row.last_segment,
+        line: row.line,
+      })),
+      truncated,
+      available: true,
+    };
+  }
+
   /**
    * Aggregate direct static call-sites for one exact symbol in SQLite.
    *
@@ -1424,7 +1543,10 @@ export class CodeGraphReader {
     const includeTests = options.includeTests === true;
     const incompleteReasons: string[] = [];
 
-    const targetCandidates = this.findNodesByName(project, symbol, undefined, 21)
+    const targetProbe = this.findNodesByName(project, symbol, undefined, 1001);
+    if (targetProbe.length > 1000) incompleteReasons.push('target_search_truncated');
+    const targetCandidates = targetProbe.slice(0, 1000)
+      .filter((node) => includeTests || !isTestSourcePath(node.file_path))
       .map((node) => ({
         qualified_name: node.qualified_name,
         path: normalizePathForSearch(node.file_path),
@@ -1448,6 +1570,7 @@ export class CodeGraphReader {
       else {
         if (status.call_sites_initialized !== 1) incompleteReasons.push('call_sites_not_initialized');
         if (status.cross_file_calls_stale === 1) incompleteReasons.push('cross_file_calls_stale');
+        else if (status.cross_file_calls_stale !== 0) incompleteReasons.push('cross_file_call_status_unknown');
       }
     } catch {
       incompleteReasons.push('project_status_unavailable');

@@ -135,8 +135,14 @@ describe('MCP server protocol compliance', () => {
     });
     expect(lookupTool.inputSchema.properties.operation).toMatchObject({
       type: 'string',
-      enum: ['literal_matches', 'direct_callers', 'top_level_directories'],
+      enum: ['literal_matches', 'direct_callers', 'top_level_directories', 'call_chain'],
       default: 'literal_matches',
+    });
+    expect(lookupTool.inputSchema.properties.max_hops).toMatchObject({
+      type: 'integer',
+      minimum: 1,
+      maximum: 8,
+      default: 6,
     });
     expect(lookupTool.inputSchema.required ?? []).not.toContain('queries');
   });

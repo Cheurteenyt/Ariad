@@ -348,6 +348,43 @@ graph-owned paths with `complete=false`, `inventory_scope=indexed_fallback`,
 and explicit reasons. `inventory_scope=indexed` requests that intentionally
 non-exhaustive view directly.
 
+For a bounded static chain from an HTTP route or CLI command registration to a
+terminal symbol:
+
+```json
+{
+  "operation": "call_chain",
+  "entry": "GET /api/layout",
+  "target_hint": "graph-packing primitive",
+  "max_hops": 6
+}
+```
+
+A one-word lowercase `entry` is treated as a CLI command name and matched at an
+exact `.command(...)` registration boundary; route strings and full command
+declarations are literal. The response returns the entry label/path/line and a
+compact ordered `chain` of symbol definition locations. It builds one bounded
+project call-site map, rolls anonymous callbacks into named owners, and uses
+exact source expressions inside definition ranges to recover calls that a
+multi-line extractor row omitted. Reverse callers prune ambiguous symbol names
+but never constitute the returned forward-hop evidence.
+
+Pass `target_symbol` when its exact name is known. Otherwise `target_hint`
+accepts the task's terminal description and ranks only symbols present in the
+bounded production call-site map. The response exposes the selected symbol,
+lexical score, and nearest alternatives; a tie makes completeness false.
+Normally omit `project` so the server uses its configured index.
+
+For tasks requesting `name@path:line -> ...`, copy `formatted_chain` directly;
+its first label is the route literal or normalized `<name> command` label.
+
+The search is capped at 8 hops, 500 expanded symbols, 200,000 production
+call-sites, 128 outgoing names per node, and 5 equal-length paths. A
+lexicographically stable shortest chain is returned; `shortest_chains_found`
+reports alternatives. `complete` describes coverage of that bounded search,
+while stale/uninitialized call-sites, ambiguous viable entries or targets, an
+unreadable source, or any cap set it to false with `incomplete_reasons`.
+
 Existing clients may omit `operation`; `literal_matches` remains the default.
 Arguments for unrelated profiles are rejected or ignored only according to the
 documented profile, so no previously valid literal request changes behavior.

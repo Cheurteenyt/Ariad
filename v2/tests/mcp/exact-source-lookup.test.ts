@@ -29,6 +29,7 @@ interface Harness {
     qualifiedName: string;
     path: string;
     startLine?: number;
+    endLine?: number;
   }): void;
   addCallSite(callSite: {
     path: string;
@@ -37,6 +38,7 @@ interface Harness {
     line: number;
   }): void;
   initializeGit(): void;
+  setCallSiteStatus(status: { stale: number | null; initialized: number | null }): void;
   close(): void;
 }
 
@@ -123,7 +125,7 @@ function createHarness(files: Record<string, string>): Harness {
         node.qualifiedName,
         node.path,
         node.startLine ?? 1,
-        node.startLine ?? 1,
+        node.endLine ?? node.startLine ?? 1,
       );
     },
     addCallSite(callSite) {
@@ -142,6 +144,13 @@ function createHarness(files: Record<string, string>): Harness {
     initializeGit() {
       execFileSync('git', ['init', '--quiet'], { cwd: root, windowsHide: true });
       execFileSync('git', ['add', '--all'], { cwd: root, windowsHide: true });
+    },
+    setCallSiteStatus(status) {
+      db.prepare(`
+        UPDATE projects
+        SET cross_file_calls_stale = ?, call_sites_initialized = ?
+        WHERE name = 'test'
+      `).run(status.stale, status.initialized);
     },
     close() {
       codeReader.close();
@@ -423,6 +432,240 @@ describe('lookup_source_text', () => {
     ])).toEqual(['.github', 'src']);
   });
 
+  it('traces an HTTP entry through exact source fallback and persistent call sites', async () => {
+    const harness = createHarness({
+      'src/server.ts': "routes.set('GET /work', () => start());\n",
+      'src/flow.ts': [
+        'export function start() {',
+        '  middle(',
+        '  );',
+        '}',
+        'export function middle() {',
+        '  finish();',
+        '}',
+        'export function finish() {}',
+        '',
+      ].join('\n'),
+    });
+    for (const node of [
+      { name: 'start', startLine: 1, endLine: 4 },
+      { name: 'middle', startLine: 5, endLine: 7 },
+      { name: 'finish', startLine: 8, endLine: 8 },
+    ]) {
+      harness.addCodeNode({
+        label: 'Function',
+        name: node.name,
+        qualifiedName: `test::src/flow.ts::${node.name}`,
+        path: 'src/flow.ts',
+        startLine: node.startLine,
+        endLine: node.endLine,
+      });
+    }
+    // The multiline start -> middle call intentionally has no persistent row;
+    // call_chain must recover it from the bounded definition text.
+    harness.addCallSite({
+      path: 'src/flow.ts',
+      sourceQualifiedName: 'test::src/flow.ts::middle',
+      callee: 'finish',
+      line: 6,
+    });
+
+    try {
+      const response = await harness.tool.handle({
+        operation: 'call_chain',
+        entry: 'GET /work',
+        target_symbol: 'finish',
+      });
+      expect(response.isError).not.toBe(true);
+      expect(JSON.parse(response.content[0].text)).toMatchObject({
+        project: 'test',
+        operation: 'call_chain',
+        entry: {
+          label: 'GET /work',
+          path: 'src/server.ts',
+          line: 1,
+        },
+        chain: [
+          { name: 'start', path: 'src/flow.ts', definition_line: 1 },
+          { name: 'middle', path: 'src/flow.ts', definition_line: 5 },
+          { name: 'finish', path: 'src/flow.ts', definition_line: 8 },
+        ],
+        formatted_chain: 'GET /work@src/server.ts:1 -> start@src/flow.ts:1 -> middle@src/flow.ts:5 -> finish@src/flow.ts:8',
+        shortest_chains_found: 1,
+        alternative_chains_truncated: false,
+        complete: true,
+        incomplete_reasons: [],
+      });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('labels a CLI registration and omits its enclosing registration helper', async () => {
+    const harness = createHarness({
+      'src/program.ts': [
+        'function addCommand() {',
+        "  const command = program.command('test [filter...]');",
+        '  command.action(() => runTests());',
+        '}',
+        'function runTests() {',
+        '  return finish();',
+        '}',
+        'function finish() {}',
+        '',
+      ].join('\n'),
+    });
+    for (const node of [
+      { name: 'addCommand', startLine: 1, endLine: 4 },
+      { name: 'runTests', startLine: 5, endLine: 7 },
+      { name: 'finish', startLine: 8, endLine: 8 },
+    ]) {
+      harness.addCodeNode({
+        label: 'Function',
+        name: node.name,
+        qualifiedName: `test::src/program.ts::${node.name}`,
+        path: 'src/program.ts',
+        startLine: node.startLine,
+        endLine: node.endLine,
+      });
+    }
+    harness.addCallSite({
+      path: 'src/program.ts',
+      sourceQualifiedName: 'test::src/program.ts::addCommand::anonymous#1',
+      callee: 'runTests',
+      line: 3,
+    });
+    harness.addCallSite({
+      path: 'src/program.ts',
+      sourceQualifiedName: 'test::src/program.ts::runTests',
+      callee: 'finish',
+      line: 6,
+    });
+
+    try {
+      const response = await harness.tool.handle({
+        operation: 'call_chain',
+        entry: 'test',
+        target_symbol: 'finish',
+      });
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.entry).toMatchObject({ label: 'test command', line: 2 });
+      expect(payload.chain).toEqual([
+        { name: 'runTests', path: 'src/program.ts', definition_line: 5 },
+        { name: 'finish', path: 'src/program.ts', definition_line: 8 },
+      ]);
+      expect(payload.formatted_chain).toBe(
+        'test command@src/program.ts:2 -> runTests@src/program.ts:5 -> finish@src/program.ts:8',
+      );
+      expect(payload.complete).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('resolves a unique reachable terminal from a semantic target hint', async () => {
+    const harness = createHarness({
+      'src/flow.ts': [
+        "routes.set('GET /tasks', () => start());",
+        'function start() { runTasks(); createRunTestsTasks(); }',
+        'function runTasks() {}',
+        'function createRunTestsTasks() {}',
+        '',
+      ].join('\n'),
+    });
+    for (const node of [
+      { name: 'start', line: 2 },
+      { name: 'runTasks', line: 3 },
+      { name: 'createRunTestsTasks', line: 4 },
+    ]) {
+      harness.addCodeNode({
+        label: 'Function',
+        name: node.name,
+        qualifiedName: `test::src/flow.ts::${node.name}`,
+        path: 'src/flow.ts',
+        startLine: node.line,
+        endLine: node.line,
+      });
+    }
+    for (const callee of ['runTasks', 'createRunTestsTasks']) {
+      harness.addCallSite({
+        path: 'src/flow.ts',
+        sourceQualifiedName: 'test::src/flow.ts::start',
+        callee,
+        line: 2,
+      });
+    }
+
+    try {
+      const response = await harness.tool.handle({
+        operation: 'call_chain',
+        entry: 'GET /tasks',
+        target_hint: 'shared task executor',
+      });
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.target_symbol).toBe('runTasks');
+      expect(payload.target_resolution).toMatchObject({
+        mode: 'semantic_hint',
+        hint: 'shared task executor',
+        selected_symbol: 'runTasks',
+      });
+      expect(payload.formatted_chain).toBe(
+        'GET /tasks@src/flow.ts:1 -> start@src/flow.ts:2 -> runTasks@src/flow.ts:3',
+      );
+      expect(payload.complete).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('fails chain completeness closed for stale metadata, hop bounds, and duplicate targets', async () => {
+    const harness = createHarness({
+      'src/server.ts': "routes.set('GET /work', () => start());\n",
+      'src/flow.ts': [
+        'function start() { middle(); }',
+        'function middle() { finish(); }',
+        'function finish() {}',
+        '',
+      ].join('\n'),
+      'src/other.ts': 'function finish() {}\n',
+    });
+    for (const node of [
+      { name: 'start', path: 'src/flow.ts', line: 1 },
+      { name: 'middle', path: 'src/flow.ts', line: 2 },
+      { name: 'finish', path: 'src/flow.ts', line: 3 },
+      { name: 'finish', path: 'src/other.ts', line: 1 },
+    ]) {
+      harness.addCodeNode({
+        label: 'Function',
+        name: node.name,
+        qualifiedName: `test::${node.path}::${node.name}`,
+        path: node.path,
+        startLine: node.line,
+        endLine: node.line,
+      });
+    }
+    harness.setCallSiteStatus({ stale: 1, initialized: 1 });
+
+    try {
+      const response = await harness.tool.handle({
+        operation: 'call_chain',
+        entry: 'GET /work',
+        target_symbol: 'finish',
+        max_hops: 1,
+      });
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.chain).toEqual([]);
+      expect(payload.complete).toBe(false);
+      expect(payload.incomplete_reasons).toEqual(expect.arrayContaining([
+        'chain_not_found',
+        'cross_file_call_status_unknown_or_stale',
+        'target_ambiguous',
+      ]));
+    } finally {
+      harness.close();
+    }
+  });
+
   it('rejects empty, multiline, duplicate, or oversized query batches', async () => {
     const harness = createHarness({ 'src/a.ts': 'value\n' });
     try {
@@ -437,6 +680,7 @@ describe('lookup_source_text', () => {
         expect(response.isError).toBe(true);
       }
       expect((await harness.tool.handle({ operation: 'direct_callers' })).isError).toBe(true);
+      expect((await harness.tool.handle({ operation: 'call_chain', entry: 'start' })).isError).toBe(true);
       expect((await harness.tool.handle({ operation: 'unknown' })).isError).toBe(true);
     } finally {
       harness.close();
