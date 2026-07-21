@@ -1351,3 +1351,73 @@ type impact, but its current graph evidence does not beat careful source
 inspection on the multi-hop caller problem that was supposed to provide the
 clearest correctness advantage. No broader superiority or savings claim is
 justified by this round.
+
+## 15. R177 multi-hop caller correction round — 2026-07-21
+
+This bounded follow-up tests only the accepted weakness exposed by r176 T01.
+It does not rerun or reinterpret T02–T04, compare Graph UI behavior, or change
+the pinned source targets. The historical `tasks-r173.json` is the frozen
+24-question token round and contains no structural T01. Therefore the exact
+r176 multi-hop questions and TypeScript-oracle answers are read from the
+active `scripts/benchmark/v1-v2-truth-audit/tasks.json`, as they were for the
+r176 baseline.
+
+### 15.1 Candidate and mechanism fixed before measurement
+
+The product correction is code commit
+`9bcb3a65b9ba6bb2949e03120a512ff7d454bbfc`, descended from r176/main
+`29101436e64113815b5a8223ab0a4b1e7bab3ebb`. It adds no MCP tool. The existing
+`lookup_source_text.direct_callers` operation retains its original depth-one
+contract and accepts optional `max_depth` for an identity-aware reverse
+TypeScript call traversal. The exact pre-fix mechanism and pinned-source
+reproduction were committed to `docs/ai/CURRENT_HANDOFF.md` before that code
+was written.
+
+Before any agent cell, the focused regression, all MCP tests, TypeScript
+typecheck, backend build, documentation check, and direct oracle smokes must
+pass. The independent oracle is re-verified against both clean target
+checkouts. The pinned source commits, project names, V2 databases, task text,
+reference arrays, answer format, model (`gpt-5.6-sol`), reasoning (`medium`),
+read-only sandbox, and condition-B policy remain unchanged from r176.
+
+### 15.2 Four-cell protocol pre-registration
+
+Only condition B (V2 MCP-only) and T01 are measured. The four selected cells
+are fixed as small/large × one-shot/continuous, attempt 1, in this execution
+order:
+
+1. one-shot small T01 B;
+2. one-shot large T01 B;
+3. continuous small T01 B;
+4. continuous large T01 B.
+
+For continuous mode, T01 is already the first turn of every r176 session. The
+existing pipeline may stop after that first registered task; it uses the same
+continuous initial prompt and zero prior observed context as r176, while
+avoiding out-of-scope T02–T04 executions. The runner rejects continuous
+`--task` filtering for any task other than the first registered task.
+
+Raw artifacts are written once under
+`D:/Mycodex/benchmark-results/r177-multihop-callers-final`, phase `postfix`.
+No artifact may be overwritten. A protocol-invalid cell may receive one clean
+attempt-2 rerun; the invalid attempt remains recorded. The existing proxy,
+summarizer, grader, and checkpoint scripts remain the only measurement path.
+The run order, answer arrays, or grading rules will not change after observing
+an answer.
+
+The immutable r176 before-values are:
+
+| Usage | Target | Grade | Raw tokens | Uncached + output | Calls | Response bytes |
+|---|---|---|---:|---:|---:|---:|
+| one-shot | small | PARTIAL | 100,040 | 18,632 | 7 | 5,534 |
+| one-shot | large | FAIL | 615,435 | 78,859 | 30 | 104,935 |
+| continuous | small | PARTIAL | 106,822 | 11,078 | 7 | 5,534 |
+| continuous | large | FAIL | 356,748 | 44,684 | 16 | 92,379 |
+
+Success requires all four post-fix answers to receive mechanical `PASS` with
+no protocol violation. The final report will publish each before/after grade,
+native raw-token count, uncached-input-plus-output count, completed call count,
+response bytes, and aggregate deltas. Lower tokens or calls do not compensate
+for an inexact answer; a non-PASS cell leaves the finding open. Results and the
+exact pushed pre-registration SHA are appended only after this section is
+committed and pushed before the first measured process starts.
