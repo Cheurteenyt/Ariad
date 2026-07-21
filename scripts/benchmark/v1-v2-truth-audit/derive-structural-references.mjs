@@ -277,6 +277,7 @@ function directCallerSites(analysis, derivation) {
   const { callSites } = analyzeCalls(analysis, derivation);
   const rows = (callSites.get(symbolKey(analysis.checker, origin)) ?? []).map(({ call }) => {
     const location = sourceLocation(analysis.target, call);
+    if (derivation.location_format === 'path_line') return `${location.path}:${location.line}`;
     return `${location.path}:${location.line}:${location.column}`;
   });
   return rows.sort();
@@ -417,6 +418,7 @@ function main() {
       include_prefixes: options.include_prefixes?.split(',').filter(Boolean),
       exclude_prefixes: options.exclude_prefixes?.split(',').filter(Boolean),
       max_depth: options.max_depth ? Number(options.max_depth) : undefined,
+      location_format: options.location_format,
     };
     const answer = derive(buildAnalysis(target), derivation);
     console.log(JSON.stringify({ target: target.id, derivation, answer }, null, 2));

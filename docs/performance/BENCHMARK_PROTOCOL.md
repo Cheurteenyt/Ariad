@@ -1086,7 +1086,8 @@ The three derivation operators are fixed before measurement:
   interface, class, and enum declarations, then records files referencing any
   impacted canonical symbol through aliases or re-exports;
 - `direct_caller_sites` records every statically resolved call expression,
-  including calls inside anonymous callbacks, as `path:line:column`.
+  including calls inside anonymous callbacks, using the task's fixed
+  `path:line` or `path:line:column` format.
 
 This is a static TypeScript oracle. Dynamic string dispatch, reflection,
 runtime-only module resolution, and untyped CommonJS calls are outside its
@@ -1128,12 +1129,12 @@ reproduce all eight registered arrays before and after the measured run.
 
 #### T04 — exhaustive call sites
 
-**Question.** Return every production call site under `v2/src` that resolves to the exported function `defaultCodeDbPath`. Use `path:line:column`, sort lexicographically, and return a JSON string array. Count distinct calls separately even when two calls share one line.
+**Question.** Return every production call site under `v2/src` that resolves to the exported function `defaultCodeDbPath`. Use `path:line`, repeat the same `path:line` once per distinct call when multiple calls share one line, sort lexicographically, and return a JSON string array.
 
 **Reference answer.**
 
 ```json
-["v2/src/cli/commands/human.ts:213:46","v2/src/cli/commands/obsidian.ts:176:46","v2/src/cli/commands/obsidian.ts:207:46","v2/src/cli/commands/obsidian.ts:279:46","v2/src/cli/commands/obsidian.ts:339:46","v2/src/cli/commands/obsidian.ts:405:46","v2/src/cli/commands/obsidian.ts:91:44","v2/src/cli/commands/report.ts:31:40","v2/src/cli/commands/stats.ts:21:42","v2/src/cli/commands/watch.ts:85:42","v2/src/cli/index.ts:166:46","v2/src/cli/index.ts:169:39","v2/src/cli/index.ts:53:40","v2/src/indexer/indexer.ts:620:18","v2/src/intelligence/graph-status.ts:137:18","v2/src/intelligence/graph-status.ts:195:18","v2/src/ui/project-store-registry.ts:101:31","v2/src/ui/project-store-registry.ts:101:6","v2/src/ui/project-store-registry.ts:199:29","v2/src/ui/project-store-registry.ts:254:24","v2/src/ui/routes/index.ts:323:5","v2/src/ui/routes/index.ts:324:5","v2/src/ui/routes/project.ts:161:18","v2/src/ui/routes/project.ts:214:18","v2/src/ui/server.ts:431:36","v2/src/ui/server.ts:431:61"]
+["v2/src/cli/commands/human.ts:213","v2/src/cli/commands/obsidian.ts:176","v2/src/cli/commands/obsidian.ts:207","v2/src/cli/commands/obsidian.ts:279","v2/src/cli/commands/obsidian.ts:339","v2/src/cli/commands/obsidian.ts:405","v2/src/cli/commands/obsidian.ts:91","v2/src/cli/commands/report.ts:31","v2/src/cli/commands/stats.ts:21","v2/src/cli/commands/watch.ts:85","v2/src/cli/index.ts:166","v2/src/cli/index.ts:169","v2/src/cli/index.ts:53","v2/src/indexer/indexer.ts:620","v2/src/intelligence/graph-status.ts:137","v2/src/intelligence/graph-status.ts:195","v2/src/ui/project-store-registry.ts:101","v2/src/ui/project-store-registry.ts:101","v2/src/ui/project-store-registry.ts:199","v2/src/ui/project-store-registry.ts:254","v2/src/ui/routes/index.ts:323","v2/src/ui/routes/index.ts:324","v2/src/ui/routes/project.ts:161","v2/src/ui/routes/project.ts:214","v2/src/ui/server.ts:431","v2/src/ui/server.ts:431"]
 ```
 
 ### 14.3 Pre-registered large-target task mapping
@@ -1183,7 +1184,7 @@ reproduce all eight registered arrays before and after the measured run.
 The existing `scripts/benchmark/v1-v2-truth-audit/` pipeline is reused without
 a second harness: `verify-spec.mjs`, `run.mjs`, `summarize.mjs`,
 `proxy.mjs`, and `checkpoint.mjs`. Raw artifacts go to the new external root
-`D:/Mycodex/benchmark-results/r175-structural-correctness-final`; the immutable
+`D:/Mycodex/benchmark-results/r176-structural-correctness-final`; the immutable
 publication checkpoint goes to
 `docs/performance/benchmarks/structural-correctness-baseline-2026-07-21`.
 
@@ -1236,3 +1237,20 @@ final result. Its raw artifacts remain immutable and disclosed. The corrected
 oracle adds a synthetic regression test covering production `src/.../test`
 callers and chained star re-exports. A new pushed pre-registration commit and a
 fresh r175 run are required before any comparative conclusion.
+
+### 14.6 Invalid column-convention validation round
+
+Commit `e0df68b9c8c535031cc05971e214ae0c1450d53e` was pushed before a second
+32-cell validation run in
+`D:/Mycodex/benchmark-results/r175-structural-correctness-final`. Its oracle
+and tool traces were valid, but the small-target T04 output contract was not:
+`rg --column` reports a UTF-8 byte column while the TypeScript compiler reports
+a UTF-16 source-character column. On `v2/src/cli/index.ts:169`, an emoji before
+the call makes those two valid conventions differ (`41` versus `39`). The task
+had not specified either convention.
+
+The two grep T04 answers therefore cannot honestly be called product failures,
+and r175 is not pooled into the final comparison. T04 now uses `path:line` and
+requires duplicate entries for distinct calls on the same line, preserving
+exhaustive cardinality without an encoding trap. A fresh pushed r3
+pre-registration and r176 run are required for the final conclusion.
