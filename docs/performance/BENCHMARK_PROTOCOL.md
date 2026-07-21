@@ -1254,3 +1254,100 @@ and r175 is not pooled into the final comparison. T04 now uses `path:line` and
 requires duplicate entries for distinct calls on the same line, preserving
 exhaustive cardinality without an encoding trap. A fresh pushed r3
 pre-registration and r176 run are required for the final conclusion.
+
+### 14.7 Final r176 integrity
+
+The final pre-registration commit is
+`0f9439708546bbef6cbd700fcc2ae83a1f14cc1c`; it was pushed before every r176
+process started. The run used Codex CLI `0.144.4`, `gpt-5.6-sol`, reasoning
+`medium`, the unchanged pinned checkouts and V2 indexes, and attempt 1 for all
+cells. All **32/32 selected cells are valid**: B used only allowed read-only
+MCP evidence through `proxy.mjs`, C used no MCP, and the trace audit found zero
+forbidden evidence operations.
+
+The canonical publication checkpoint is
+[`structural-correctness-baseline-2026-07-21`](benchmarks/structural-correctness-baseline-2026-07-21/aggregate-and-ratios.md).
+Its [selected-run CSV](benchmarks/structural-correctness-baseline-2026-07-21/selected-runs.csv)
+and [complete per-task table](benchmarks/structural-correctness-baseline-2026-07-21/per-task.md)
+retain native input, cached input, output, call, byte, grade, and validity
+fields. The [raw manifest](benchmarks/structural-correctness-baseline-2026-07-21/raw-artifact-manifest.json)
+covers 160 non-derived artifacts (2,062,334 bytes) under
+`D:/Mycodex/benchmark-results/r176-structural-correctness-final`, with tree
+SHA-256
+`6cfaa74403bcdd65bc41129afcaac1417da8d6f9aa13c2cd027cb8104703112c`.
+
+The first checkpoint attempt exposed a publication-only defect: the report
+assumed A and D existed and dereferenced their absent aggregates. The measured
+prompts, answers, grades, and raw artifacts were unaffected. The checkpoint
+now emits `n/a` for unavailable ratios, derives arm/task columns from selected
+runs, and has a B/C-only regression test.
+
+### 14.8 Final grades and native accounting
+
+| Usage | Target | Arm | Raw tokens | Calls | PASS | PARTIAL | FAIL |
+|---|---|---|---:|---:|---:|---:|---:|
+| one-shot | small | B V2 MCP | 917,106 | 32 | 3 | 1 | 0 |
+| one-shot | small | C grep/read | 366,319 | 17 | 3 | 0 | 1 |
+| one-shot | large | B V2 MCP | 1,042,001 | 44 | 3 | 0 | 1 |
+| one-shot | large | C grep/read | 690,565 | 37 | 4 | 0 | 0 |
+| continuous | small | B V2 MCP | 1,963,616 | 26 | 2 | 2 | 0 |
+| continuous | small | C grep/read | 2,970,158 | 20 | 3 | 1 | 0 |
+| continuous | large | B V2 MCP | 3,329,913 | 28 | 3 | 0 | 1 |
+| continuous | large | C grep/read | 2,266,706 | 18 | 2 | 2 | 0 |
+| **All** | **both** | **B V2 MCP** | **7,252,636** | **130** | **11** | **3** | **2** |
+| **All** | **both** | **C grep/read** | **6,293,748** | **92** | **12** | **3** | **1** |
+
+The full grade matrix is:
+
+| Usage | Target | Task | B V2 MCP | C grep/read |
+|---|---|---|---|---|
+| one-shot | small | T01 multi-hop callers | PARTIAL | FAIL |
+| one-shot | small | T02 type impact | PASS | PASS |
+| one-shot | small | T03 negative callers | PASS | PASS |
+| one-shot | small | T04 exhaustive callers | PASS | PASS |
+| one-shot | large | T01 multi-hop callers | FAIL | PASS |
+| one-shot | large | T02 alias/re-export type impact | PASS | PASS |
+| one-shot | large | T03 alias-aware callers | PASS | PASS |
+| one-shot | large | T04 negative callers | PASS | PASS |
+| continuous | small | T01 multi-hop callers | PARTIAL | PARTIAL |
+| continuous | small | T02 type impact | PARTIAL | PASS |
+| continuous | small | T03 negative callers | PASS | PASS |
+| continuous | small | T04 exhaustive callers | PASS | PASS |
+| continuous | large | T01 multi-hop callers | FAIL | PARTIAL |
+| continuous | large | T02 alias/re-export type impact | PASS | PARTIAL |
+| continuous | large | T03 alias-aware callers | PASS | PASS |
+| continuous | large | T04 negative callers | PASS | PASS |
+
+Both arms are exact on every direct exhaustive/negative task. Shared-type
+impact is also tied at 3 PASS and 1 PARTIAL per arm. The entire accuracy gap is
+the multi-hop category: V2 records 0 PASS, 2 PARTIAL, 2 FAIL, while grep/read
+records 1 PASS, 2 PARTIAL, 1 FAIL.
+
+V2 uses 1.152355639 times the total native tokens of grep/read: 958,888 more,
+or **15.2355639% more**. It uses 130 versus 92 completed calls
+(1.413043478 times). The split is not uniform: V2/grep tokens are 1.853663221
+in one-shot, 1.010820407 in continuous, 0.863402325 on the small target, and
+1.478360962 on the large target. These are native counts, not cost estimates.
+
+### 14.9 Grep/read non-PASS inspection and conclusion
+
+| Usage | Target/task | Grade | Classification | Inspection evidence |
+|---|---|---|---|---|
+| one-shot | small T01 | FAIL | catchable-by-inspection | The trace reads the membership/page/route bodies, but the final answer places `getExactScopePage` and `routeScope` one hop too deep despite those direct calls being visible. |
+| continuous | small T01 | PARTIAL | catchable-by-inspection | Two focused `Select-String` commands exit nonzero, and the later successful definition search includes `routeLayout` and `routeScope`; both are nevertheless omitted. |
+| continuous | large T01 | PARTIAL | catchable-by-inspection | The trace reads and searches `program.ts`, `testTools.ts`, and `testContext.ts`, then omits seven callers present in that inspected evidence. |
+| continuous | large T02 | PARTIAL | catchable-by-inspection | The task explicitly requires re-exports, but the trace never audits bare `export *` shims and one compound search exits nonzero; the two shim files are omitted. |
+
+There are **zero plausibly-undetected grep/read failures** in r176. This does
+not turn the four non-PASS cells into successes; it means their raw evidence
+contains a review signal that could have prevented accepting the answer.
+
+The pre-registered correctness hypothesis is **not supported**. On these two
+pinned commits and eight structurally completeness-prone tasks, grep/read has
+more exact answers (12/16, 75% versus 11/16, 68.75%), the same PARTIAL count
+(3/16), fewer FAILs (1/16 versus 2/16), fewer calls, and fewer total tokens.
+V2 is reliable on direct exhaustive and negative queries and competitive on
+type impact, but its current graph evidence does not beat careful source
+inspection on the multi-hop caller problem that was supposed to provide the
+clearest correctness advantage. No broader superiority or savings claim is
+justified by this round.
