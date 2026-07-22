@@ -6,6 +6,9 @@
 
 This directory is intentionally idle on `main`.
 
+The active R180 documentation branch records its recoverable state in
+[`CURRENT_HANDOFF.md`](CURRENT_HANDOFF.md).
+
 During one active `v2/r<n>-<short-name>` round, the implementation agent
 creates and commits:
 
