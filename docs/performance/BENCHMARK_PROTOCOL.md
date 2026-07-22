@@ -1722,3 +1722,173 @@ two usage modes, and one attempt per cell. Moreover, C did not reach exact
 correctness in any cell, so the ratio describes a more expensive and less
 accurate grep/read attempt rather than equal-quality successful answers. R178
 does not change or generalize the wider mixed findings from R176 T02-T04.
+
+## 17. R179 T02-T04 structural token-cost round — 2026-07-22
+
+R179 investigates the remaining R176 structural tasks where V2 condition B
+often consumed more native raw tokens than grep/read condition C despite
+near-tied correctness. This section is append-only. Subsections 17.1-17.6 are
+the required **diagnosis checkpoint written before any R179 product change**.
+No result below is a fresh R179 measurement unless a later subsection says so.
+
+### 17.1 Evidence identity and mechanical re-verification
+
+The diagnosis starts from clean post-R178 `main` at
+`148e4b65849efc3fcfbc4fb716abf0898424293d`. Its immutable source evidence is
+the R176 raw root
+`D:/Mycodex/benchmark-results/r176-structural-correctness-final`, the pinned V2
+state `D:/Mycodex/benchmark-state/v2-r173-final`, and the canonical
+[`structural-correctness-baseline-2026-07-21`](benchmarks/structural-correctness-baseline-2026-07-21/aggregate-and-ratios.md)
+checkpoint. The current runner verified both pinned repositories and reported
+Codex CLI `0.144.4`.
+
+The existing native-accounting summarizer was rerun against that external raw
+root into a new derived-only directory. It selected 32 records with zero
+invalid cells. Filtering the regenerated CSV to B/C and T02-T04 produced all
+24 expected rows, and a field-by-field JSON comparison exactly matched the
+canonical selected-run CSV. Thus the following diagnosis is a re-derivation of
+unchanged evidence, not a hand-transcribed alternative result.
+
+| Usage | Target | Task | B/C raw | B/C uncached + output | B calls / C calls | B/C response bytes | Prior bytes B / C | Grade B / C |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| one-shot | small | T02 | 4.918x | 2.305x | 21 / 6 | 98,570 / 30,736 | 0 / 0 | PASS / PASS |
+| one-shot | small | T03 | 1.248x | 0.911x | 1 / 2 | 516 / 5,456 | 0 / 0 | PASS / PASS |
+| one-shot | small | T04 | 1.503x | 0.632x | 3 / 2 | 21,486 / 9,153 | 0 / 0 | PASS / PASS |
+| one-shot | large | T02 | 1.103x | 0.988x | 8 / 8 | 76,271 / 95,836 | 0 / 0 | PASS / PASS |
+| one-shot | large | T03 | 2.030x | 2.959x | 4 / 3 | 17,684 / 3,181 | 0 / 0 | PASS / PASS |
+| one-shot | large | T04 | 1.317x | 3.533x | 2 / 3 | 1,456 / 1,335 | 0 / 0 | PASS / PASS |
+| continuous | small | T02 | 0.695x | 0.892x | 15 / 5 | 81,660 / 36,488 | 7,860 / 701,049 | PARTIAL / PASS |
+| continuous | small | T03 | 0.717x | 0.914x | 2 / 2 | 9,158 / 4,972 | 92,654 / 739,965 | PASS / PASS |
+| continuous | small | T04 | 0.740x | 0.983x | 2 / 2 | 16,753 / 4,058 | 102,427 / 745,898 | PASS / PASS |
+| continuous | large | T02 | 1.483x | 1.329x | 7 / 3 | 44,249 / 12,828 | 96,207 / 87,755 | PASS / PARTIAL |
+| continuous | large | T03 | 1.547x | 1.366x | 3 / 2 | 14,249 / 2,835 | 142,401 / 102,544 | PASS / PASS |
+| continuous | large | T04 | 1.608x | 1.349x | 2 / 1 | 1,456 / 361 | 157,745 / 106,755 | PASS / PASS |
+
+The MCP tool-list/schema response contributes 9,653 response bytes to every B
+cell and zero to C. Native raw input also includes cached input and prior
+conversation. Therefore a raw-token loss is not automatically a current-task
+payload loss. On continuous small, C inherits the pathological R176 T01 grep
+response (696,164 bytes), so B's raw wins on T02-T04 do not establish superior
+current-task efficiency. On continuous large, B instead carries progressively
+more prior context than C; its uncached-plus-output ratios still remain
+1.329x-1.366x-1.349x, confirming a current-task mechanism in addition to
+cached context. Both raw and uncached values remain reported.
+
+### 17.2 T02 diagnosis: transitive named-type impact
+
+T02 asks for files that reference a root type or any transitively dependent
+named type, following TypeScript symbol identity through aliases and
+re-exports. Condition B had no identity-aware operation for this question.
+
+- Small one-shot used 21 MCP calls and returned 98,570 bytes; continuous used
+  15 calls and 81,660 bytes. The sequences repeatedly alternated
+  `search_code_and_memory`, `literal_matches`, `get_module`, and `prepare_edit`,
+  included two invalid newline literal queries, and manually inspected the
+  resulting modules.
+- Large one-shot used eight calls and returned 76,271 bytes; continuous used
+  seven calls and 44,249 bytes. It similarly chased the root name, aliases,
+  import paths, re-exports, and component-test variants through literals and
+  module bodies.
+- No single response explains the result. The largest observed T02 response is
+  18,985 bytes; the dominant mechanism is many redundant discovery and source
+  round trips whose aggregate payload becomes large. Large one-shot is the
+  useful boundary case: B and C both use eight calls, B returns fewer bytes and
+  has a slightly lower uncached count, yet B raw is 1.103x C because of fixed
+  MCP/schema/cache accounting.
+
+The small T02 answer is exact in one-shot but PARTIAL in continuous despite
+the repeated work. This is the same root family as T01: name/string matching
+stands in for compiler symbol identity. The specific graph is different
+(reverse named-type dependencies rather than reverse calls), so the T01
+`direct_callers` mechanism must not be changed. A bounded identity-aware
+operation inside the existing `lookup_source_text` tool is justified.
+
+### 17.3 T03 diagnosis: exact production call sites
+
+T03 asks for every production call site resolving to one declared function,
+including exact path, line, and column where required.
+
+- Small one-shot is already the counterexample to a forced fix:
+  `direct_callers(resolveActiveCodeDb)` returned the correct empty set in one
+  call and 516 response bytes. B raw is 1.248x C, but B uncached-plus-output is
+  0.911x C and uses less payload and fewer calls. That residual raw loss is
+  fixed MCP/schema/cache cost, not a defective query result. Continuous small
+  ignored the available operation and used one search plus one literal scan;
+  its raw win is caused by C's inherited T01 context.
+- Large one-shot used four calls and 17,684 bytes; continuous used three calls
+  and 14,249 bytes. `direct_callers(outputDir)` returned
+  `complete:false` because the short name matched the intended declaration in
+  `context.ts` and an unrelated nested declaration in `tasks.ts`. It exposed
+  one caller aggregate, but not every exact call position. The model then used
+  broad literal scans and a module read to recover same-file and renamed-import
+  calls, including a 9,974-byte truncated literal response.
+
+The large failure mechanism is again name ambiguity versus compiler identity,
+but the missing product capability is narrower than T01: declaration-path
+disambiguation plus exact call-site positions. The existing direct aggregation
+must remain unchanged. A separate bounded operation on `lookup_source_text`
+that accepts the declaration path and returns compiler-resolved production
+call sites is justified; no change is justified for the already efficient
+small empty-set path by itself.
+
+### 17.4 T04 diagnosis: duplicate positions and definitive empty sets
+
+T04 is also an exact production call-site question, with duplicate calls on
+one line preserved where applicable.
+
+- Small one-shot first called `direct_callers(defaultCodeDbPath)`. It correctly
+  reported 27 total call sites aggregated into 17 owning callers, but did not
+  return the individual locations. Two additional literal scans were required,
+  producing 21,486 response bytes across three calls and mixing production,
+  test, and documentation matches. Continuous small used the two literal scans
+  directly. The mechanism is not one unusually large response; it is missing
+  positional output followed by redundant broad scans. Notably, B already has
+  lower uncached-plus-output than C in one-shot, so its 1.503x raw loss also
+  contains substantial fixed/cache cost.
+- Large T04 has no production callers. In both modes B obtained a definitive
+  identity-aware empty result from `direct_callers(generateReadme)` and then
+  redundantly ran a literal scan. Payload stayed small (1,456 bytes), yet the
+  one-shot B uncached count is 3.533x C and continuous B uncached is 1.349x C.
+  Here fixed MCP/schema/model overhead dominates, while an exact positional
+  operation can at least make the redundant confirmation unnecessary.
+
+T04 therefore shares T03's missing exact-call-site output, including duplicate
+locations, rather than T02's type-dependency traversal. It is still in the T01
+symbol-identity family, but it is not a reason to alter `direct_callers`.
+
+### 17.5 Pre-code product decision and non-decisions
+
+The existing TypeScript oracle proves that both missing result shapes can be
+derived safely from compiler identity on the indexed, root-confined source
+inventory. R179 may therefore add two bounded operations to the existing
+`lookup_source_text` tool:
+
+1. `symbol_call_sites`: identify one declaration by symbol, repository path,
+   and optional definition line; return sorted production call positions with
+   aliases resolved and duplicate occurrences preserved. This is the shared
+   T03/T04 correction.
+2. `transitive_type_impact`: identify one named type declaration by symbol,
+   repository path, and optional definition line; return sorted files that
+   reference that type or transitively dependent named types. This is the T02
+   correction.
+
+Both operations must reuse an on-demand bounded TypeScript program, report
+incompleteness and truncation explicitly, preserve root/path safety, default to
+excluding tests, and return copy-ready compact arrays. They may share internal
+analysis code with the existing semantic caller tracer. They must not modify
+T01, change `direct_callers`, add a new MCP tool, alter the benchmark oracle,
+or claim to eliminate the fixed MCP/schema cost. Regressions must cover aliases,
+same-name ambiguity, same-file calls, duplicate positions, re-exports,
+production filtering, deterministic ordering, bounds, and fail-closed target
+selection before a fresh measurement is considered.
+
+### 17.6 Diagnosis checkpoint conclusion
+
+The diagnosis supports a narrow product fix for T02 and the shared T03/T04
+positional gap, but not a blanket claim that every historical raw-token loss is
+fixable. T02 is mainly a redundant-round-trip and aggregate-payload problem.
+Large T03 and small T04 are missing-identity/output-shape problems. Small T03
+and large negative T04 show that fixed MCP schema, cache, and model overhead can
+remain after the smallest correct call sequence. Fresh B/C evidence must
+therefore publish correctness, raw tokens, uncached-plus-output, calls, response
+bytes, context, and environment separately, including any unfavorable result.

@@ -13,7 +13,7 @@ base_sha: 148e4b65849efc3fcfbc4fb716abf0898424293d
 last_completed_code_sha: 148e4b65849efc3fcfbc4fb716abf0898424293d
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T18:16:15.2299329Z
+updated_at_utc: 2026-07-22T18:23:57.4665074Z
 implementer_role: codex
 ```
 
@@ -48,15 +48,15 @@ The three diagnoses must be completed and pushed before any product edit.
 
 | Finding | Task | Decision | Evidence | Product change | Validation state |
 |---------|------|----------|----------|----------------|------------------|
-| R179-DIAG-T02 | T02 | IN_PROGRESS | Recompute selected B/C cells and inspect complete MCP traces | forbidden until diagnosis checkpoint | NOT_STARTED |
-| R179-DIAG-T03 | T03 | IN_PROGRESS | Recompute selected B/C cells and inspect complete MCP traces | forbidden until diagnosis checkpoint | NOT_STARTED |
-| R179-DIAG-T04 | T04 | IN_PROGRESS | Recompute selected B/C cells and inspect complete MCP traces | forbidden until diagnosis checkpoint | NOT_STARTED |
+| R179-DIAG-T02 | T02 | ACCEPTED | 21/15 small and 8/7 large B calls manually chase names, aliases, re-exports, and modules; aggregate payload and round trips dominate | add bounded `transitive_type_impact` to existing lookup tool | diagnosis written; product not started |
+| R179-DIAG-T03 | T03 | ACCEPTED WITH BOUNDARY | small one-shot is already one exact 516-byte call; large target is ambiguous by short name and exact positions require broad follow-ups | add bounded declaration-qualified `symbol_call_sites`; do not alter efficient empty path or `direct_callers` | diagnosis written; product not started |
+| R179-DIAG-T04 | T04 | ACCEPTED WITH BOUNDARY | small direct aggregation lacks 27 individual positions; large empty result is followed by redundant literal confirmation; fixed MCP overhead remains | share `symbol_call_sites` with T03 and preserve duplicate positions | diagnosis written; product not started |
 
 ## Pushed checkpoints
 
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
-| `148e4b65849efc3fcfbc4fb716abf0898424293d` | pending | R179-INIT | Initialize bounded T02-T04 diagnosis from the post-R178 canonical main | clean exact base; protocol and artifact inventory read | pending |
+| `e8f4b99aca85cb3eea2cdb86059d5fe89a43d8fc` | `e8f4b99aca85cb3eea2cdb86059d5fe89a43d8fc` | R179-INIT | Initialize bounded T02-T04 diagnosis from the post-R178 canonical main | docs check PASS; clean exact base; protocol and artifact inventory read | [CI 29946043041](https://github.com/Cheurteenyt/Ariad/actions/runs/29946043041) PASS |
 
 ## Exact validation evidence
 
@@ -74,8 +74,26 @@ command: inspect R176 per-task.md, selected-runs.csv, raw-artifact-manifest.json
 working_directory: repository root and D:/Mycodex/benchmark-results/r176-structural-correctness-final
 environment: read-only artifact inspection
 exit_code: 0
-result_summary: all sixteen selected T02-T04 B/C cells and their complete JSONL/MCP traces are locally available; initial table shows call-heavy T02 and low-call but context-heavy T03/T04 patterns
+result_summary: all 24 selected T02-T04 B/C cells and their complete JSONL/MCP traces are locally available; initial table shows call-heavy T02 and low-call but context-heavy T03/T04 patterns
 not_run: no conclusion is accepted until every selected cell is mechanically re-derived
+```
+
+```text
+command: node scripts/benchmark/v1-v2-truth-audit/summarize.mjs --results-root D:/Mycodex/benchmark-results/r176-structural-correctness-final --phase baseline --output-dir D:/Mycodex/benchmark-results/r179-t02-t04-diagnosis-derived; compare filtered generated T02-T04 B/C rows with canonical selected-runs.csv
+working_directory: repository root
+environment: Windows 11, Node v24.15.0, npm 11.12.1, Codex CLI 0.144.4; derived output only, no measured process
+exit_code: 0
+result_summary: 32 selected, 0 invalid; all 24 T02-T04 B/C rows exactly match the canonical CSV
+not_run: no fresh benchmark cell and no product code before the diagnosis checkpoint
+```
+
+```text
+command: inspect every selected R176 T02-T04 JSONL and MCP trace; attribute completed tools, response bytes, prior context, raw input, cached input, and output
+working_directory: repository root and immutable external R176 raw root
+environment: read-only artifact inspection
+exit_code: 0
+result_summary: T02 is repeated name/alias/module discovery; large T03 is ambiguous short-name resolution plus missing exact locations; T04 is missing individual positions plus redundant empty-set confirmation; fixed MCP/schema/cache cost explains the remaining efficient small-T03 boundary
+not_run: accepted product mechanisms remain unimplemented until this checkpoint is committed and pushed
 ```
 
 ## Reset recovery
@@ -105,14 +123,15 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 
 ## Current working state
 
-- **Last completed finding:** R178 is merged and mirrored at `148e4b6`.
-- **Current finding:** R179-DIAG-T02/T03/T04, exact artifact-level diagnosis.
-- **Dirty files expected:** active handoff and its documentation pointer until
-  the initialization checkpoint is committed.
-- **Unpushed commits expected:** 1 initialization checkpoint.
+- **Last completed finding:** R179-DIAG-T02/T03/T04 are written from an exact
+  24-row re-derivation and complete trace inspection.
+- **Current finding:** publish the diagnosis-only checkpoint before any product
+  edit, then implement the two accepted bounded operations.
+- **Dirty files expected:** this handoff and the diagnosis section only.
+- **Unpushed commits expected:** one diagnosis-only checkpoint.
 - **Known blocker:** none.
-- **Single next action:** mechanically re-derive T02-T04 costs and tool-call
-  payload attribution from the immutable R176 raw artifacts.
+- **Single next action:** commit and push the diagnosis-only checkpoint, then
+  start regression-first product work.
 
 ## Security confirmation
 
