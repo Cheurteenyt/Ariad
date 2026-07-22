@@ -1847,3 +1847,135 @@ lists every token sample, call count, grade, min, max, mean, environment row,
 matched ratio, and raw manifest identity. Because instability is the primary
 finding, R179 does not replace the R178 point with a single new headline
 number and makes no product-code change.
+
+## 18. R181 T02-T04 structural-cost root-cause round — 2026-07-23
+
+R176 found equal aggregate correctness between V2 MCP-only B and grep/read-only
+C on T03 and T04 (4/4 PASS per arm), while each arm had one T02 PARTIAL among
+four configurations. Its single samples nevertheless showed one striking cost
+pattern: B was cheaper for all three T02-T04 tasks in continuous/small, but B
+was more expensive for all three tasks in each of one-shot/small,
+one-shot/large, and continuous/large. R181 tests whether that pattern is a
+repeatable project mechanism or agent/session noise before changing product
+code. T01 and `direct_callers` are excluded from the diagnosis and correction
+because R177 and R179 already own that surface.
+
+### 18.1 Immutable pre-registration before measurement
+
+The clean product anchor is post-PR #76 `main` at
+`93e0d5c99fa5dd09a5276a9c5c7e922b16f64315`. The task specification, pinned
+small target `5915e0624ed4376611fdc1f824d1d65a327c4a2f`, pinned large target
+`ef3a5830f960c00018f810cebf26133b35ec2b6f`, prompts, independent TypeScript
+oracle, model `gpt-5.6-sol`, reasoning `medium`, native token accounting,
+mechanical grader, policies, V1 executable, and V2 indexes remain unchanged.
+Only conditions B (V2 MCP-only) and C (grep/read-only) are measured.
+
+R181 uses **N=3 repetitions per task/configuration/arm**. This is the minimum
+that exposes sign flips and one-outlier behavior while still allowing a range
+and arithmetic mean. The 12 selected R176 B+C task/configuration samples total
+11,128,260 native raw tokens; repeating them three times projects about
+33,384,780 selected raw tokens before any supported correction. The actual
+cost, including continuous-session warm-up, is published. More repetitions
+are not added after viewing results.
+
+The three fresh append-once roots are:
+
+```text
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-1
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-2
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-3
+```
+
+Baseline uses `--phase baseline --condition B,C --attempt 1`. One-shot runs
+select `--task T02`, `T03`, or `T04`; continuous runs omit `--task` because the
+unchanged runner correctly preserves the registered T01→T04 conversation.
+Consequently, continuous measurement creates 12 T01 warm-up cells across the
+two targets, two arms, and three repetitions. They establish the same prior
+session context as R176 but are neither graded nor interpreted by R181 and
+cannot justify a T01 code change. The 72 decision cells are exactly three
+tasks × four mode/target configurations × two arms × three repetitions.
+
+The 24 baseline invocations run in this fixed order, with repetitions 1, 2,
+and 3 back-to-back inside each item:
+
+1. one-shot/small T02, T03, T04;
+2. one-shot/large T02, T03, T04;
+3. continuous/small full registered session;
+4. continuous/large full registered session.
+
+The runner's existing filtered arm order is preserved: B then C except
+one-shot/small T03 (C then B) and continuous/large (C session then B session).
+Before every invocation, the append-once environment helper records UTC time,
+repository SHA and cleanliness, OS/version/architecture, CPU/logical count,
+RAM, Node, npm, Codex CLI, exact model, reasoning, phase, and repetition. A
+version or repository drift is disclosed rather than averaged. Current V2 is
+built first; runner verification must prove clean pinned checkouts; and the
+independent T02, T03, and T04 oracle must pass on both targets.
+
+Only a mechanically proven protocol-invalid artifact may use attempt 2 in its
+own repetition root. The invalid attempt remains disclosed. An unfavorable
+answer, token count, call sequence, direction, or variance is never a rerun
+reason. No aggregate, grade, or trace result is inspected until all baseline
+invocations finish.
+
+#### Pre-registered repetition and mechanism rules
+
+For each of the 24 task/configuration/arm groups, token stability requires
+`max(native raw tokens) / min(native raw tokens) <= 1.20`; grade stability
+requires the same mechanical grade in all three repetitions. Call counts do
+not decide stability, but all samples and ranges are reported.
+
+The old directional pattern is **fully replicated** only when every repetition
+has B<C for each T02-T04 continuous/small cell and B>C for every corresponding
+cell in the other three configurations, with all 24 token groups and grades
+stable. If every direction repeats but a stability rule fails, the conclusion
+is “directionally supported but quantitatively unstable.” Any within-cell sign
+flip makes that cell unstable; failure of any continuous/small task to retain
+B<C means the old universal continuous/small advantage is not replicated.
+The report distinguishes individual cells from the overall pattern rather
+than replacing mixed evidence with one aggregate ratio.
+
+Before any correction, a tracked diagnosis report must publish, per
+task/configuration/arm and repetition: grade, native raw tokens, uncached input
+plus output, tool names and order, completed calls, response bytes, largest
+individual tool response, concentration of response bytes, prior observed
+context bytes, and wall time. It must then test these competing explanations:
+
+- a project-controlled fixed payload or schema cost;
+- one concentrated oversized MCP response;
+- repeated MCP calls or an inefficient tool-selection path;
+- continuous-session carry-over from the mandatory T01 warm-up;
+- target-specific behavior rather than a cross-repository mechanism;
+- nondeterministic agent behavior with no reproducible repository defect.
+
+Call count alone is not causation. A continuous advantage is classified as
+amortization only if repeated traces show a reusable V2 cost reduction that is
+not explained by unequal T01 prior context. If the advantage tracks the prior
+turn size, it is session carry-over, not a V2 amortization claim. The diagnosis
+is committed and pushed before any product fix.
+
+#### Correction and same-N comparison gate
+
+A correction is permitted only when the repeated traces isolate a stable,
+project-controlled mechanism. It must be narrow, preserve contracts, add a
+targeted regression when practical, and introduce no new MCP tool. If evidence
+points only to model choice, task/session history, or unstable noise, R181
+records an explicit no-fix conclusion instead of forcing an optimization.
+
+If a correction is implemented, the identical 24-invocation schedule is
+repeated at N=3 under `--phase postfix` in the same three roots after recording
+the correction SHA and fresh environment blocks. B and C are both rerun; C is
+the environmental control. For each task/configuration, pre/post token ranges,
+means, grades, calls, and response bytes are reported. A B cell is “helped”
+only when its post-fix maximum is at least 10% below its pre-fix minimum and no
+grade regresses. It is “worse” if a grade regresses or its post-fix minimum is
+at least 10% above its pre-fix maximum. Overlapping ranges or smaller changes
+are “no conclusive material change.” The correction is accepted only if its
+targeted cells help and no selected B cell worsens. If no correction is
+supported, no postfix run is fabricated; the report explicitly records that
+before/after evidence is not applicable.
+
+The future canonical evidence directory is
+`docs/performance/benchmarks/t02-t04-structural-cost-root-cause-2026-07-23`,
+with one immutable baseline checkpoint per repetition, an immutable pre-fix
+diagnosis, and—only if warranted—the corresponding postfix checkpoints.
