@@ -1641,12 +1641,78 @@ root existed. All measured process start times must be later than that push.
 
 ### 16.3 Fresh aggregate result
 
-Pending the pushed pre-registration and eight measured cells.
+The pre-registration commit was pushed at
+`38d10e93d27fc46d13329648d000a9c072d21622`, and the remote branch was again
+verified at documentation head
+`fdefc62ee8ed0b9a3b76b5d79064c8992365e446` before execution. The earliest
+cell started at `2026-07-22T01:52:32.105Z`, after both commits. Attempt 1
+produced all eight expected cells with exit code 0; the mechanical audit marks
+**8/8 valid**, records no violations, and required no attempt 2. Both
+continuous cells in each arm have zero prior observed context bytes.
+
+| Arm | Valid | PASS/PARTIAL/FAIL | Raw tokens | Uncached + output | Calls | Response bytes | Wall ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B V2 MCP | 4/4 | 4/0/0 | 236,837 | 48,933 | 4 | 19,028 | 121,603.2 |
+| C grep/read | 4/4 | 0/2/2 | 1,223,595 | 153,771 | 52 | 243,102 | 477,078.7 |
+
+Fresh C/B native raw tokens are **5.166401365x**; equivalently B/C is
+`0.193558326x`, and B uses **80.6441674% fewer** raw tokens (`986,758` fewer).
+C/B is also 3.142480535x for uncached-input-plus-output, 13x for completed
+calls, 12.776014295x for response bytes, and 3.923239722x for observed wall
+time. Shell-command latency is not recorded in the MCP-only query-latency
+field, so no B/C query-latency ratio is reported. Wall time is a descriptive
+single-run observation with no variance estimate.
+
+The native totals are individually close to the hand-combined inputs: fresh B
+is 98 tokens lower than R177 B (-0.041362%), while fresh C is 15,484 lower than
+R176 C (-1.249638%). Consequently, the fresh 5.166401365x ratio is 1.208776%
+below the old 5.229615717x figure. It confirms the approximate 5.2x observation
+without depending on a cross-round numerator and denominator.
+
+The canonical checkpoint is
+[`fresh-multihop-v2-vs-grep-2026-07-22`](benchmarks/fresh-multihop-v2-vs-grep-2026-07-22/aggregate-and-ratios.md).
+Its [selected-run CSV](benchmarks/fresh-multihop-v2-vs-grep-2026-07-22/selected-runs.csv),
+[per-task table](benchmarks/fresh-multihop-v2-vs-grep-2026-07-22/per-task.md),
+and [raw manifest](benchmarks/fresh-multihop-v2-vs-grep-2026-07-22/raw-artifact-manifest.json)
+retain the complete native accounting and artifact hashes. The manifest covers
+40 raw artifacts (371,077 bytes) under the append-once external root and has
+tree SHA-256
+`ed0349cfe9608b960693c77c891f6cda982a7c49dc355b8a801a3446aee181c0`.
 
 ### 16.4 Fresh per-cell result
 
-Pending the pushed pre-registration and eight measured cells.
+| Usage | Target | Arm | Grade | Raw tokens | Uncached + output | Calls | Response bytes | Wall ms | Raw C/B |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| one-shot | small | B V2 MCP | PASS | 49,200 | 10,032 | 1 | 2,767 | 20,202.5 | — |
+| one-shot | small | C grep/read | FAIL | 196,753 | 28,049 | 8 | 46,755 | 84,511.4 | 3.999044715x |
+| one-shot | large | B V2 MCP | PASS | 67,075 | 11,779 | 1 | 6,747 | 45,221.3 | — |
+| one-shot | large | C grep/read | PARTIAL | 391,993 | 45,369 | 13 | 88,373 | 147,481.4 | 5.844099888x |
+| continuous | small | B V2 MCP | PASS | 50,871 | 14,775 | 1 | 2,767 | 20,139.8 | — |
+| continuous | small | C grep/read | FAIL | 361,041 | 51,537 | 21 | 45,200 | 136,598.8 | 7.097187002x |
+| continuous | large | B V2 MCP | PASS | 69,691 | 12,347 | 1 | 6,747 | 36,039.6 | — |
+| continuous | large | C grep/read | PARTIAL | 273,808 | 28,816 | 10 | 62,774 | 108,487.1 | 3.928886083x |
+
+Every B answer exactly equals its independent oracle and uses the one-call
+sequence `mcp:lookup_source_text`. The one-shot small C answer returns eight
+names but assigns three incorrect depths. Continuous small C assigns two
+incorrect depths and adds two out-of-oracle callers. One-shot large C omits
+the two `program.ts` callers, and continuous large C omits those two plus three
+`testTools.ts` handlers. These are valid measured answers, not protocol
+failures, and remain FAIL/PARTIAL as mechanically graded.
 
 ### 16.5 Plain-language ratio and evidence link
 
-Pending the pushed pre-registration and eight measured cells.
+On this exact reverse multi-hop task, the fresh grep/read arm consumed
+**5.1664 times** the native tokens of V2 MCP, while V2 used **80.644% fewer
+tokens**, made 4 calls instead of 52, and returned the exact oracle in all four
+cells. This confirms, rather than reverses, the earlier approximate 5.2x
+figure; the fresh ratio is only 1.209% lower and is now measured within one
+disclosed environment and round. The evidence is the canonical
+[`R178 checkpoint`](benchmarks/fresh-multihop-v2-vs-grep-2026-07-22/aggregate-and-ratios.md).
+
+This is not a claim that V2 saves tokens on every small or large repository.
+It is a controlled confirmation for the two pinned projects, one T01 question,
+two usage modes, and one attempt per cell. Moreover, C did not reach exact
+correctness in any cell, so the ratio describes a more expensive and less
+accurate grep/read attempt rather than equal-quality successful answers. R178
+does not change or generalize the wider mixed findings from R176 T02-T04.

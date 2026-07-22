@@ -13,7 +13,7 @@ base_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
 last_completed_code_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T01:51:18.4241625Z
+updated_at_utc: 2026-07-22T02:08:44.2809862Z
 implementer_role: codex
 ```
 
@@ -53,6 +53,7 @@ apples-to-apples B/C comparison.
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
 | `d542d666a048eb14e6b6ca314efd47239cca92e5` | `38d10e93d27fc46d13329648d000a9c072d21622` | R178-PROTOCOL | Exact environment, R176 environment gap, eight-cell order, immutable roots, and acceptance rules fixed and pushed before measurement | `npm run docs:check` PASS | pending |
+| `d542d666a048eb14e6b6ca314efd47239cca92e5` | pending | R178-RESULT | Eight fresh same-round B/C cells: B 4/4 PASS and 236,837 raw tokens; C 0/4 PASS and 1,223,595; C/B 5.166401365x | build, runner/oracle verify, 8/8 valid cells, immutable checkpoint, docs check, typecheck, benchmark tests, package build | pending |
 
 ## Exact validation evidence
 
@@ -83,6 +84,33 @@ result_summary: 7/7 documentation/checkpoint/reference tests pass; 63 Markdown f
 not_run: measured benchmark cells remain forbidden until push
 ```
 
+```text
+command: npm run build; run.mjs verify; derive-structural-references.mjs verify --target all --task T01
+working_directory: v2 and repository root as applicable
+environment: Node.js v24.15.0, Codex CLI 0.144.4, pinned v2-r173-final state
+exit_code: 0
+result_summary: exact candidate compiles; both target checkouts are clean at registered SHAs; independent TypeScript oracle matches 8/8 small and 23/23 large callers
+not_run: no T02-T04 task
+```
+
+```text
+command: execute the four pre-registered run.mjs B/C invocations; summarize.mjs; checkpoint.mjs
+working_directory: repository root
+environment: Microsoft Windows 11 Professionnel build 26200, Node.js v24.15.0, npm 11.12.1, Codex CLI 0.144.4, gpt-5.6-sol medium
+exit_code: 0
+result_summary: 8/8 valid attempt-1 cells with zero violations; B is 4 PASS/0 PARTIAL/0 FAIL and 236837 raw tokens/4 calls; C is 0 PASS/2 PARTIAL/2 FAIL and 1223595 raw tokens/52 calls; fresh C/B is 5.166401365x; 40-artifact tree ed0349cfe9608b960693c77c891f6cda982a7c49dc355b8a801a3446aee181c0
+not_run: no attempt 2, no T02-T04, no product modification
+```
+
+```text
+command: npm run docs:check; npm run typecheck; node --test summarize/checkpoint/derive structural tests; npm run build:package
+working_directory: v2 and repository root as applicable
+environment: Node.js v24.15.0, npm 11.12.1, Windows 11
+exit_code: 0
+result_summary: documentation valid for 65 Markdown files with 55 reachable and all references verified; TypeScript backend/lab check passes; 7/7 benchmark tests pass; backend and embedded Graph UI package build passes every bundle budget with npm audit reporting 0 vulnerabilities
+not_run: broad product test suites are delegated to the mandatory GitHub CI because R178 changes only documentation and generated benchmark evidence
+```
+
 ## Reset recovery
 
 ```bash
@@ -108,13 +136,13 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 ## Current working state
 
 - **Last completed finding:** R177 multi-hop correction is merged on `main`.
-- **Current finding:** R178-PROTOCOL, fresh same-round B/C confirmation.
-- **Dirty files expected:** protocol and active-handoff documentation until the
-  pre-registration checkpoint is committed.
-- **Unpushed commits expected:** 0 before the pre-registration commit.
+- **Current finding:** R178-RESULT, publish and validate the fresh confirmation.
+- **Dirty files expected:** protocol, active handoff, and canonical checkpoint
+  until the result checkpoint is committed.
+- **Unpushed commits expected:** 0 before the result commit.
 - **Known blocker:** none.
-- **Single next action:** build the exact candidate, run runner/oracle
-  verification, then execute the four fixed B/C commands in registered order.
+- **Single next action:** run documentation and package validation, commit and
+  push the result checkpoint, then complete CI-backed publication.
 
 ## Security confirmation
 
@@ -129,7 +157,7 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 - [x] The exact cells, order, roots, task, candidate, and acceptance rules are
   fixed before measurement.
 - [x] The pre-registration commit is pushed before every measured process.
-- [ ] All eight fresh cells are valid and mechanically graded.
-- [ ] The canonical checkpoint and plain-language ratio are published.
+- [x] All eight fresh cells are valid and mechanically graded.
+- [x] The canonical checkpoint and plain-language ratio are published locally.
 - [ ] The affordable local validation and GitHub CI are green.
 - [ ] The handoff is archived and removed before merge.
