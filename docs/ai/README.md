@@ -6,6 +6,10 @@
 
 This directory is intentionally idle on `main`.
 
+The active R179 work branch records its recoverable state in
+[`CURRENT_HANDOFF.md`](CURRENT_HANDOFF.md). The file is archived and removed
+before merge.
+
 During one active `v2/r<n>-<short-name>` round, the implementation agent
 creates and commits:
 
