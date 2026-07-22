@@ -13,7 +13,7 @@ base_sha: 148e4b65849efc3fcfbc4fb716abf0898424293d
 last_completed_code_sha: 4cd8e695bcdb67b4f317a69a0aaba4ba9ff5fdc5
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T18:47:57.7122493Z
+updated_at_utc: 2026-07-22T18:50:48.3660556Z
 implementer_role: codex
 ```
 
@@ -153,11 +153,12 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
   semantic answers are exact and complete.
 - **Current finding:** establish exact CI head, then publish a pushed immutable
   environment disclosure and B/C pre-registration before any measured process.
-- **Dirty files expected:** this handoff only.
-- **Unpushed commits expected:** one handoff checkpoint.
+- **Dirty files expected:** this handoff and benchmark pre-registration only.
+- **Unpushed commits expected:** one immutable pre-registration checkpoint.
 - **Known blocker:** none.
-- **Single next action:** record CI for `4cd8e69`, finish the immutable fresh
-  rerun pre-registration, and push it before creating a raw result root.
+- **Single next action:** push the immutable pre-registration, record its exact
+  SHA/time and green CI, then verify build/runner/oracles before creating the
+  raw result root.
 
 ## Security confirmation
 

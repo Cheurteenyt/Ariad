@@ -1892,3 +1892,91 @@ and large negative T04 show that fixed MCP schema, cache, and model overhead can
 remain after the smallest correct call sequence. Fresh B/C evidence must
 therefore publish correctness, raw tokens, uncached-plus-output, calls, response
 bytes, context, and environment separately, including any unfavorable result.
+
+### 17.7 Immutable fresh B/C pre-registration
+
+This subsection was written while the future external result root did not
+exist and before any R179 measured process. The product candidate is
+`4cd8e695bcdb67b4f317a69a0aaba4ba9ff5fdc5`; later commits before measurement
+may contain only this pre-registration and recoverability documentation. The
+exact pushed pre-registration SHA and push time must be recorded before the
+first cell starts. No product, task, runner, oracle, prompt, grading, or tool
+schema change is permitted after that point.
+
+The shared environment was captured at `2026-07-22T18:50:48.3660556Z`:
+
+```text
+OSCaption                : Microsoft Windows 11 Professionnel
+OSVersion                : 10.0.26200
+OSBuild                  : 26200
+OSArchitecture           : 64 bits
+CPUName                  : AMD Ryzen 9 5900X 12-Core Processor
+PhysicalCores            : 12
+LogicalProcessors        : 24
+TotalPhysicalMemoryBytes : 42849894400
+TotalPhysicalMemoryGiB   : 39.907
+Node                     : v24.15.0
+Npm                      : 11.12.1
+Codex                    : codex-cli 0.144.4
+ArmBModelAndReasoning     : gpt-5.6-sol / medium
+ArmCModelAndReasoning     : gpt-5.6-sol / medium
+ProductCandidate         : 4cd8e695bcdb67b4f317a69a0aaba4ba9ff5fdc5
+DocumentationHead        : 85ca53540b5594f4db92cc454feebabd72bd1d52
+SmallTarget              : 5915e0624ed4376611fdc1f824d1d65a327c4a2f
+LargeTarget              : ef3a5830f960c00018f810cebf26133b35ec2b6f
+FutureRawRoot            : D:/Mycodex/benchmark-results/r179-t02-t04-structural-final
+FutureRawRootExists      : false
+```
+
+The exact unchanged pipeline is the R176/R178 runner, MCP trace proxy, native
+accounting, mechanical grader, audit, and checkpoint path. The pinned V2 state
+remains `D:/Mycodex/benchmark-state/v2-r173-final`. Before execution, the
+candidate must pass the exact GitHub backend, CodeQL, Windows smoke, package,
+Docker, and frontend checks; `npm run build`, runner verification, and the
+independent TypeScript oracle for T02-T04 on both targets must pass locally.
+
+The one-shot arm creates 12 cells with `--phase postfix --condition B,C
+--attempt 1`, one invocation for each target and each of T02, T03, and T04.
+The runner's registered condition order is retained: small T02 B/C, small T03
+C/B, small T04 B/C, and large T02-T04 B/C. The continuous arm must preserve the
+original accumulated context and therefore runs the registered T01-T04 sequence
+without `--task`: small B then C, large C then B. It creates 16 cells, of which
+the four T01 cells are context-building evidence only. The primary R179 result
+selects the remaining 24 B/C T02-T04 cells; all 28 raw cells remain disclosed
+and included in the manifest.
+
+The eight runner invocations are fixed:
+
+```text
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target small --condition B,C --task T02 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target small --condition B,C --task T03 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target small --condition B,C --task T04 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target large --condition B,C --task T02 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target large --condition B,C --task T03 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode one-shot --target large --condition B,C --task T04 --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode continuous --target small --condition B,C --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+node scripts/benchmark/v1-v2-truth-audit/run.mjs run --phase postfix --mode continuous --target large --condition B,C --attempt 1 --results-root D:/Mycodex/benchmark-results/r179-t02-t04-structural-final --v2-home D:/Mycodex/benchmark-state/v2-r173-final
+```
+
+Artifacts are append-once. Attempt 2 is allowed only for a mechanically proven
+protocol-invalid cell; the invalid attempt remains in the root and report. An
+unfavorable answer, token count, latency, ratio, or tool choice is not a rerun
+reason. The future canonical checkpoint is
+`docs/performance/benchmarks/structural-token-cost-correction-2026-07-22`.
+
+Correctness is primary. All 12 selected B cells must be protocol-valid PASS and
+must exactly equal their independent oracle. Product-routing success additionally
+requires one completed `lookup_source_text` evidence call per B cell, no
+exploratory call, and a complete semantic response; failures remain reported
+rather than hidden. Efficiency is reported for raw native tokens,
+uncached-input-plus-output, calls, response bytes, schema bytes, prior context,
+query latency, and wall time. A fresh B/C benchmark win is claimed only if B has
+no worse correctness and lower selected aggregate raw tokens than C. Per-cell
+losses remain visible.
+
+For historical comparison, the exact same 12 R176 B cells total 6,073,591 raw
+tokens, 547,575 uncached-plus-output tokens, 70 calls, and 383,508 response
+bytes, with 11 PASS and one PARTIAL. The 12 R176 C cells total 5,054,669 raw,
+453,837 uncached-plus-output, 39 calls, and 207,239 response bytes, also 11 PASS
+and one PARTIAL. R179 may claim a correction improvement only from the fresh
+same-round selected cells and must keep the historical values immutable.
