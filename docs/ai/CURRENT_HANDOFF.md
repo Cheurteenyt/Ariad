@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r180-r179-forward-reference
 base_sha: ffd5e45b07ac7b98b353ff97e57dfdd40abbd5d9
-last_completed_code_sha: ffd5e45b07ac7b98b353ff97e57dfdd40abbd5d9
+last_completed_code_sha: ce4b94a9b9463a82d375a1bf55fd9165f4996e5b
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T19:54:14Z
+updated_at_utc: 2026-07-22T19:57:21Z
 implementer_role: codex
 ```
 
@@ -42,13 +42,14 @@ correction against current `main`.
 
 | Finding | Decision | Evidence | Validation state |
 |---------|----------|----------|------------------|
-| R180-DOC-FWD | ACCEPTED | Section 16.5 and two R178 archived-report citations present the R178 point without a nearby R179 forward reference | NOT_STARTED |
+| R180-DOC-FWD | ACCEPTED | Section 16.5 and both R178 archived-report citations now point to the R179 4.28x-5.44x range without changing historical wording | DECLARED_LOCAL |
 
 ## Pushed checkpoints
 
 | Code SHA | CI head SHA | Finding | Summary | Local validation | GitHub run |
 |----------|-------------|---------|---------|------------------|------------|
 | `ffd5e45b07ac7b98b353ff97e57dfdd40abbd5d9` | pending | R180-INIT | Anchor documentation-only round at current merged R179 main | clean exact main | pending |
+| `ce4b94a9b9463a82d375a1bf55fd9165f4996e5b` | pending | R180-DOC-FWD | Add bounded R179 forward references while preserving R178 measurements | `npm run docs:check` PASS; repository-wide citation grep audited | pending |
 
 ## Exact validation evidence
 
@@ -68,6 +69,15 @@ environment: ripgrep, excluding .git and dependency directories
 exit_code: 0
 result_summary: section 16.5 has the requested citation; outside BENCHMARK_PROTOCOL.md, two standalone citations exist in the archived R178 round report; the R179 aggregate report already supplies the range and instability qualification
 not_run: no benchmark process
+```
+
+```text
+command: repository-wide rg with six lines of context after correction; git diff --check; npm run docs:check
+working_directory: repository root and v2
+environment: Windows 11, ripgrep, Node.js v24.15.0, npm 11.12.1
+exit_code: 0
+result_summary: every R178 standalone citation has a nearby link to section 17 and the 4.28x-5.44x range; original measured lines remain unchanged; 7 documentation tests pass, 73 Markdown files checked, 63 reachable, and all benchmark references verified
+not_run: benchmark tests, product tests, product build, and non-documentation validation by explicit documentation-only scope
 ```
 
 ## Reset recovery
@@ -97,12 +107,12 @@ npm run docs:check
 
 - **Last completed finding:** R179 is merged at `ffd5e45` with exact-main CI
   and CodeQL green.
-- **Current finding:** add forward references for the R178 single-point ratio.
-- **Dirty files expected:** this handoff before the initialization checkpoint.
-- **Unpushed commits expected:** one initialization checkpoint.
+- **Current finding:** R180-DOC-FWD implemented locally at `ce4b94a`.
+- **Dirty files expected:** this handoff update only.
+- **Unpushed commits expected:** resolution plus handoff checkpoint.
 - **Known blocker:** none.
-- **Single next action:** push this recoverable scope, then add the bounded
-  cross-references and run the repository-wide citation audit again.
+- **Single next action:** commit this handoff, push both checkpoints, and wait
+  for exact-head CI before final cleanup and merge.
 
 ## Security confirmation
 
@@ -113,9 +123,9 @@ npm run docs:check
 
 ## Pre-final-audit checklist
 
-- [ ] Every unqualified citation has a nearby R179 range link.
-- [ ] Original R178/R179 measured wording and data remain intact.
-- [ ] `npm run docs:check` passes.
-- [ ] No non-documentation file changed.
+- [x] Every unqualified citation has a nearby R179 range link.
+- [x] Original R178/R179 measured wording and data remain intact.
+- [x] `npm run docs:check` passes.
+- [x] No non-documentation file changed.
 - [ ] No important work exists only in the current environment.
 - [ ] The active handoff is removed before merge.
