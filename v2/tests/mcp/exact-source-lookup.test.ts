@@ -272,6 +272,179 @@ describe('lookup_source_text', () => {
     }
   });
 
+  it('returns declaration-qualified semantic call sites with aliases, duplicates, and production filtering', async () => {
+    const harness = createHarness({
+      'src/target.ts': [
+        'export function target() {}',
+        'export function sameFile() { target(); target(); }',
+        'export class Other { target() {} use() { this.target(); } }',
+        '',
+      ].join('\n'),
+      'src/barrel.ts': "export { target as renamed } from './target.js';\n",
+      'src/callers.ts': [
+        "import { renamed as aliased } from './barrel.js';",
+        'export function imported() { aliased(); }',
+        '',
+      ].join('\n'),
+      'src/unrelated.ts': [
+        'export function target() {}',
+        'export function unrelated() { target(); }',
+        '',
+      ].join('\n'),
+      'src/mcp/test/production.ts': [
+        "import { target } from '../../target.js';",
+        'export function productionCaller() { target(); }',
+        '',
+      ].join('\n'),
+      'tests/target.test.ts': [
+        "import { target } from '../src/target.js';",
+        'export function excludedTestCaller() { target(); }',
+        '',
+      ].join('\n'),
+    });
+    try {
+      const response = await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: 'src/target.ts',
+        definition_line: 1,
+        scope_prefix: 'src',
+        location_format: 'path_line_column',
+      });
+      expect(response.isError).not.toBe(true);
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.call_sites).toEqual([
+        { path: 'src/callers.ts', line: 2, column: 30 },
+        { path: 'src/mcp/test/production.ts', line: 2, column: 38 },
+        { path: 'src/target.ts', line: 2, column: 30 },
+        { path: 'src/target.ts', line: 2, column: 40 },
+      ]);
+      expect(payload.formatted_call_sites).toEqual([
+        'src/callers.ts:2:30',
+        'src/mcp/test/production.ts:2:38',
+        'src/target.ts:2:30',
+        'src/target.ts:2:40',
+      ]);
+      expect(payload.complete).toBe(true);
+      expect(payload.incomplete_reasons).toEqual([]);
+      expect(response.content[0].text).not.toContain('unrelated');
+      expect(response.content[0].text).not.toContain('excludedTestCaller');
+
+      const lineOnly = JSON.parse((await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: 'src/target.ts',
+        definition_line: 1,
+        location_format: 'path_line',
+        max_results: 2,
+      })).content[0].text);
+      expect(lineOnly.formatted_call_sites).toEqual([
+        'src/callers.ts:2',
+        'src/mcp/test/production.ts:2',
+      ]);
+      expect(lineOnly.results_truncated).toBe(true);
+      expect(lineOnly.complete).toBe(false);
+      expect(lineOnly.incomplete_reasons).toContain('results_truncated');
+
+      const withTests = JSON.parse((await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: 'src/target.ts',
+        definition_line: 1,
+        include_tests: true,
+      })).content[0].text);
+      expect(withTests.formatted_call_sites).toContain('tests/target.test.ts:2:40');
+
+      const ambiguous = JSON.parse((await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: 'src/target.ts',
+      })).content[0].text);
+      expect(ambiguous.call_sites).toEqual([]);
+      expect(ambiguous.complete).toBe(false);
+      expect(ambiguous.incomplete_reasons).toContain('target_symbol_ambiguous');
+    } finally {
+      harness.close();
+    }
+  }, 20_000);
+
+  it('returns transitive named-type impact by compiler identity through aliases and star re-exports', async () => {
+    const harness = createHarness({
+      'src/types.ts': [
+        'export interface GraphData { value: string }',
+        'export namespace Other { export interface GraphData { other: number } }',
+        '',
+      ].join('\n'),
+      'src/dependent.ts': [
+        "import type { GraphData as Root } from './types.js';",
+        'export interface Envelope { graph: Root }',
+        '',
+      ].join('\n'),
+      'src/barrel.ts': "export * from './dependent.js';\n",
+      'src/consumer.ts': [
+        "import type { Envelope as View } from './barrel.js';",
+        'export type Consumer = View | null;',
+        '',
+      ].join('\n'),
+      'src/use.ts': [
+        "import type { Consumer } from './consumer.js';",
+        'export const value: Consumer = null;',
+        '',
+      ].join('\n'),
+      'src/runtime.mjs': "export { GraphData } from './types.js';\n",
+      'src/unrelated.ts': [
+        'export interface GraphData { other: number }',
+        'export type Other = GraphData;',
+        '',
+      ].join('\n'),
+      'src/mcp/test/production.ts': [
+        "import type { GraphData } from '../../types.js';",
+        'export type Production = GraphData;',
+        '',
+      ].join('\n'),
+      'tests/types.test.ts': [
+        "import type { GraphData } from '../src/types.js';",
+        'export type Excluded = GraphData;',
+        '',
+      ].join('\n'),
+    });
+    try {
+      const response = await harness.tool.handle({
+        operation: 'transitive_type_impact',
+        symbol: 'GraphData',
+        definition_path: 'src/types.ts',
+        definition_line: 1,
+        scope_prefix: 'src',
+      });
+      expect(response.isError).not.toBe(true);
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.files).toEqual([
+        'src/barrel.ts',
+        'src/consumer.ts',
+        'src/dependent.ts',
+        'src/mcp/test/production.ts',
+        'src/types.ts',
+        'src/use.ts',
+      ]);
+      expect(payload.complete).toBe(true);
+      expect(payload.incomplete_reasons).toEqual([]);
+      expect(response.content[0].text).not.toContain('unrelated');
+      expect(response.content[0].text).not.toContain('runtime.mjs');
+      expect(response.content[0].text).not.toContain('types.test');
+
+      const ambiguous = JSON.parse((await harness.tool.handle({
+        operation: 'transitive_type_impact',
+        symbol: 'GraphData',
+        definition_path: 'src/types.ts',
+      })).content[0].text);
+      expect(ambiguous.files).toEqual([]);
+      expect(ambiguous.complete).toBe(false);
+      expect(ambiguous.incomplete_reasons).toContain('target_symbol_ambiguous');
+    } finally {
+      harness.close();
+    }
+  }, 15_000);
+
   it('aggregates deterministic direct caller counts and rolls anonymous callbacks into their owner', async () => {
     const harness = createHarness({});
     harness.addCodeNode({
@@ -772,6 +945,19 @@ describe('lookup_source_text', () => {
         expect(response.isError).toBe(true);
       }
       expect((await harness.tool.handle({ operation: 'direct_callers' })).isError).toBe(true);
+      expect((await harness.tool.handle({ operation: 'symbol_call_sites', symbol: 'target' })).isError).toBe(true);
+      expect((await harness.tool.handle({ operation: 'transitive_type_impact', symbol: 'Type' })).isError).toBe(true);
+      expect((await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: '../src/target.ts',
+      })).isError).toBe(true);
+      expect((await harness.tool.handle({
+        operation: 'symbol_call_sites',
+        symbol: 'target',
+        definition_path: 'src/target.ts',
+        definition_line: 1.5,
+      })).isError).toBe(true);
       expect((await harness.tool.handle({ operation: 'call_chain', entry: 'start' })).isError).toBe(true);
       expect((await harness.tool.handle({ operation: 'unknown' })).isError).toBe(true);
     } finally {

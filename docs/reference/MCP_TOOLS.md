@@ -262,10 +262,11 @@ shortened by `limit`.
 ### 7. `lookup_source_text`
 
 **Purpose**: One bounded gateway for exact source truth. It preserves literal
-lookup and adds server-side direct- and multi-hop caller analysis, top-level
-inventory, and route/CLI call chains, avoiding repeated search/read loops
-without adding a ninth MCP schema. It is not a regex engine, shell proxy, or
-broad composite search.
+lookup and adds declaration-qualified semantic call sites and named-type
+impact, server-side direct- and multi-hop caller analysis, top-level inventory,
+and route/CLI call chains. This avoids repeated search/read loops without
+adding a ninth MCP schema. It is not a regex engine, shell proxy, or broad
+composite search.
 
 **Input**:
 ```json
@@ -365,6 +366,58 @@ closed. Repository tests are excluded by default, but product directories
 named `src/.../test` remain production. Omitting `max_depth`, or setting it to
 1, retains the original persistent direct-caller response contract and does
 not load the TypeScript compiler.
+
+For every exact production call position resolving to one declaration, select
+the declaration by repository path instead of relying on its short name:
+
+```json
+{
+  "operation": "symbol_call_sites",
+  "symbol": "resolveConfig",
+  "definition_path": "src/config.ts",
+  "definition_line": 42,
+  "scope_prefix": "src",
+  "location_format": "path_line_column",
+  "include_tests": false,
+  "max_results": 200
+}
+```
+
+The TypeScript compiler resolves same-file calls, renamed imports, and
+re-exports by canonical symbol identity. `call_sites` contains 1-based path,
+line, and column objects. `formatted_call_sites` is a copy-ready, lexically
+sorted string array; `path_line` omits columns while preserving duplicate calls
+on the same line. `definition_line` is optional when the file contains only one
+matching callable. Missing or ambiguous declarations, unsafe or incomplete
+source inventories, and result caps set `complete=false` with explicit reasons.
+
+For the production files affected by a named TypeScript type and all named
+types transitively dependent on it:
+
+```json
+{
+  "operation": "transitive_type_impact",
+  "symbol": "GraphData",
+  "definition_path": "src/types.ts",
+  "definition_line": 12,
+  "scope_prefix": "src",
+  "include_tests": false,
+  "max_results": 200
+}
+```
+
+The response `files` array follows canonical symbol identities through renamed
+imports and re-exports, including star re-exports. It analyzes TypeScript source
+only (`.ts`, `.tsx`, `.mts`, and `.cts`) and derives workspace-package aliases
+from repository manifests when no installed `node_modules` link is available.
+The optional scope bounds returned references without removing out-of-scope
+files needed for compiler resolution.
+
+Both declaration-qualified profiles load the compiler lazily, scan only the
+graph-owned, root-confined inventory, default to production files, and share
+the 20,000-path, 4-MiB-per-file, and 128-MiB-total safety limits. `max_results`
+is bounded to `1..1000` and defaults to 200. Truncation is explicit and never
+reported as complete.
 
 For exact tracked repository inventory:
 

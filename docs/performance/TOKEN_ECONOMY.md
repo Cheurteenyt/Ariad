@@ -156,8 +156,10 @@ For a team of 10 developers: **~$41/month, ~$492/year**.
 3. **Do not call `get_project_overview` automatically** — call it when project health, freshness, or broad architecture is part of the question.
 4. **Use `lookup_source_text` for bounded exact lookups in MCP-only workflows** — batch up to 10 exact strings and inspect its coverage metadata.
 5. **For exhaustive reverse caller impact, make one `direct_callers` request with `max_depth` and copy `formatted_callers`** instead of recursively searching bare names.
-6. **Use `prepare_edit_context` when an edit needs blast-radius, risk, or human-memory context**, not as unconditional startup overhead.
-7. **Do not duplicate MCP and source evidence** unless completeness is uncertain or verification is necessary.
-8. **Use `search_code_and_memory` for exploration** — it combines graph and memory search but does not replace arbitrary source-text search.
-9. **Check freshness and completeness fields** before treating an answer as exhaustive; reindex or verify source when coverage is incomplete.
+6. **For exact call positions, make one declaration-qualified `symbol_call_sites` request and copy `formatted_call_sites`** instead of confirming an aggregate with broad literal scans.
+7. **For a named TypeScript type blast radius, make one declaration-qualified `transitive_type_impact` request and copy `files`** instead of chasing names, aliases, and re-exports manually.
+8. **Use `prepare_edit_context` when an edit needs blast-radius, risk, or human-memory context**, not as unconditional startup overhead.
+9. **Do not duplicate MCP and source evidence** unless completeness is uncertain or verification is necessary.
+10. **Use `search_code_and_memory` for exploration** — it combines graph and memory search but does not replace arbitrary source-text search.
+11. **Check freshness and completeness fields** before treating an answer as exhaustive; reindex or verify source when coverage is incomplete.
 

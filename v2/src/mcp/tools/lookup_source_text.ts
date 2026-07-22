@@ -20,6 +20,8 @@ const MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 const MAX_TEXT_LENGTH = 500;
 const MAX_CALLERS = 1000;
 const DEFAULT_CALLERS = 200;
+const MAX_STRUCTURAL_RESULTS = 1000;
+const DEFAULT_STRUCTURAL_RESULTS = 200;
 const MAX_TRACKED_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_TOP_LEVEL_DIRECTORIES = 1024;
 const MAX_CHAIN_HOPS = 8;
@@ -27,7 +29,14 @@ const DEFAULT_CHAIN_HOPS = 6;
 const MAX_CHAIN_PATHS = 5;
 const MAX_CHAIN_EXPANSIONS = 500;
 const MAX_CHAIN_SYMBOLS_PER_NODE = 128;
-const OPERATIONS = ['literal_matches', 'direct_callers', 'top_level_directories', 'call_chain'] as const;
+const OPERATIONS = [
+  'literal_matches',
+  'direct_callers',
+  'symbol_call_sites',
+  'transitive_type_impact',
+  'top_level_directories',
+  'call_chain',
+] as const;
 type SourceOperation = typeof OPERATIONS[number];
 
 const CALLABLE_LABELS = new Set(['Function', 'Method', 'Route', 'Constructor']);
@@ -266,7 +275,7 @@ export class LookupSourceTextTool extends BaseTool {
   get definition(): ToolDefinition {
     return {
       name: 'lookup_source_text',
-      description: 'Run one bounded exact-source operation. For exhaustive reverse caller impact, call direct_callers once with max_depth set to the requested hop bound, then copy formatted_callers. For any route-to-target or CLI-command-to-target trace, call call_chain first without pre-searching and copy formatted_chain. Other profiles find literals or list Git-tracked directories.',
+      description: 'Run one bounded exact-source operation. Use transitive_type_impact once for declaration-qualified named-type blast radius and copy files. Use symbol_call_sites once for declaration-qualified exact production call positions and copy formatted_call_sites. For exhaustive reverse caller impact, call direct_callers once with max_depth set to the requested hop bound, then copy formatted_callers. For any route-to-target or CLI-command-to-target trace, call call_chain first without pre-searching and copy formatted_chain. Other profiles find literals or list Git-tracked directories.',
       annotations: {
         title: 'Look up exact source text',
         readOnlyHint: true,
@@ -285,7 +294,7 @@ export class LookupSourceTextTool extends BaseTool {
             type: 'string',
             enum: OPERATIONS,
             default: 'literal_matches',
-            description: 'Exact operation. Use call_chain immediately for route/CLI entry-to-target questions; do not discover its intermediate symbols first. Existing calls default to literal_matches.',
+            description: 'Exact operation. Use declaration-qualified semantic operations immediately for type-impact or exact-call-site questions. Use call_chain immediately for route/CLI entry-to-target questions. Existing calls default to literal_matches.',
           },
           queries: {
             type: 'array',
@@ -304,12 +313,42 @@ export class LookupSourceTextTool extends BaseTool {
             type: 'string',
             minLength: 1,
             maxLength: MAX_QUERY_LENGTH,
-            description: 'direct_callers only: exact callee symbol name.',
+            description: 'direct_callers, symbol_call_sites, or transitive_type_impact: exact symbol name.',
           },
           include_tests: {
             type: 'boolean',
             default: false,
-            description: 'direct_callers only: include repository test roots and test/spec files. Product directories named src/.../test remain production when false.',
+            description: 'Semantic caller/reference operations only: include repository test roots and test/spec files. Product directories named src/.../test remain production when false.',
+          },
+          definition_path: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 1024,
+            description: 'symbol_call_sites or transitive_type_impact: exact repository-relative file containing the target declaration.',
+          },
+          definition_line: {
+            type: 'integer',
+            minimum: 1,
+            description: 'symbol_call_sites or transitive_type_impact: optional 1-based declaration line used to disambiguate same-name declarations in one file.',
+          },
+          scope_prefix: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 1024,
+            description: 'symbol_call_sites or transitive_type_impact: optional repository-relative prefix that bounds returned production references without breaking compiler resolution.',
+          },
+          max_results: {
+            type: 'integer',
+            minimum: 1,
+            maximum: MAX_STRUCTURAL_RESULTS,
+            default: DEFAULT_STRUCTURAL_RESULTS,
+            description: 'symbol_call_sites or transitive_type_impact: maximum sorted results. Truncation makes complete false.',
+          },
+          location_format: {
+            type: 'string',
+            enum: ['path_line', 'path_line_column'],
+            default: 'path_line_column',
+            description: 'symbol_call_sites only: copy-ready format. Duplicate path:line entries are preserved.',
           },
           max_callers: {
             type: 'integer',
@@ -370,6 +409,8 @@ export class LookupSourceTextTool extends BaseTool {
         throw new Error(`Argument operation must be one of: ${OPERATIONS.join(', ')}.`);
       }
       if (operation === 'direct_callers') return await this.handleDirectCallers(args, project);
+      if (operation === 'symbol_call_sites') return await this.handleStructuralReferences(args, project, operation);
+      if (operation === 'transitive_type_impact') return await this.handleStructuralReferences(args, project, operation);
       if (operation === 'top_level_directories') return await this.handleTopLevelDirectories(args, project);
       if (operation === 'call_chain') return await this.handleCallChain(args, project);
 
@@ -513,6 +554,120 @@ export class LookupSourceTextTool extends BaseTool {
     } catch (error: unknown) {
       return this.error(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private async handleStructuralReferences(
+    args: Record<string, unknown>,
+    project: string,
+    operation: 'symbol_call_sites' | 'transitive_type_impact',
+  ): Promise<ToolResponse> {
+    const symbol = this.requireString(args, 'symbol');
+    if (symbol.length > MAX_QUERY_LENGTH || /[\r\n\0]/u.test(symbol)) {
+      throw new Error(`Argument symbol must be a single-line string of at most ${MAX_QUERY_LENGTH} characters.`);
+    }
+    const definitionPath = this.requireString(args, 'definition_path');
+    if (definitionPath.length > 1024 || /[\r\n\0]/u.test(definitionPath)) {
+      throw new Error('Argument definition_path must be a single-line string of at most 1024 characters.');
+    }
+    const normalizedDefinitionPath = normalizedIndexedPath(definitionPath);
+    if (
+      normalizedDefinitionPath.length === 0
+      || hasParentTraversal(normalizedDefinitionPath)
+      || isAbsolute(definitionPath)
+      || posix.isAbsolute(normalizedDefinitionPath)
+      || win32.isAbsolute(definitionPath)
+    ) throw new Error('Argument definition_path must be a safe repository-relative path.');
+    const definitionLineValue = this.optionalNumber(args, 'definition_line');
+    if (
+      definitionLineValue !== undefined
+      && (!Number.isInteger(definitionLineValue) || definitionLineValue < 1)
+    ) {
+      throw new Error('Argument definition_line must be a positive integer.');
+    }
+    const definitionLine = definitionLineValue;
+    const scopePrefix = this.optionalString(args, 'scope_prefix');
+    if (scopePrefix !== undefined && (scopePrefix.length > 1024 || /[\r\n\0]/u.test(scopePrefix))) {
+      throw new Error('Argument scope_prefix must be a single-line string of at most 1024 characters.');
+    }
+    if (scopePrefix !== undefined) {
+      const normalizedScope = normalizedIndexedPath(scopePrefix);
+      if (
+        normalizedScope.length === 0
+        || hasParentTraversal(normalizedScope)
+        || isAbsolute(scopePrefix)
+        || posix.isAbsolute(normalizedScope)
+        || win32.isAbsolute(scopePrefix)
+      ) throw new Error('Argument scope_prefix must be a safe repository-relative path prefix.');
+    }
+    const includeTestsValue = args.include_tests;
+    if (includeTestsValue !== undefined && typeof includeTestsValue !== 'boolean') {
+      throw new Error('Argument include_tests must be a boolean.');
+    }
+    const maxResults = Math.max(1, Math.min(
+      MAX_STRUCTURAL_RESULTS,
+      Math.floor(this.optionalNumber(args, 'max_results') ?? DEFAULT_STRUCTURAL_RESULTS),
+    ));
+    const codeReader = this.codeReader;
+    if (!codeReader) return this.error('Code graph reader not configured. Index the project first.');
+    const root = codeReader.getProjectRoot(project);
+    if (!root) return this.error(`Indexed repository root is unavailable for project "${project}".`);
+    const indexedPathProbe = codeReader.listProjectFilePaths(project, MAX_INDEXED_FILES + 1);
+    const indexedPaths = indexedPathProbe.slice(0, MAX_INDEXED_FILES);
+    const structural = await import('../structural-references.js');
+    const common = {
+      root,
+      indexedPaths,
+      target: { name: symbol, path: normalizedDefinitionPath, definitionLine },
+      includeTests: includeTestsValue === true,
+      scopePrefix,
+      maxResults,
+    };
+    if (operation === 'transitive_type_impact') {
+      const result = structural.findTransitiveTypeImpact(common);
+      const reasons = new Set(result.incomplete_reasons);
+      if (indexedPathProbe.length > MAX_INDEXED_FILES) reasons.add('indexed_file_limit');
+      const incompleteReasons = [...reasons].sort(stablePathCompare);
+      return this.json({
+        project,
+        operation,
+        symbol,
+        definition_path: normalizedDefinitionPath,
+        definition_line: definitionLine,
+        scope_prefix: scopePrefix,
+        files: result.files,
+        results_truncated: result.results_truncated,
+        analysis: { method: 'typescript_semantic', source_files: result.source_files_analyzed },
+        complete: result.complete && incompleteReasons.length === 0,
+        incomplete_reasons: incompleteReasons,
+      });
+    }
+    const result = structural.findStructuralCallSites(common);
+    const reasons = new Set(result.incomplete_reasons);
+    if (indexedPathProbe.length > MAX_INDEXED_FILES) reasons.add('indexed_file_limit');
+    const incompleteReasons = [...reasons].sort(stablePathCompare);
+    const locationFormat = this.optionalString(args, 'location_format') ?? 'path_line_column';
+    if (!['path_line', 'path_line_column'].includes(locationFormat)) {
+      throw new Error('Argument location_format must be one of: path_line, path_line_column.');
+    }
+    return this.json({
+      project,
+      operation,
+      symbol,
+      definition_path: normalizedDefinitionPath,
+      definition_line: definitionLine,
+      scope_prefix: scopePrefix,
+      call_sites: result.call_sites,
+      formatted_call_sites: result.call_sites.map((site) => (
+        locationFormat === 'path_line'
+          ? `${site.path}:${site.line}`
+          : `${site.path}:${site.line}:${site.column}`
+      )).sort(stablePathCompare),
+      location_format: locationFormat,
+      results_truncated: result.results_truncated,
+      analysis: { method: 'typescript_semantic', source_files: result.source_files_analyzed },
+      complete: result.complete && incompleteReasons.length === 0,
+      incomplete_reasons: incompleteReasons,
+    });
   }
 
   private async handleDirectCallers(args: Record<string, unknown>, project: string): Promise<ToolResponse> {
