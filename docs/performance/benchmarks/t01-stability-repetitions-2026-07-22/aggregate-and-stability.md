@@ -101,3 +101,17 @@ from the raw manifest.
 No attempt 2 or invalid-run replacement exists. The three manifests cover 120
 raw artifacts and 1,015,125 bytes in total, with separate identities so no
 duplicate cell key is collapsed across repetitions.
+
+## Verification
+
+- `npm run docs:check` passed with all benchmark questions, links, anchors,
+  metadata, and portal reachability verified.
+- Pre-registration CI run `29949018208` and measured-checkpoint CI run
+  `29951530497` passed backend, frontend, Windows, package, and Docker jobs.
+- The final data audit re-hashed all 120 raw artifacts, reproduced all three
+  manifest tree hashes, proved all three committed CSV files byte-identical to
+  the derived runner CSV files, and independently recalculated all 24 selected
+  cells and three matched aggregates.
+- The diff from anchor `148e4b65849efc3fcfbc4fb716abf0898424293d`
+  contains documentation evidence only. No product, runner, task, oracle,
+  policy, grading, package, or Graph UI file changed.
