@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r179-structural-token-costs
 base_sha: 148e4b65849efc3fcfbc4fb716abf0898424293d
-last_completed_code_sha: 148e4b65849efc3fcfbc4fb716abf0898424293d
+last_completed_code_sha: 4cd8e695bcdb67b4f317a69a0aaba4ba9ff5fdc5
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T18:23:57.4665074Z
+updated_at_utc: 2026-07-22T18:47:57.7122493Z
 implementer_role: codex
 ```
 
@@ -48,15 +48,16 @@ The three diagnoses must be completed and pushed before any product edit.
 
 | Finding | Task | Decision | Evidence | Product change | Validation state |
 |---------|------|----------|----------|----------------|------------------|
-| R179-DIAG-T02 | T02 | ACCEPTED | 21/15 small and 8/7 large B calls manually chase names, aliases, re-exports, and modules; aggregate payload and round trips dominate | add bounded `transitive_type_impact` to existing lookup tool | diagnosis written; product not started |
-| R179-DIAG-T03 | T03 | ACCEPTED WITH BOUNDARY | small one-shot is already one exact 516-byte call; large target is ambiguous by short name and exact positions require broad follow-ups | add bounded declaration-qualified `symbol_call_sites`; do not alter efficient empty path or `direct_callers` | diagnosis written; product not started |
-| R179-DIAG-T04 | T04 | ACCEPTED WITH BOUNDARY | small direct aggregation lacks 27 individual positions; large empty result is followed by redundant literal confirmation; fixed MCP overhead remains | share `symbol_call_sites` with T03 and preserve duplicate positions | diagnosis written; product not started |
+| R179-DIAG-T02 | T02 | IMPLEMENTED | 21/15 small and 8/7 large B calls manually chase names, aliases, re-exports, and modules; aggregate payload and round trips dominate | bounded `transitive_type_impact` on existing lookup tool | 2/2 pinned oracle smokes exact and complete |
+| R179-DIAG-T03 | T03 | IMPLEMENTED WITH BOUNDARY | small one-shot is already one exact 516-byte call; large target is ambiguous by short name and exact positions require broad follow-ups | bounded declaration-qualified `symbol_call_sites`; efficient empty path and `direct_callers` unchanged | 2/2 pinned oracle smokes exact and complete |
+| R179-DIAG-T04 | T04 | IMPLEMENTED WITH BOUNDARY | small direct aggregation lacks 27 individual positions; large empty result is followed by redundant literal confirmation; fixed MCP overhead remains | share `symbol_call_sites` with T03 and preserve duplicate positions | 2/2 pinned oracle smokes exact and complete |
 
 ## Pushed checkpoints
 
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
 | `e8f4b99aca85cb3eea2cdb86059d5fe89a43d8fc` | `e8f4b99aca85cb3eea2cdb86059d5fe89a43d8fc` | R179-INIT | Initialize bounded T02-T04 diagnosis from the post-R178 canonical main | docs check PASS; clean exact base; protocol and artifact inventory read | [CI 29946043041](https://github.com/Cheurteenyt/Ariad/actions/runs/29946043041) PASS |
+| `4cd8e695bcdb67b4f317a69a0aaba4ba9ff5fdc5` | pending | R179-IMPL | Add declaration-qualified semantic call sites and transitive type impact without changing `direct_callers` | MCP 46/46; typecheck, build, package, docs PASS; six pinned smokes exact | [CI 29948244532](https://github.com/Cheurteenyt/Ariad/actions/runs/29948244532) running |
 
 ## Exact validation evidence
 
@@ -96,6 +97,31 @@ result_summary: T02 is repeated name/alias/module discovery; large T03 is ambigu
 not_run: accepted product mechanisms remain unimplemented until this checkpoint is committed and pushed
 ```
 
+```text
+command: npm run typecheck; npx vitest run tests/mcp; npm run build:package; npm run docs:check
+working_directory: v2
+environment: Windows 11, Node v24.15.0, npm 11.12.1
+exit_code: 0
+result_summary: backend and graph-lab typechecks PASS; all 46 MCP tests PASS; complete embedded-UI package PASS; 66-file documentation validation and structural spec verification PASS
+```
+
+```text
+command: invoke transitive_type_impact for T02 and symbol_call_sites for T03/T04 directly through the built lookup tool against both pinned R176 projects; compare copy-ready arrays with tasks.json oracle answers
+working_directory: repository root
+environment: XDG-compatible pinned DB state D:/Mycodex/benchmark-state/v2-r173-final; small SHA 5915e06; large SHA ef3a583
+exit_code: 0
+result_summary: 6/6 exact, complete=true, zero incomplete reasons; response bytes small T02/T03/T04 563/385/2911 and large 672/1032/436
+```
+
+```text
+command: npm test
+working_directory: v2
+environment: Windows 11 local host
+exit_code: 1
+result_summary: broader local suite is platform-environment blocked: 539 unrelated filesystem/security tests fail together because Windows temporary directories are reported with POSIX mode 0666; targeted MCP suites, typecheck, build, docs, package, and pinned semantic smokes pass
+scope_decision: no permissive workaround or unrelated filesystem change; rely on the supported Linux GitHub backend job for the broad suite and retain this local disclosure
+```
+
 ## Reset recovery
 
 ```bash
@@ -123,15 +149,15 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 
 ## Current working state
 
-- **Last completed finding:** R179-DIAG-T02/T03/T04 are written from an exact
-  24-row re-derivation and complete trace inspection.
-- **Current finding:** publish the diagnosis-only checkpoint before any product
-  edit, then implement the two accepted bounded operations.
-- **Dirty files expected:** this handoff and the diagnosis section only.
-- **Unpushed commits expected:** one diagnosis-only checkpoint.
+- **Last completed finding:** R179-IMPL is pushed at `4cd8e69`; all six pinned
+  semantic answers are exact and complete.
+- **Current finding:** establish exact CI head, then publish a pushed immutable
+  environment disclosure and B/C pre-registration before any measured process.
+- **Dirty files expected:** this handoff only.
+- **Unpushed commits expected:** one handoff checkpoint.
 - **Known blocker:** none.
-- **Single next action:** commit and push the diagnosis-only checkpoint, then
-  start regression-first product work.
+- **Single next action:** record CI for `4cd8e69`, finish the immutable fresh
+  rerun pre-registration, and push it before creating a raw result root.
 
 ## Security confirmation
 
@@ -142,8 +168,8 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 
 ## Pre-final-audit checklist
 
-- [ ] Every diagnosis is written and pushed before product code changes.
-- [ ] Every accepted fix has a focused regression that fails when reverted.
+- [x] Every diagnosis is written and pushed before product code changes.
+- [x] Every accepted fix has a focused regression that fails when reverted.
 - [ ] Fresh B/C cells disclose the full environment before measurement.
 - [ ] The full affordable local suite and GitHub Actions are recorded.
 - [ ] No important work exists only in the current environment.
