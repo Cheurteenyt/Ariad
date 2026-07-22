@@ -7,13 +7,13 @@ schema_version: 1
 kind: implementation-handoff
 round: R178
 status: ACTIVE
-repository: Cheurteenyt/codebase-mirror
+repository: Cheurteenyt/Ariad
 branch: v2/r178-fresh-bc-multihop
 base_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
 last_completed_code_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T02:08:44.2809862Z
+updated_at_utc: 2026-07-22T02:28:12.8765400Z
 implementer_role: codex
 ```
 
@@ -41,6 +41,16 @@ implementer_role: codex
   change, broad superiority claim, or reinterpretation of R176/R177.
 - No attempt to claim that R176 and R178 used identical OS/runtime/hardware:
   R176 did not record those fields.
+
+### Post-measure repository migration
+
+After the immutable R178 result was pushed, GitHub reported the canonical
+repository as `Cheurteenyt/Ariad`. The exact-SHA CI and CodeQL preflights still
+required the former repository name and therefore failed before running any
+validation. The owner confirmed that the rename was intentional and authorized
+the active control-plane, package metadata, and documentation migration to
+`Cheurteenyt/Ariad`. This publication fix occurs after all measured processes;
+it does not alter the candidate SHA, task, oracle, runner, or raw artifacts.
 
 ## Audit decisions
 
@@ -108,17 +118,26 @@ working_directory: v2 and repository root as applicable
 environment: Node.js v24.15.0, npm 11.12.1, Windows 11
 exit_code: 0
 result_summary: documentation valid for 65 Markdown files with 55 reachable and all references verified; TypeScript backend/lab check passes; 7/7 benchmark tests pass; backend and embedded Graph UI package build passes every bundle budget with npm audit reporting 0 vulnerabilities
-not_run: broad product test suites are delegated to the mandatory GitHub CI because R178 changes only documentation and generated benchmark evidence
+not_run: the optional AsyncSSH self-test cannot start because asyncssh==2.24.0 is not installed; the helper passes Python syntax compilation
+```
+
+```text
+command: npx vitest run tests/ci/r169-glm-github-governance.test.ts tests/ci/r169-glm-post-merge-watchdog-runtime.test.ts; parse all workflow YAML; npm test
+working_directory: v2
+environment: Node.js v24.15.0, npm 11.12.1, Windows 11
+exit_code: targeted tests and YAML parse 0; broad npm test 1
+result_summary: 28/28 repository-governance and watchdog-runtime regressions pass, including the canonical Ariad binding across six sensitive workflows. The broad suite reaches unrelated POSIX filesystem tests but fails on Windows permission/symlink emulation, repeatedly reading temporary compatibility roots as mode 0o666; no storage or indexer source is modified by this migration.
+not_run: actionlint is not installed locally; mandatory GitHub Actions validates the workflow files and the Linux-specific product suite on the exact pushed SHA
 ```
 
 ## Reset recovery
 
 ```bash
-REPOSITORY=https://github.com/Cheurteenyt/codebase-mirror.git
+REPOSITORY=https://github.com/Cheurteenyt/Ariad.git
 WORK_BRANCH=v2/r178-fresh-bc-multihop
 
-git clone --single-branch --branch "$WORK_BRANCH" "$REPOSITORY" codebase-mirror
-cd codebase-mirror
+git clone --single-branch --branch "$WORK_BRANCH" "$REPOSITORY" Ariad
+cd Ariad
 git fetch origin main "$WORK_BRANCH"
 test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$WORK_BRANCH")"
 git merge-base --is-ancestor d542d666a048eb14e6b6ca314efd47239cca92e5 HEAD
@@ -136,13 +155,17 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 ## Current working state
 
 - **Last completed finding:** R177 multi-hop correction is merged on `main`.
-- **Current finding:** R178-RESULT, publish and validate the fresh confirmation.
-- **Dirty files expected:** protocol, active handoff, and canonical checkpoint
-  until the result checkpoint is committed.
-- **Unpushed commits expected:** 0 before the result commit.
-- **Known blocker:** none.
-- **Single next action:** run documentation and package validation, commit and
-  push the result checkpoint, then complete CI-backed publication.
+- **Current finding:** R178-REPOSITORY-MIGRATION, bind active automation and
+  public metadata to the renamed canonical repository without touching the
+  measured evidence.
+- **Dirty files expected:** active workflows, repository metadata,
+  documentation, and focused CI regression tests until the migration commit.
+- **Unpushed commits expected:** 1 migration commit after local validation.
+- **Known blocker:** the pushed result SHA fails its exact-SHA preflight because
+  GitHub reports `Cheurteenyt/Ariad` while the workflows require the former
+  repository name.
+- **Single next action:** validate and push the canonical-repository migration,
+  then require green GitHub CI and CodeQL on the resulting exact head SHA.
 
 ## Security confirmation
 

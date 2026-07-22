@@ -34,7 +34,7 @@ servers unless a future result table explicitly adds such a condition.
 
 | Field | Fixed value |
 |---|---|
-| Public repository | <https://github.com/Cheurteenyt/codebase-mirror> |
+| Public repository | <https://github.com/Cheurteenyt/Ariad> |
 | Target commit | `5915e0624ed4376611fdc1f824d1d65a327c4a2f` |
 | Product version at target | `0.77.0-alpha.1` |
 | Benchmark project name | `benchmark-codebase-mirror-5915e06` |
@@ -320,7 +320,7 @@ not change the target SHA, project name, questions, or model between conditions.
 ```powershell
 $TargetSha = '5915e0624ed4376611fdc1f824d1d65a327c4a2f'
 $Target = 'D:\benchmark\codebase-mirror-5915e06'
-git clone https://github.com/Cheurteenyt/codebase-mirror.git $Target
+git clone https://github.com/Cheurteenyt/Ariad.git $Target
 git -C $Target checkout --detach $TargetSha
 git -C $Target rev-parse HEAD
 git -C $Target status --short
@@ -1058,7 +1058,7 @@ it will not convert token counts into monetary estimates.
 
 The two targets and commits are unchanged:
 
-- small: `Cheurteenyt/codebase-mirror` at
+- small: `Cheurteenyt/Ariad` at
   `5915e0624ed4376611fdc1f824d1d65a327c4a2f`;
 - large: `microsoft/playwright` at
   `ef3a5830f960c00018f810cebf26133b35ec2b6f`.
@@ -1543,7 +1543,13 @@ R177 corrected and freshly remeasured only condition B. Combining its final B
 total with the historical R176 condition-C total suggested that grep/read used
 about 5.2 times as many native tokens, but those two values came from different
 rounds. R178 replaces that hand-combined comparison with one bounded,
-same-round B/C confirmation. It changes no product or benchmark code.
+same-round B/C confirmation. Its measurement phase changes no product or
+benchmark code.
+
+The repository was renamed to `Cheurteenyt/Ariad` after the immutable R178
+result commit was pushed. Updating active repository bindings during
+publication does not change the candidate SHA, benchmark inputs, raw artifacts,
+or any value reported below.
 
 ### 16.1 Environment disclosure and R176 difference
 
