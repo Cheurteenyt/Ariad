@@ -6,14 +6,14 @@
 schema_version: 1
 kind: implementation-handoff
 round: R178
-status: ACTIVE
+status: ARCHIVED
 repository: Cheurteenyt/Ariad
 branch: v2/r178-fresh-bc-multihop
 base_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
-last_completed_code_sha: d542d666a048eb14e6b6ca314efd47239cca92e5
+last_completed_code_sha: 432878eb0dbea9d016ef4d43ad20f0792cba1933
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-22T02:28:12.8765400Z
+updated_at_utc: 2026-07-22T02:31:29.5682657Z
 implementer_role: codex
 ```
 
@@ -63,7 +63,8 @@ apples-to-apples B/C comparison.
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
 | `d542d666a048eb14e6b6ca314efd47239cca92e5` | `38d10e93d27fc46d13329648d000a9c072d21622` | R178-PROTOCOL | Exact environment, R176 environment gap, eight-cell order, immutable roots, and acceptance rules fixed and pushed before measurement | `npm run docs:check` PASS | pending |
-| `d542d666a048eb14e6b6ca314efd47239cca92e5` | pending | R178-RESULT | Eight fresh same-round B/C cells: B 4/4 PASS and 236,837 raw tokens; C 0/4 PASS and 1,223,595; C/B 5.166401365x | build, runner/oracle verify, 8/8 valid cells, immutable checkpoint, docs check, typecheck, benchmark tests, package build | pending |
+| `d542d666a048eb14e6b6ca314efd47239cca92e5` | `5d5d2e8f2f2fdbc702167e8f1e3ab36bdc7c6957` | R178-RESULT | Eight fresh same-round B/C cells: B 4/4 PASS and 236,837 raw tokens; C 0/4 PASS and 1,223,595; C/B 5.166401365x | build, runner/oracle verify, 8/8 valid cells, immutable checkpoint, docs check, typecheck, benchmark tests, package build | exact-SHA preflight failed because the renamed repository still had the legacy workflow binding |
+| `432878eb0dbea9d016ef4d43ad20f0792cba1933` | `432878eb0dbea9d016ef4d43ad20f0792cba1933` | R178-REPOSITORY-MIGRATION | Six sensitive workflows, public metadata, active documentation, and validator migrated to `Cheurteenyt/Ariad`; frozen benchmark evidence preserved | governance/watchdog 28/28, docs 7/7, typecheck, build, package, YAML parse | CI push `29885944993` PASS; CI PR `29885947072` PASS; CodeQL `29885947052` PASS |
 
 ## Exact validation evidence
 
@@ -154,18 +155,14 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 
 ## Current working state
 
-- **Last completed finding:** R177 multi-hop correction is merged on `main`.
-- **Current finding:** R178-REPOSITORY-MIGRATION, bind active automation and
-  public metadata to the renamed canonical repository without touching the
-  measured evidence.
-- **Dirty files expected:** active workflows, repository metadata,
-  documentation, and focused CI regression tests until the migration commit.
-- **Unpushed commits expected:** 1 migration commit after local validation.
-- **Known blocker:** the pushed result SHA fails its exact-SHA preflight because
-  GitHub reports `Cheurteenyt/Ariad` while the workflows require the former
-  repository name.
-- **Single next action:** validate and push the canonical-repository migration,
-  then require green GitHub CI and CodeQL on the resulting exact head SHA.
+- **Last completed finding:** R178 fresh B/C confirmation and the canonical
+  Ariad repository migration are validated on exact head `432878e`.
+- **Current finding:** R178-CLOSED; this record is historical and inactive.
+- **Dirty files expected:** none after the archival commit.
+- **Unpushed commits expected:** none after the archival commit.
+- **Known blocker:** none.
+- **Single next action:** require exact CI and CodeQL on the archival head, then
+  squash-merge PR #73.
 
 ## Security confirmation
 
@@ -182,5 +179,5 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify `
 - [x] The pre-registration commit is pushed before every measured process.
 - [x] All eight fresh cells are valid and mechanically graded.
 - [x] The canonical checkpoint and plain-language ratio are published locally.
-- [ ] The affordable local validation and GitHub CI are green.
-- [ ] The handoff is archived and removed before merge.
+- [x] The affordable local validation and GitHub CI are green.
+- [x] The handoff is archived and removed before merge.
