@@ -283,6 +283,37 @@ describe("Sidebar ARIA tree keyboard navigation", () => {
     expect(onSelectNode).toHaveBeenCalledWith(exactNode);
   });
 
+  it("promotes an exact path query to an actionable directory scope", async () => {
+    const exactNode = makeNode(
+      99,
+      "benchUtil.ts",
+      "packages\\bench\\benchUtil.ts",
+    );
+    vi.spyOn(api, "searchNodes").mockResolvedValue(
+      makeSearchPage("packages/bench", [exactNode]),
+    );
+    const onSelectPath = vi.fn();
+    render(
+      <Sidebar
+        project="test"
+        nodes={[makeNode(1, "visible.ts", "src/visible.ts")]}
+        onSelectPath={onSelectPath}
+        onSelectNode={vi.fn()}
+        selectedPath={null}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search paths or symbols" }), {
+      target: { value: "packages/bench" },
+    });
+
+    const openDirectory = await screen.findByRole("button", {
+      name: "Open directory packages/bench",
+    });
+    fireEvent.click(openDirectory);
+    expect(onSelectPath).toHaveBeenCalledWith("packages/bench", new Set());
+  });
+
   it("revalidates an active exact query when exactRefreshKey changes", async () => {
     const staleNode = makeNode(90, "outside-old.ts", "hidden/outside-old.ts");
     const freshNode = makeNode(91, "outside-new.ts", "hidden/outside-new.ts");

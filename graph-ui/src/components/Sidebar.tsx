@@ -105,6 +105,10 @@ function graphNodeItemId(node: GraphNode): string {
   return `node:${node.id}`;
 }
 
+function portableGraphPath(path: string): string {
+  return path.replaceAll("\\", "/");
+}
+
 function findTreeItem(root: HTMLElement | null, itemId: string): HTMLElement | null {
   if (!root) return null;
   return [...root.querySelectorAll<HTMLElement>("[role=treeitem]")]
@@ -360,6 +364,22 @@ export function Sidebar({
   const completeSearchFailed = exactSearch.error != null
     && exactData == null
     && (filtered?.length ?? 0) === 0;
+  const exactDirectoryMatch = useMemo(() => {
+    if (!exactData) return null;
+    const key = portableGraphPath(activeSearchQuery)
+      .replace(/^\.\/+/u, "")
+      .replace(/\/+$/u, "");
+    if (!key.includes("/")) return null;
+    const prefix = `${key}/`;
+    const hasDescendant = exactData.nodes.some((node) => (
+      node.file_path != null && portableGraphPath(node.file_path).startsWith(prefix)
+    ));
+    if (!hasDescendant) return null;
+    const overviewIds = new Set(nodes
+      .filter((node) => node.file_path != null && portableGraphPath(node.file_path).startsWith(prefix))
+      .map((node) => node.id));
+    return { key, overviewIds };
+  }, [activeSearchQuery, exactData, nodes]);
 
   const topLevel = useMemo(() => {
     const directories = [...tree.children.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -512,6 +532,26 @@ export function Sidebar({
                   </span>
                 )}
               </div>
+              {exactDirectoryMatch && (
+                <button
+                  type="button"
+                  aria-label={`Open directory ${exactDirectoryMatch.key}`}
+                  onClick={() => onSelectPath(exactDirectoryMatch.key, exactDirectoryMatch.overviewIds)}
+                  className="mx-3 my-2 flex min-h-12 w-[calc(100%-1.5rem)] items-center gap-2 rounded-lg border border-cyan-300/20 bg-cyan-300/[0.06] px-3 text-left transition-colors hover:bg-cyan-300/[0.1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/60"
+                >
+                  <span className="min-w-0">
+                    <span className="block text-[10px] font-medium uppercase tracking-wider text-cyan-100/55">
+                      Exact directory
+                    </span>
+                    <span className="block truncate font-mono text-[11px] text-cyan-50/85">
+                      {exactDirectoryMatch.key}
+                    </span>
+                  </span>
+                  <span className="ml-auto shrink-0 text-[10px] font-medium text-cyan-100/65">
+                    Open graph
+                  </span>
+                </button>
+              )}
               {exactSearch.error && (
                 <div
                   role="alert"
