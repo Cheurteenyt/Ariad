@@ -2,7 +2,7 @@
 
 > **Status:** Canonical measurement laboratory
 > **Audience:** Frontend contributors, performance engineers, and auditors
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-20
+> **Last verified:** `0.78.0-alpha.1` / 2026-07-23
 
 ## Purpose
 
@@ -36,10 +36,11 @@ frontend plus the C `layout3d` engine. The lab records this commit in every
 report. Using a floating `main` or the latest V1 release invalidates the
 comparison.
 
-The reference source is MIT licensed but is not vendored a second time into
-this repository. A local clone/build belongs in the ignored
+The reference source is already vendored once under `v1-reference/`, with its
+upstream MIT notice preserved in `v1-reference/LICENSE`. A separate local
+clone/build used by the lab belongs in the ignored
 `.codex-runtime/graph-ui-lab/v1-source` directory. V2 discovery always excludes
-`.codex-runtime`, so raw measurements and the reference clone cannot pollute or
+`.codex-runtime`, so raw measurements and that build clone cannot pollute or
 block the product graph.
 
 ## The strict same-graph rule

@@ -2,7 +2,7 @@
   <img src="docs/assets/codebase-memory-logo.png" alt="Codebase Memory project logo" width="240">
 </p>
 
-# Codebase Memory V2
+# Ariad — Codebase Memory V2
 
 > **Hybrid code intelligence** — native WASM indexer (112 languages) + human memory graph + Obsidian vault sync.
 > V1 (C engine, 158 languages) remains an optional, separately run database producer and reference; V2 never launches it automatically.
@@ -21,6 +21,22 @@ Codebase Memory V2 is a **hybrid** code intelligence system:
 3. **V1 C engine** (separate producer/reference) — 158 languages via tree-sitter C. If an operator runs V1 separately, V2 can read the resulting compatible SQLite database via `CodeGraphReader`.
 
 V2 performs native indexing without invoking V1. It does not automatically fall back to V1, merge V1 and V2 output, or create a V1 database on demand.
+
+## Lineage and attribution
+
+Ariad / Codebase Memory V2 was initially inspired by
+[DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp):
+in particular, its local persistent code graph, structural MCP queries, and
+interactive graph exploration. Ariad V2 is a separate TypeScript, Node.js, and
+WASM implementation maintained independently; it is not an official DeusData
+release and is not affiliated with that project.
+
+`v1-reference/` preserves a frozen compatibility and benchmark snapshot of the
+upstream project at commit
+[`345425a1bbf73fa29f76067a91f6d16dcf6f11a8`](https://github.com/DeusData/codebase-memory-mcp/tree/345425a1bbf73fa29f76067a91f6d16dcf6f11a8).
+That snapshot is not part of the active V2 runtime. Its original MIT notice is
+preserved in [`v1-reference/LICENSE`](v1-reference/LICENSE); Ariad's own code is
+licensed separately under the root [MIT license](LICENSE).
 
 ## Current version
 
