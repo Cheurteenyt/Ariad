@@ -1979,3 +1979,34 @@ The future canonical evidence directory is
 `docs/performance/benchmarks/t02-t04-structural-cost-root-cause-2026-07-23`,
 with one immutable baseline checkpoint per repetition, an immutable pre-fix
 diagnosis, and—only if warranted—the corresponding postfix checkpoints.
+
+### 18.2 Baseline result and diagnosis before correction
+
+All 24 invocations and 84 raw cells completed on attempt 1. The 72 T02-T04
+decision cells used 26,866,194 native raw tokens. Across them, B and C are tied
+at 34 PASS and 2 PARTIAL each. B used 11,575,204 tokens versus C's 15,290,990,
+or 24.3005% fewer in the descriptive combined total, but usage mode changes
+the conclusion: one-shot B is 56.33% more expensive, while continuous B is
+36.21% cheaper.
+
+The pre-registered R176 direction pattern fails. Only 2/24 token groups meet
+`max/min <= 1.20`; six paired cells flip direction at least once; and all three
+continuous/large tasks reverse R176 in every repetition. Continuous B is not
+amortizing its schema: every resumed B turn exposes the same 10,168 schema
+bytes. Its advantage follows the much smaller T01 B warm-up context, including
+a small/C outlier that injected 681,556 response bytes before T02.
+
+The stable project-controlled mechanism is narrower. One-shot T02 accounts
+for 969,993 tokens, or 87.5%, of the one-shot B-over-C gap. Its B path needs
+10-19 distinct calls because the pinned indexes contain `CALLS` and `CONTAINS`
+edges but no alias-aware type-reference graph; the large type alias is not a
+node at all. No exact request is duplicated and the largest T02 B response is
+only 13.4%-37.8% of total response bytes. R181 therefore authorizes one
+general `type_dependents` operation inside the existing `lookup_source_text`
+tool, implemented on demand without an index migration. It authorizes no T01,
+direct-caller, schema, or prompt change.
+
+The complete pre-fix evidence, all per-repetition tokens, grades, calls, tool
+signatures, response concentration, context, wall times, environment identity,
+manifest hashes, and correction gate are published in the
+[`R181 diagnosis before product changes`](benchmarks/t02-t04-structural-cost-root-cause-2026-07-23/diagnosis-before-fix.md).
