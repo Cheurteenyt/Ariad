@@ -1,3 +1,15 @@
+> **Archived upstream reference — not the Ariad V2 README.**
+>
+> This directory preserves a frozen compatibility and benchmark snapshot of
+> [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp)
+> at commit
+> [`345425a1bbf73fa29f76067a91f6d16dcf6f11a8`](https://github.com/DeusData/codebase-memory-mcp/tree/345425a1bbf73fa29f76067a91f6d16dcf6f11a8).
+> The upstream source and the original README below are MIT licensed; see
+> [LICENSE](LICENSE). Ariad V2 is maintained as a separate implementation, and
+> this snapshot is not its active runtime or its current product documentation.
+> Floating links and product claims below belong to the archived upstream
+> README and may have changed since the pinned commit.
+
 # codebase-memory-mcp
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)

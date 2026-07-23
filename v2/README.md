@@ -7,6 +7,15 @@
 Hybrid code intelligence: native WASM indexer (112 languages via tree-sitter),
 human memory graph (SQLite), Obsidian sync, and a web-based graph UI.
 
+## Project lineage
+
+This package was initially inspired by
+[DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp),
+but it is a separate TypeScript, Node.js, and WASM implementation. See the
+repository's [lineage and attribution](../README.md#lineage-and-attribution)
+section for the precise boundary between active V2 code and the frozen
+upstream reference snapshot.
+
 ## Installation
 
 ```bash

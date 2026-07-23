@@ -2,7 +2,7 @@
 
 > **Status:** Canonical documentation portal
 > **Audience:** Users, integrators, contributors, maintainers, and auditors
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-20
+> **Last verified:** `0.78.0-alpha.1` / 2026-07-23
 
 This page is the only documentation entry point. It separates current product
 contracts from measured evidence and historical records so an old audit cannot
@@ -13,6 +13,7 @@ silently override current behavior.
 | Need | Canonical source |
 |---|---|
 | Install and use the project | [Root README](../README.md) |
+| Understand project lineage and attribution | [Lineage and attribution](../README.md#lineage-and-attribution) |
 | Understand what is active now | [V2 current state](reference/V2_CURRENT_STATE.md) |
 | Understand the system | [V2 architecture](architecture/V2_ARCHITECTURE.md) |
 | Use the CLI | [CLI reference](reference/CLI_REFERENCE.md) |
