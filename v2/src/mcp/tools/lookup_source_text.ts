@@ -9,6 +9,7 @@ import {
   safeRealpathStrict,
 } from '../../utils/safe-path.js';
 import type { CodeNode } from '../../bridge/sqlite-ro.js';
+import { traceStructuralTypeDependents } from '../structural-type-dependents.js';
 
 const MAX_QUERIES = 10;
 const MAX_QUERY_LENGTH = 256;
@@ -27,7 +28,10 @@ const DEFAULT_CHAIN_HOPS = 6;
 const MAX_CHAIN_PATHS = 5;
 const MAX_CHAIN_EXPANSIONS = 500;
 const MAX_CHAIN_SYMBOLS_PER_NODE = 128;
-const OPERATIONS = ['literal_matches', 'direct_callers', 'top_level_directories', 'call_chain'] as const;
+const MAX_INCLUDE_PREFIXES = 20;
+const MAX_TYPE_FILES = 1000;
+const DEFAULT_TYPE_FILES = 200;
+const OPERATIONS = ['literal_matches', 'direct_callers', 'type_dependents', 'top_level_directories', 'call_chain'] as const;
 type SourceOperation = typeof OPERATIONS[number];
 
 const CALLABLE_LABELS = new Set(['Function', 'Method', 'Route', 'Constructor']);
@@ -266,7 +270,7 @@ export class LookupSourceTextTool extends BaseTool {
   get definition(): ToolDefinition {
     return {
       name: 'lookup_source_text',
-      description: 'Run one bounded exact-source operation. For exhaustive reverse caller impact, call direct_callers once with max_depth set to the requested hop bound, then copy formatted_callers. For any route-to-target or CLI-command-to-target trace, call call_chain first without pre-searching and copy formatted_chain. Other profiles find literals or list Git-tracked directories.',
+      description: 'Run one bounded exact-source operation. For a TypeScript type-change impact question, call type_dependents once with declaration_path, symbol, and include_prefixes, then copy files. For exhaustive reverse caller impact, call direct_callers once with max_depth set to the requested hop bound, then copy formatted_callers. For any route-to-target or CLI-command-to-target trace, call call_chain first without pre-searching and copy formatted_chain. Other profiles find literals or list Git-tracked directories.',
       annotations: {
         title: 'Look up exact source text',
         readOnlyHint: true,
@@ -285,7 +289,7 @@ export class LookupSourceTextTool extends BaseTool {
             type: 'string',
             enum: OPERATIONS,
             default: 'literal_matches',
-            description: 'Exact operation. Use call_chain immediately for route/CLI entry-to-target questions; do not discover its intermediate symbols first. Existing calls default to literal_matches.',
+            description: 'Exact operation. Use type_dependents immediately for TypeScript type-change impact and call_chain immediately for route/CLI entry-to-target questions. Existing calls default to literal_matches.',
           },
           queries: {
             type: 'array',
@@ -304,12 +308,32 @@ export class LookupSourceTextTool extends BaseTool {
             type: 'string',
             minLength: 1,
             maxLength: MAX_QUERY_LENGTH,
-            description: 'direct_callers only: exact callee symbol name.',
+            description: 'direct_callers: exact callee name. type_dependents: exact declared type/interface/class/enum name.',
+          },
+          declaration_path: {
+            type: 'string',
+            minLength: 1,
+            maxLength: MAX_QUERY_LENGTH,
+            description: 'type_dependents only: exact indexed repository-relative declaration path.',
+          },
+          include_prefixes: {
+            type: 'array',
+            minItems: 1,
+            maxItems: MAX_INCLUDE_PREFIXES,
+            items: { type: 'string', minLength: 1, maxLength: MAX_QUERY_LENGTH },
+            description: 'type_dependents only: repository-relative output prefixes, such as graph-ui/src or packages/.',
+          },
+          max_files: {
+            type: 'integer',
+            minimum: 1,
+            maximum: MAX_TYPE_FILES,
+            default: DEFAULT_TYPE_FILES,
+            description: 'type_dependents only: maximum sorted impacted files returned.',
           },
           include_tests: {
             type: 'boolean',
             default: false,
-            description: 'direct_callers only: include repository test roots and test/spec files. Product directories named src/.../test remain production when false.',
+            description: 'direct_callers/type_dependents: include repository test roots and test/spec files. Product directories named src/.../test remain production when false.',
           },
           max_callers: {
             type: 'integer',
@@ -370,6 +394,7 @@ export class LookupSourceTextTool extends BaseTool {
         throw new Error(`Argument operation must be one of: ${OPERATIONS.join(', ')}.`);
       }
       if (operation === 'direct_callers') return await this.handleDirectCallers(args, project);
+      if (operation === 'type_dependents') return await this.handleTypeDependents(args, project);
       if (operation === 'top_level_directories') return await this.handleTopLevelDirectories(args, project);
       if (operation === 'call_chain') return await this.handleCallChain(args, project);
 
@@ -513,6 +538,92 @@ export class LookupSourceTextTool extends BaseTool {
     } catch (error: unknown) {
       return this.error(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private async handleTypeDependents(
+    args: Record<string, unknown>,
+    project: string,
+  ): Promise<ToolResponse> {
+    const symbol = this.requireString(args, 'symbol');
+    const declarationPath = normalizedIndexedPath(this.requireString(args, 'declaration_path'));
+    for (const [name, value] of [['symbol', symbol], ['declaration_path', declarationPath]] as const) {
+      if (value.length > MAX_QUERY_LENGTH || /[\r\n\0]/u.test(value)) {
+        throw new Error(`Argument ${name} must be a single-line string of at most ${MAX_QUERY_LENGTH} characters.`);
+      }
+    }
+    if (
+      declarationPath.length === 0
+      || hasParentTraversal(declarationPath)
+      || isAbsolute(declarationPath)
+      || posix.isAbsolute(declarationPath)
+      || win32.isAbsolute(declarationPath)
+    ) throw new Error('Argument declaration_path must be a safe repository-relative path.');
+
+    const rawPrefixes = this.optionalArray(args, 'include_prefixes') ?? [];
+    if (rawPrefixes.length > MAX_INCLUDE_PREFIXES) {
+      throw new Error(`Argument include_prefixes must contain at most ${MAX_INCLUDE_PREFIXES} paths.`);
+    }
+    const includePrefixes = rawPrefixes.map((value, index) => {
+      if (typeof value !== 'string') {
+        throw new Error(`Argument include_prefixes[${index}] must be a string.`);
+      }
+      const prefix = normalizedIndexedPath(value).replace(/\/+$/u, '');
+      if (
+        prefix.length === 0
+        || prefix.length > MAX_QUERY_LENGTH
+        || /[\r\n\0]/u.test(prefix)
+        || hasParentTraversal(prefix)
+        || isAbsolute(prefix)
+        || posix.isAbsolute(prefix)
+        || win32.isAbsolute(prefix)
+      ) throw new Error(`Argument include_prefixes[${index}] must be a safe repository-relative path.`);
+      return prefix;
+    });
+    if (new Set(includePrefixes).size !== includePrefixes.length) {
+      throw new Error('Argument include_prefixes must not contain duplicate paths.');
+    }
+
+    const includeTestsValue = args.include_tests;
+    if (includeTestsValue !== undefined && typeof includeTestsValue !== 'boolean') {
+      throw new Error('Argument include_tests must be a boolean.');
+    }
+    const maxFiles = Math.max(1, Math.min(
+      MAX_TYPE_FILES,
+      Math.floor(this.optionalNumber(args, 'max_files') ?? DEFAULT_TYPE_FILES),
+    ));
+    const codeReader = this.codeReader;
+    if (!codeReader) return this.error('Code graph reader not configured. Index the project first.');
+    const root = codeReader.getProjectRoot(project);
+    if (!root) return this.error(`Indexed repository root is unavailable for project "${project}".`);
+    const indexedPathProbe = codeReader.listProjectFilePaths(project, MAX_INDEXED_FILES + 1);
+    const indexedPaths = indexedPathProbe.slice(0, MAX_INDEXED_FILES);
+    const result = traceStructuralTypeDependents({
+      root,
+      indexedPaths,
+      target: { name: symbol, path: declarationPath },
+      includePrefixes,
+      includeTests: includeTestsValue === true,
+      maxFiles,
+    });
+    const incompleteReasons = new Set(result.incomplete_reasons);
+    if (indexedPathProbe.length > MAX_INDEXED_FILES) incompleteReasons.add('indexed_file_limit');
+    const reasons = [...incompleteReasons].sort(stablePathCompare);
+    return this.json({
+      project,
+      operation: 'type_dependents',
+      symbol,
+      declaration_path: declarationPath,
+      include_prefixes: includePrefixes,
+      include_tests: includeTestsValue === true,
+      target_candidates: result.target_candidates,
+      files: result.files,
+      total_files: result.total_files,
+      files_truncated: result.files_truncated,
+      dependent_symbols: result.dependent_symbols,
+      source_files_analyzed: result.source_files_analyzed,
+      complete: result.complete && reasons.length === 0,
+      incomplete_reasons: reasons,
+    });
   }
 
   private async handleDirectCallers(args: Record<string, unknown>, project: string): Promise<ToolResponse> {

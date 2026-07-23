@@ -2,7 +2,7 @@
 
 > **Status:** Canonical MCP contract reference
 > **Audience:** MCP integrators, agent authors, users, and maintainers
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-21
+> **Last verified:** `0.78.0-alpha.1` / 2026-07-23
 
 V2 exposes **8 MCP tools** via JSON-RPC 2.0 over stdio. This document describes each tool's input, output, and usage.
 
@@ -263,9 +263,9 @@ shortened by `limit`.
 
 **Purpose**: One bounded gateway for exact source truth. It preserves literal
 lookup and adds server-side direct- and multi-hop caller analysis, top-level
-inventory, and route/CLI call chains, avoiding repeated search/read loops
-without adding a ninth MCP schema. It is not a regex engine, shell proxy, or
-broad composite search.
+inventory, TypeScript type-dependency analysis, and route/CLI call chains,
+avoiding repeated search/read loops without adding a ninth MCP schema. It is
+not a regex engine, shell proxy, or broad composite search.
 
 **Input**:
 ```json
@@ -365,6 +365,37 @@ closed. Repository tests are excluded by default, but product directories
 named `src/.../test` remain production. Omitting `max_depth`, or setting it to
 1, retains the original persistent direct-caller response contract and does
 not load the TypeScript compiler.
+
+For an alias-aware TypeScript type-change impact set, use one semantic call:
+
+```json
+{
+  "operation": "type_dependents",
+  "declaration_path": "src/types.ts",
+  "symbol": "RootConfig",
+  "include_prefixes": ["src"],
+  "include_tests": false,
+  "max_files": 200
+}
+```
+
+The operation starts from the exact indexed declaration path and declared
+type, interface, class, or enum. It follows canonical TypeScript symbol
+identity through renamed imports, named dependent declarations, re-exports,
+and workspace package aliases derived from indexed `package.json` `name`,
+`types`/`typings`, and typed `exports`. It returns the sorted declaration and
+impacted TypeScript files, target candidates, dependent-symbol count, source
+coverage, truncation, and explicit completeness metadata. Tests are excluded
+by default while product paths named `src/.../test` remain included.
+
+`include_prefixes` accepts 1 to 20 safe repository-relative output prefixes;
+omitting it searches all eligible output paths. `max_files` is bounded to
+`1..1000` and defaults to 200. The semantic input is limited to 20,000 indexed
+paths, 4 MiB per TypeScript file, 128 MiB total, 2,048 package manifests, and
+1 MiB per manifest. Unsafe, unreadable, over-budget, missing, ambiguous, or
+truncated analysis returns `complete=false` with sorted
+`incomplete_reasons`. This is an on-demand read over indexed paths and does
+not require an index-format migration.
 
 For exact tracked repository inventory:
 

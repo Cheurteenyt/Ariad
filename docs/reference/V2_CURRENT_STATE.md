@@ -60,8 +60,8 @@ This boundary is intentional and regression-tested.
 
 - Eight read-oriented MCP tools, including bounded exact source lookup and
   `prepare_edit_context`.
-- Exact source profiles for literal matches, direct callers, tracked top-level
-  inventory, and bounded call chains.
+- Exact source profiles for literal matches, TypeScript type dependents, direct
+  callers, tracked top-level inventory, and bounded call chains.
 - Deterministic ordering, output bounds, ambiguity, staleness, coverage,
   completeness, and truncation metadata.
 - Exact literals and known paths are expected to use the cheapest exact source
