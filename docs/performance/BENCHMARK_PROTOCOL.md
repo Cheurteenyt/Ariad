@@ -2010,3 +2010,35 @@ The complete pre-fix evidence, all per-repetition tokens, grades, calls, tool
 signatures, response concentration, context, wall times, environment identity,
 manifest hashes, and correction gate are published in the
 [`R181 diagnosis before product changes`](benchmarks/t02-t04-structural-cost-root-cause-2026-07-23/diagnosis-before-fix.md).
+
+### 18.3 Same-N correction result
+
+Correction SHA `1c151232f1d49042d9e7ecfc3f44987fa5612625` adds the bounded,
+alias-aware TypeScript `type_dependents` profile inside the existing
+`lookup_source_text` tool. It adds no ninth tool and changes neither T01,
+`direct_callers`, the persistent index, nor the independent task oracle. The
+identical N=3 postfix schedule ran from clean pushed head
+`cd78ae40c4f834d6a1dfdb02c2eabcb688f4f329`; all 24 invocations and 84 raw
+cells completed on attempt 1 with no environment drift.
+
+The correction passes the pre-registered acceptance gate. All four T02 B
+groups are `HELPED`, with mean token reductions of 71.4% one-shot/small, 79.8%
+one-shot/large, 62.0% continuous/small, and 61.8% continuous/large. Every one
+of the 12 T02 B cells calls `type_dependents`; the six large-target cells need
+one MCP call. No selected T03/T04 B group is `WORSE`. The fixed B tool-schema
+response grows by 777 bytes per cell, but every non-target one-shot range
+overlaps its baseline range and retains PASS correctness.
+
+Across all 36 decision cells, B improves from 34 PASS / 2 PARTIAL to 36 PASS
+and falls from 11,575,204 to 5,372,595 raw tokens (-53.585%), 200 to 94 calls,
+and 1,181,112 to 335,133 response bytes. Post-fix one-shot B uses 1,373,676
+tokens versus C's 1,647,578, changing B/C from `1.563307x` to `0.833754760x`.
+C itself moves by -16.3% one-shot and +16.4% continuous despite no product
+change, so the accepted causal claim is the four range-separated T02 B cells,
+not the entire aggregate delta or a universal savings rate.
+
+The canonical [R181 correction comparison](benchmarks/t02-t04-structural-cost-root-cause-2026-07-23/postfix-comparison.md)
+contains every pre/post range, mean, grade triple, call mean, response-byte
+mean, environment identity, acceptance decision, and immutable postfix
+manifest. Continuous results remain context-confounded and do not establish
+schema amortization.
