@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +62,27 @@ function treeState(cwd, expectedSha) {
   return { path_role: cwd.split(/[\\/]/).at(-1), head_sha: sha, status_short: status };
 }
 
+function directoryDigest(root) {
+  const entries = [];
+  function walk(path) {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) walk(child);
+      else if (entry.isFile()) {
+        entries.push({
+          path: child.slice(root.length + 1).replaceAll('\\', '/'),
+          sha256: sha256File(child),
+        });
+      }
+    }
+  }
+  walk(root);
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  const hash = createHash('sha256');
+  for (const entry of entries) hash.update(`${entry.path}\0${entry.sha256}\n`);
+  return { files: entries.length, sha256: hash.digest('hex') };
+}
+
 const options = parseArgs(process.argv.slice(2));
 for (const required of ['lab_root', 'output', 'phase', 'repetition', 'prereg_sha']) {
   if (!options[required]) throw new Error(`Missing --${required.replaceAll('_', '-')}`);
@@ -85,6 +107,17 @@ const targets = Object.fromEntries(
       treeState(join(labRoot, 'targets', target.id), target.commit),
     ]),
 );
+const committedFixture = join(repoRoot, 'v2', 'tests', 'fixtures', 'r184-competitive-lab');
+const externalFixture = join(labRoot, 'targets', 'fixture');
+const mutatedFixture = join(labRoot, 'targets', 'fixture-mutated');
+for (const path of [committedFixture, externalFixture, mutatedFixture]) {
+  if (!existsSync(path)) throw new Error(`Missing controlled corpus path: ${path}`);
+}
+const committedFixtureDigest = directoryDigest(committedFixture);
+const externalFixtureDigest = directoryDigest(externalFixture);
+if (committedFixtureDigest.sha256 !== externalFixtureDigest.sha256) {
+  throw new Error('External controlled fixture differs from the preregistered repository fixture');
+}
 const repetition = Number.parseInt(options.repetition, 10);
 if (!Number.isInteger(repetition) || repetition < 1) {
   throw new Error('--repetition must be a positive integer');
@@ -126,6 +159,10 @@ const record = {
       .filter(Boolean),
   },
   corpus: targets,
+  controlled_corpus: {
+    fixture: externalFixtureDigest,
+    fixture_mutated: directoryDigest(mutatedFixture),
+  },
   operating_system: {
     platform: os.platform(),
     type: os.type(),

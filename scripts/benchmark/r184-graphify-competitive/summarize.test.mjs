@@ -38,7 +38,7 @@ test('R184 ordered chain grading rejects reordered evidence', () => {
 });
 
 test('PowerShell audit ignores separators inside quoted rg patterns', () => {
-  const command = String.raw`"C:\Windows\powershell.exe" -Command 'rg -n "PipelineEnvelope|PipelineEnvelopeAlias|export).*from" src'`;
+  const command = String.raw`powershell.exe -Command 'rg -n "PipelineEnvelope|PipelineEnvelopeAlias|export).*from" src'`;
   assert.deepEqual(splitPowerShellCommands(command), [
     'rg -n "PipelineEnvelope|PipelineEnvelopeAlias|export).*from" src',
   ]);
