@@ -225,6 +225,153 @@ describe('lookup_source_text', () => {
     }
   });
 
+  it('returns alias-aware transitive type-impact files in one bounded operation', async () => {
+    const harness = createHarness({
+      'src/types.ts': 'export interface Root { id: string }\n',
+      'src/alias.ts': [
+        "import type { Root } from './types';",
+        'export type Alias = Root & { enabled: boolean };',
+        '',
+      ].join('\n'),
+      'src/wrapper.ts': [
+        "import type { Alias } from './alias';",
+        'export interface Wrapper { value: Alias }',
+        'export const current: Wrapper | null = null;',
+        '',
+      ].join('\n'),
+      'src/direct.ts': [
+        "import type { Root as RenamedRoot } from './types';",
+        'export const direct: RenamedRoot | null = null;',
+        '',
+      ].join('\n'),
+      'src/star.ts': "export * from './alias';\n",
+      'src/javascript.mjs': "export * from './types';\n",
+      'src/mcp/test/production.ts': [
+        "import type { Root } from '../../types';",
+        'export const production: Root | null = null;',
+        '',
+      ].join('\n'),
+      'tests/excluded.test.ts': [
+        "import type { Root } from '../src/types';",
+        'export const excluded: Root | null = null;',
+        '',
+      ].join('\n'),
+      'src/unrelated.ts': 'export interface Unrelated { value: number }\n',
+    });
+    try {
+      const response = await harness.tool.handle({
+        operation: 'type_dependents',
+        declaration_path: 'src/types.ts',
+        symbol: 'Root',
+        include_prefixes: ['src/'],
+      });
+      expect(response.isError).not.toBe(true);
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.files).toEqual([
+        'src/alias.ts',
+        'src/direct.ts',
+        'src/mcp/test/production.ts',
+        'src/star.ts',
+        'src/types.ts',
+        'src/wrapper.ts',
+      ]);
+      expect(payload.files).not.toContain('src/javascript.mjs');
+      expect(payload.target_candidates).toEqual([{
+        name: 'Root',
+        path: 'src/types.ts',
+        definition_line: 1,
+        declaration_kind: 'interface',
+      }]);
+      expect(payload.total_files).toBe(6);
+      expect(payload.files_truncated).toBe(false);
+      expect(payload.dependent_symbols).toBe(3);
+      expect(payload.complete).toBe(true);
+      expect(payload.incomplete_reasons).toEqual([]);
+
+      const withTests = JSON.parse((await harness.tool.handle({
+        operation: 'type_dependents',
+        declaration_path: 'src/types.ts',
+        symbol: 'Root',
+        include_tests: true,
+      })).content[0].text);
+      expect(withTests.files).toContain('tests/excluded.test.ts');
+
+      const truncated = JSON.parse((await harness.tool.handle({
+        operation: 'type_dependents',
+        declaration_path: 'src/types.ts',
+        symbol: 'Root',
+        include_prefixes: ['src'],
+        max_files: 2,
+      })).content[0].text);
+      expect(truncated.files).toEqual(['src/alias.ts', 'src/direct.ts']);
+      expect(truncated.total_files).toBe(6);
+      expect(truncated.files_truncated).toBe(true);
+      expect(truncated.complete).toBe(false);
+      expect(truncated.incomplete_reasons).toContain('result_files_truncated');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('derives workspace package aliases and typed export subpaths from indexed manifests', async () => {
+    const harness = createHarness({
+      'packages/origin/package.json': JSON.stringify({
+        name: '@scope/origin',
+        exports: { './types': { types: './types.ts' } },
+      }),
+      'packages/origin/types.ts': 'export interface Root { id: string }\n',
+      'packages/consumer/package.json': JSON.stringify({
+        name: '@scope/consumer',
+        types: 'index.ts',
+      }),
+      'packages/consumer/index.ts': [
+        "import type { Root } from '@scope/origin/types';",
+        'export type ConsumerConfig = Root & { enabled: boolean };',
+        '',
+      ].join('\n'),
+    });
+    try {
+      const response = await harness.tool.handle({
+        operation: 'type_dependents',
+        declaration_path: 'packages/origin/types.ts',
+        symbol: 'Root',
+        include_prefixes: ['packages'],
+      });
+      expect(response.isError).not.toBe(true);
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.files).toEqual([
+        'packages/consumer/index.ts',
+        'packages/origin/types.ts',
+      ]);
+      expect(payload.complete).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('fails type-impact completeness closed for unsafe workspace export targets', async () => {
+    const harness = createHarness({
+      'packages/origin/package.json': JSON.stringify({
+        name: '@scope/origin',
+        exports: { '.': { types: './../outside.ts' } },
+      }),
+      'packages/origin/types.ts': 'export interface Root { id: string }\n',
+    });
+    try {
+      const response = await harness.tool.handle({
+        operation: 'type_dependents',
+        declaration_path: 'packages/origin/types.ts',
+        symbol: 'Root',
+      });
+      expect(response.isError).not.toBe(true);
+      const payload = JSON.parse(response.content[0].text);
+      expect(payload.complete).toBe(false);
+      expect(payload.incomplete_reasons).toContain('package_manifest_unsafe_target');
+    } finally {
+      harness.close();
+    }
+  });
+
   it('caps each query independently and reports truncation', async () => {
     const harness = createHarness({
       'src/repeated.ts': 'needle first\nneedle second\nother value\n',
@@ -772,6 +919,12 @@ describe('lookup_source_text', () => {
         expect(response.isError).toBe(true);
       }
       expect((await harness.tool.handle({ operation: 'direct_callers' })).isError).toBe(true);
+      expect((await harness.tool.handle({ operation: 'type_dependents', symbol: 'Root' })).isError).toBe(true);
+      expect((await harness.tool.handle({
+        operation: 'type_dependents',
+        symbol: 'Root',
+        declaration_path: '../outside.ts',
+      })).isError).toBe(true);
       expect((await harness.tool.handle({ operation: 'call_chain', entry: 'start' })).isError).toBe(true);
       expect((await harness.tool.handle({ operation: 'unknown' })).isError).toBe(true);
     } finally {

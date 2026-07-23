@@ -1847,3 +1847,198 @@ lists every token sample, call count, grade, min, max, mean, environment row,
 matched ratio, and raw manifest identity. Because instability is the primary
 finding, R179 does not replace the R178 point with a single new headline
 number and makes no product-code change.
+
+## 18. R181 T02-T04 structural-cost root-cause round — 2026-07-23
+
+R176 found equal aggregate correctness between V2 MCP-only B and grep/read-only
+C on T03 and T04 (4/4 PASS per arm), while each arm had one T02 PARTIAL among
+four configurations. Its single samples nevertheless showed one striking cost
+pattern: B was cheaper for all three T02-T04 tasks in continuous/small, but B
+was more expensive for all three tasks in each of one-shot/small,
+one-shot/large, and continuous/large. R181 tests whether that pattern is a
+repeatable project mechanism or agent/session noise before changing product
+code. T01 and `direct_callers` are excluded from the diagnosis and correction
+because R177 and R179 already own that surface.
+
+### 18.1 Immutable pre-registration before measurement
+
+The clean product anchor is post-PR #76 `main` at
+`93e0d5c99fa5dd09a5276a9c5c7e922b16f64315`. The task specification, pinned
+small target `5915e0624ed4376611fdc1f824d1d65a327c4a2f`, pinned large target
+`ef3a5830f960c00018f810cebf26133b35ec2b6f`, prompts, independent TypeScript
+oracle, model `gpt-5.6-sol`, reasoning `medium`, native token accounting,
+mechanical grader, policies, V1 executable, and V2 indexes remain unchanged.
+Only conditions B (V2 MCP-only) and C (grep/read-only) are measured.
+
+R181 uses **N=3 repetitions per task/configuration/arm**. This is the minimum
+that exposes sign flips and one-outlier behavior while still allowing a range
+and arithmetic mean. The 12 selected R176 B+C task/configuration samples total
+11,128,260 native raw tokens; repeating them three times projects about
+33,384,780 selected raw tokens before any supported correction. The actual
+cost, including continuous-session warm-up, is published. More repetitions
+are not added after viewing results.
+
+The three fresh append-once roots are:
+
+```text
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-1
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-2
+D:/Mycodex/benchmark-results/r181-t02-t04-cost-rep-3
+```
+
+Baseline uses `--phase baseline --condition B,C --attempt 1`. One-shot runs
+select `--task T02`, `T03`, or `T04`; continuous runs omit `--task` because the
+unchanged runner correctly preserves the registered T01→T04 conversation.
+Consequently, continuous measurement creates 12 T01 warm-up cells across the
+two targets, two arms, and three repetitions. They establish the same prior
+session context as R176 but are neither graded nor interpreted by R181 and
+cannot justify a T01 code change. The 72 decision cells are exactly three
+tasks × four mode/target configurations × two arms × three repetitions.
+
+The 24 baseline invocations run in this fixed order, with repetitions 1, 2,
+and 3 back-to-back inside each item:
+
+1. one-shot/small T02, T03, T04;
+2. one-shot/large T02, T03, T04;
+3. continuous/small full registered session;
+4. continuous/large full registered session.
+
+The runner's existing filtered arm order is preserved: B then C except
+one-shot/small T03 (C then B) and continuous/large (C session then B session).
+Before every invocation, the append-once environment helper records UTC time,
+repository SHA and cleanliness, OS/version/architecture, CPU/logical count,
+RAM, Node, npm, Codex CLI, exact model, reasoning, phase, and repetition. A
+version or repository drift is disclosed rather than averaged. Current V2 is
+built first; runner verification must prove clean pinned checkouts; and the
+independent T02, T03, and T04 oracle must pass on both targets.
+
+Only a mechanically proven protocol-invalid artifact may use attempt 2 in its
+own repetition root. The invalid attempt remains disclosed. An unfavorable
+answer, token count, call sequence, direction, or variance is never a rerun
+reason. No aggregate, grade, or trace result is inspected until all baseline
+invocations finish.
+
+#### Pre-registered repetition and mechanism rules
+
+For each of the 24 task/configuration/arm groups, token stability requires
+`max(native raw tokens) / min(native raw tokens) <= 1.20`; grade stability
+requires the same mechanical grade in all three repetitions. Call counts do
+not decide stability, but all samples and ranges are reported.
+
+The old directional pattern is **fully replicated** only when every repetition
+has B<C for each T02-T04 continuous/small cell and B>C for every corresponding
+cell in the other three configurations, with all 24 token groups and grades
+stable. If every direction repeats but a stability rule fails, the conclusion
+is “directionally supported but quantitatively unstable.” Any within-cell sign
+flip makes that cell unstable; failure of any continuous/small task to retain
+B<C means the old universal continuous/small advantage is not replicated.
+The report distinguishes individual cells from the overall pattern rather
+than replacing mixed evidence with one aggregate ratio.
+
+Before any correction, a tracked diagnosis report must publish, per
+task/configuration/arm and repetition: grade, native raw tokens, uncached input
+plus output, tool names and order, completed calls, response bytes, largest
+individual tool response, concentration of response bytes, prior observed
+context bytes, and wall time. It must then test these competing explanations:
+
+- a project-controlled fixed payload or schema cost;
+- one concentrated oversized MCP response;
+- repeated MCP calls or an inefficient tool-selection path;
+- continuous-session carry-over from the mandatory T01 warm-up;
+- target-specific behavior rather than a cross-repository mechanism;
+- nondeterministic agent behavior with no reproducible repository defect.
+
+Call count alone is not causation. A continuous advantage is classified as
+amortization only if repeated traces show a reusable V2 cost reduction that is
+not explained by unequal T01 prior context. If the advantage tracks the prior
+turn size, it is session carry-over, not a V2 amortization claim. The diagnosis
+is committed and pushed before any product fix.
+
+#### Correction and same-N comparison gate
+
+A correction is permitted only when the repeated traces isolate a stable,
+project-controlled mechanism. It must be narrow, preserve contracts, add a
+targeted regression when practical, and introduce no new MCP tool. If evidence
+points only to model choice, task/session history, or unstable noise, R181
+records an explicit no-fix conclusion instead of forcing an optimization.
+
+If a correction is implemented, the identical 24-invocation schedule is
+repeated at N=3 under `--phase postfix` in the same three roots after recording
+the correction SHA and fresh environment blocks. B and C are both rerun; C is
+the environmental control. For each task/configuration, pre/post token ranges,
+means, grades, calls, and response bytes are reported. A B cell is “helped”
+only when its post-fix maximum is at least 10% below its pre-fix minimum and no
+grade regresses. It is “worse” if a grade regresses or its post-fix minimum is
+at least 10% above its pre-fix maximum. Overlapping ranges or smaller changes
+are “no conclusive material change.” The correction is accepted only if its
+targeted cells help and no selected B cell worsens. If no correction is
+supported, no postfix run is fabricated; the report explicitly records that
+before/after evidence is not applicable.
+
+The future canonical evidence directory is
+`docs/performance/benchmarks/t02-t04-structural-cost-root-cause-2026-07-23`,
+with one immutable baseline checkpoint per repetition, an immutable pre-fix
+diagnosis, and—only if warranted—the corresponding postfix checkpoints.
+
+### 18.2 Baseline result and diagnosis before correction
+
+All 24 invocations and 84 raw cells completed on attempt 1. The 72 T02-T04
+decision cells used 26,866,194 native raw tokens. Across them, B and C are tied
+at 34 PASS and 2 PARTIAL each. B used 11,575,204 tokens versus C's 15,290,990,
+or 24.3005% fewer in the descriptive combined total, but usage mode changes
+the conclusion: one-shot B is 56.33% more expensive, while continuous B is
+36.21% cheaper.
+
+The pre-registered R176 direction pattern fails. Only 2/24 token groups meet
+`max/min <= 1.20`; six paired cells flip direction at least once; and all three
+continuous/large tasks reverse R176 in every repetition. Continuous B is not
+amortizing its schema: every resumed B turn exposes the same 10,168 schema
+bytes. Its advantage follows the much smaller T01 B warm-up context, including
+a small/C outlier that injected 681,556 response bytes before T02.
+
+The stable project-controlled mechanism is narrower. One-shot T02 accounts
+for 969,993 tokens, or 87.5%, of the one-shot B-over-C gap. Its B path needs
+10-19 distinct calls because the pinned indexes contain `CALLS` and `CONTAINS`
+edges but no alias-aware type-reference graph; the large type alias is not a
+node at all. No exact request is duplicated and the largest T02 B response is
+only 13.4%-37.8% of total response bytes. R181 therefore authorizes one
+general `type_dependents` operation inside the existing `lookup_source_text`
+tool, implemented on demand without an index migration. It authorizes no T01,
+direct-caller, schema, or prompt change.
+
+The complete pre-fix evidence, all per-repetition tokens, grades, calls, tool
+signatures, response concentration, context, wall times, environment identity,
+manifest hashes, and correction gate are published in the
+[`R181 diagnosis before product changes`](benchmarks/t02-t04-structural-cost-root-cause-2026-07-23/diagnosis-before-fix.md).
+
+### 18.3 Same-N correction result
+
+Correction SHA `1c151232f1d49042d9e7ecfc3f44987fa5612625` adds the bounded,
+alias-aware TypeScript `type_dependents` profile inside the existing
+`lookup_source_text` tool. It adds no ninth tool and changes neither T01,
+`direct_callers`, the persistent index, nor the independent task oracle. The
+identical N=3 postfix schedule ran from clean pushed head
+`cd78ae40c4f834d6a1dfdb02c2eabcb688f4f329`; all 24 invocations and 84 raw
+cells completed on attempt 1 with no environment drift.
+
+The correction passes the pre-registered acceptance gate. All four T02 B
+groups are `HELPED`, with mean token reductions of 71.4% one-shot/small, 79.8%
+one-shot/large, 62.0% continuous/small, and 61.8% continuous/large. Every one
+of the 12 T02 B cells calls `type_dependents`; the six large-target cells need
+one MCP call. No selected T03/T04 B group is `WORSE`. The fixed B tool-schema
+response grows by 777 bytes per cell, but every non-target one-shot range
+overlaps its baseline range and retains PASS correctness.
+
+Across all 36 decision cells, B improves from 34 PASS / 2 PARTIAL to 36 PASS
+and falls from 11,575,204 to 5,372,595 raw tokens (-53.585%), 200 to 94 calls,
+and 1,181,112 to 335,133 response bytes. Post-fix one-shot B uses 1,373,676
+tokens versus C's 1,647,578, changing B/C from `1.563307x` to `0.833754760x`.
+C itself moves by -16.3% one-shot and +16.4% continuous despite no product
+change, so the accepted causal claim is the four range-separated T02 B cells,
+not the entire aggregate delta or a universal savings rate.
+
+The canonical [R181 correction comparison](benchmarks/t02-t04-structural-cost-root-cause-2026-07-23/postfix-comparison.md)
+contains every pre/post range, mean, grade triple, call mean, response-byte
+mean, environment identity, acceptance decision, and immutable postfix
+manifest. Continuous results remain context-confounded and do not establish
+schema amortization.

@@ -109,7 +109,7 @@ The MCP (Model Context Protocol) server exposes these 8 tools:
 4. `create_human_note` — create a human-memory note and optionally link code nodes
 5. `link_note_to_code_node` — link an existing note to an existing code node
 6. `search_code_and_memory` — search the code graph and human memory together
-7. `lookup_source_text` — bounded exact literals, identity-aware direct/multi-hop callers, route/CLI call chains, and tracked inventory
+7. `lookup_source_text` — bounded exact literals, TypeScript type dependents, identity-aware direct/multi-hop callers, route/CLI call chains, and tracked inventory
 8. `prepare_edit_context` — assemble dependency, risk, freshness, and note context before editing
 
 Obsidian synchronization is a separate CLI/watch responsibility; none of the
@@ -124,8 +124,9 @@ of presenting the sampled portion as exact project-wide state.
 than four independently advertised schemas. Its default literal contract is
 unchanged. Optional profiles aggregate persistent call-sites, follow exact
 TypeScript symbol identities through a bounded reverse multi-hop call graph,
+compute alias-aware transitive type dependents from one exact declaration,
 read Git-tracked inventory, or trace a shortest static chain from an exact
-route/CLI entry. The semantic reverse profile loads the TypeScript compiler
+route/CLI entry. The semantic profiles load the TypeScript compiler
 only when `max_depth > 1`; the chain profile loads one bounded production
 call-site map, uses reverse reachability only to prune name ambiguity, and
 verifies every forward hop from a call-site or bounded source expression. All

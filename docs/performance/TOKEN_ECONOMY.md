@@ -156,8 +156,9 @@ For a team of 10 developers: **~$41/month, ~$492/year**.
 3. **Do not call `get_project_overview` automatically** — call it when project health, freshness, or broad architecture is part of the question.
 4. **Use `lookup_source_text` for bounded exact lookups in MCP-only workflows** — batch up to 10 exact strings and inspect its coverage metadata.
 5. **For exhaustive reverse caller impact, make one `direct_callers` request with `max_depth` and copy `formatted_callers`** instead of recursively searching bare names.
-6. **Use `prepare_edit_context` when an edit needs blast-radius, risk, or human-memory context**, not as unconditional startup overhead.
-7. **Do not duplicate MCP and source evidence** unless completeness is uncertain or verification is necessary.
-8. **Use `search_code_and_memory` for exploration** — it combines graph and memory search but does not replace arbitrary source-text search.
-9. **Check freshness and completeness fields** before treating an answer as exhaustive; reindex or verify source when coverage is incomplete.
+6. **For a TypeScript type-change impact set, make one `type_dependents` request with the exact declaration path, symbol, and output prefixes** instead of reconstructing aliases through search/read loops.
+7. **Use `prepare_edit_context` when an edit needs blast-radius, risk, or human-memory context**, not as unconditional startup overhead.
+8. **Do not duplicate MCP and source evidence** unless completeness is uncertain or verification is necessary.
+9. **Use `search_code_and_memory` for exploration** — it combines graph and memory search but does not replace arbitrary source-text search.
+10. **Check freshness and completeness fields** before treating an answer as exhaustive; reindex or verify source when coverage is incomplete.
 

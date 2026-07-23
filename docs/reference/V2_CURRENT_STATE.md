@@ -60,8 +60,8 @@ This boundary is intentional and regression-tested.
 
 - Eight read-oriented MCP tools, including bounded exact source lookup and
   `prepare_edit_context`.
-- Exact source profiles for literal matches, direct callers, tracked top-level
-  inventory, and bounded call chains.
+- Exact source profiles for literal matches, TypeScript type dependents, direct
+  callers, tracked top-level inventory, and bounded call chains.
 - Deterministic ordering, output bounds, ambiguity, staleness, coverage,
   completeness, and truncation metadata.
 - Exact literals and known paths are expected to use the cheapest exact source
@@ -112,7 +112,13 @@ The native-accounting audit on the pinned small and large targets establishes:
 - the [focused r177 correction rerun](../performance/BENCHMARK_PROTOCOL.md#156-final-bounded-candidate-result), limited to the four r176 multi-hop T01
   cells, improves 0 PASS / 2 PARTIAL / 2 FAIL to 4 PASS with one bounded
   `lookup_source_text` call per cell; raw native tokens fall 79.904% and calls
-  fall from 60 to 4. This does not revise the unrerun T02–T04 categories.
+  fall from 60 to 4. That focused round did not revise T02–T04;
+- the [R181 repeated T02-T04 correction](../performance/BENCHMARK_PROTOCOL.md#183-same-n-correction-result)
+  later isolates the T02 many-call type-impact gap at N=3 and accepts the new
+  `type_dependents` profile: all four targeted B groups pass non-overlapping
+  range gates, no selected B group worsens, and the one-shot T02-T04 B/C ratio
+  changes from `1.563307x` to `0.833754760x`. The result is protocol-specific,
+  and continuous cells remain context-confounded.
 
 These findings are repository- and protocol-specific. Historical `-67%` to
 `-87%` scenario estimates are not native transport measurements. See
