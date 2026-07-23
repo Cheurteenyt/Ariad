@@ -2,17 +2,17 @@ export function splitPowerShellCommands(command) {
   const commandArgument = command.match(/\s-(?:Command|c)\s+([\s\S]+)$/iu)?.[1]?.trim()
     ?? command.trim();
   let script = commandArgument;
-  if (
-    script.length >= 2
-    && (script[0] === '"' || script[0] === "'")
-    && script.at(-1) === script[0]
-  ) {
-    script = script.slice(1, -1);
-  }
+  // Codex records the argv rendering used to start PowerShell. Nested quotes in
+  // that rendering can make the two wrapper quote characters differ even
+  // though neither belongs to the script. Remove each boundary independently.
+  if (script[0] === '"' || script[0] === "'") script = script.slice(1);
+  if (script.at(-1) === '"' || script.at(-1) === "'") script = script.slice(0, -1);
+
   const parts = [];
   let current = '';
   let quote = null;
   let escaped = false;
+  const explicitPipelineHead = /^(?:rg|Get-Content|Select-String|Select-Object|Sort-Object|ForEach-Object|Where-Object|Test-Path|git|python|py|node|npm|npx|pnpm|yarn|curl|wget|Invoke-WebRequest|Invoke-RestMethod|Get-ChildItem|Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item|sqlite3|jq|findstr|where)(?:\.exe|\.cmd)?\b/iu;
   for (let index = 0; index < script.length; index += 1) {
     const character = script[index];
     if (escaped) {
@@ -42,7 +42,12 @@ export function splitPowerShellCommands(command) {
       current += character;
       continue;
     }
-    if (character === '|' || character === ';' || character === '\n') {
+    const pipelineBoundary = character === '|'
+      && (
+        /\s/u.test(script[index - 1] ?? '')
+        || explicitPipelineHead.test(script.slice(index + 1).trimStart().replace(/^["']+/u, ''))
+      );
+    if (pipelineBoundary || character === ';' || character === '\n') {
       if (current.trim()) parts.push(current.trim());
       current = '';
       continue;
@@ -53,28 +58,30 @@ export function splitPowerShellCommands(command) {
   return parts;
 }
 
+function commandHead(part) {
+  let candidate = part.trim();
+  while (candidate[0] === '"' || candidate[0] === "'") candidate = candidate.slice(1);
+  if (candidate.startsWith('&')) candidate = candidate.slice(1).trimStart();
+  const token = candidate.match(/^[^\s"'`]+/u)?.[0] ?? '';
+  return token.replace(/\.(?:exe|cmd)$/iu, '');
+}
+
 export function auditCommand(command) {
   const normalized = command.replaceAll('\r', ' ');
-  const forbidden = [
-    /\bgit(?:\.exe)?\b/i,
-    /\b(?:python|py|node|npm|npx|pnpm|yarn)(?:\.exe|\.cmd)?\b/i,
-    /\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b/i,
-    /\b(?:Get-ChildItem|Remove-Item|Set-Content|Add-Content|Out-File|New-Item|Copy-Item|Move-Item)\b/i,
-    /\b(?:sqlite3|jq|findstr|where\.exe)\b/i,
-  ];
-  for (const pattern of forbidden) {
-    if (pattern.test(normalized)) return `forbidden command token: ${pattern}`;
-  }
   const commands = splitPowerShellCommands(normalized);
-  if (commands.length === 0 || !/\b(?:rg|Get-Content|Select-String)\b/i.test(normalized)) {
+  if (commands.length === 0) {
     return 'command does not contain an allowed evidence reader';
   }
+  let hasEvidenceReader = false;
   for (const part of commands) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    if (!/^(?:rg|Get-Content|Select-String|Select-Object)\b/i.test(trimmed)) {
-      return `forbidden pipeline command: ${trimmed.split(/\s+/)[0]}`;
+    const head = commandHead(part);
+    if (!head) continue;
+    if (!/^(?:rg|Get-Content|Select-String|Select-Object)$/iu.test(head)) {
+      return `forbidden pipeline command: ${head}`;
     }
+    if (/^(?:rg|Get-Content|Select-String)$/iu.test(head)) hasEvidenceReader = true;
   }
-  return null;
+  return hasEvidenceReader
+    ? null
+    : 'command does not contain an allowed evidence reader';
 }
