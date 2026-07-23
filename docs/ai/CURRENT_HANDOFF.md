@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r181-structural-cost-root-cause
 base_sha: 93e0d5c99fa5dd09a5276a9c5c7e922b16f64315
-last_completed_code_sha: 61af45679ad28a4cef7d7888cab04dfdbe07758b
+last_completed_code_sha: 1c151232f1d49042d9e7ecfc3f44987fa5612625
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T00:37:05Z
+updated_at_utc: 2026-07-23T00:53:06Z
 implementer_role: codex
 ```
 
@@ -39,7 +39,7 @@ No external audit is active. R181 is an evidence-first root-cause round initiate
 | Finding | Audit source | Decision | Evidence or reason | Resolution code commit | Regression test | CI-validated head | Validation state |
 |---------|--------------|----------|--------------------|------------------------|-----------------|-------------------|------------------|
 | R181-LOCAL-F001 | R176 T02-T04 single-sample evidence | ACCEPTED | Repeat N=3 and attribute token cost before deciding whether a repository defect exists. | `1ced999a49a647b22fc5e08a6a1d5a50fafc1bbe` | environment helper smoke plus existing mechanical benchmark checks | pending | IMPLEMENTED_PUSHED |
-| R181-LOCAL-F002 | R181 N=3 traces and pinned indexes | ACCEPTED | T02 lacks alias-aware type-impact evidence; 10-19 distinct B calls cause 87.5% of the one-shot gap. Add a general bounded operation inside `lookup_source_text`; do not touch T01/direct callers. | pending | pending | pending | NOT_STARTED |
+| R181-LOCAL-F002 | R181 N=3 traces and pinned indexes | ACCEPTED | T02 lacks alias-aware type-impact evidence; 10-19 distinct B calls cause 87.5% of the one-shot gap. Add a general bounded operation inside `lookup_source_text`; do not touch T01/direct callers. | `1c151232f1d49042d9e7ecfc3f44987fa5612625` | `tests/mcp/exact-source-lookup.test.ts`; `tests/mcp/server.test.ts` | pending | IMPLEMENTED_LOCAL |
 
 ## Pushed checkpoints
 
@@ -49,6 +49,7 @@ No external audit is active. R181 is an evidence-first root-cause round initiate
 | `1ced999a49a647b22fc5e08a6a1d5a50fafc1bbe` | pending | R181-LOCAL-F001 | N=3 protocol, mechanism/noise gates, and append-once environment capture. | helper syntax/smoke; `git diff --check`; `npm --prefix v2 run docs:check` | pending |
 | `6b80e3a36481c69ad397de69297542ae80069ab5` | pending | R181-LOCAL-F001 | Ensure raw manifests hash every pre-registered environment capture. | targeted 2-test checkpoint suite; full `docs:check` (8 tests) | pending |
 | `61af45679ad28a4cef7d7888cab04dfdbe07758b` | pending | R181-LOCAL-F001, R181-LOCAL-F002 | Three immutable baseline checkpoints and pre-fix mechanism/noise diagnosis. | 72/72 decision cells valid; `docs:check` (8 tests) | pending |
+| `1c151232f1d49042d9e7ecfc3f44987fa5612625` | pending | R181-LOCAL-F002 | Add one bounded alias-aware TypeScript `type_dependents` profile inside the existing `lookup_source_text` tool. | typecheck; build; MCP 47/47; docs check; pinned small 7/7 and large 8/8 oracle smoke | pending |
 
 ## Exact validation evidence
 
@@ -106,6 +107,15 @@ result_summary: 28 selected raw cells per repetition and no invalid cell; only 2
 not_run: no product correction or postfix cell existed when this diagnosis checkpoint was created
 ```
 
+```text
+command: npm run typecheck; npm run build; npx vitest run tests/mcp; npm run docs:check; invoke type_dependents against both pinned read-only indexes
+working_directory: D:/Mycodex/codebase-mirror/v2 (pinned-index smoke launched from repository root)
+environment: same disclosed R181 Windows host and immutable small/large checkouts
+exit_code: 0
+result_summary: typecheck and build pass; all 47 MCP tests pass; all 8 documentation/benchmark tests pass; the new operation returns the exact independent-oracle sets (small 7/7 in 2.5s, large 8/8 in 13.2s) with complete=true; unsafe workspace export targets fail completeness closed
+not_run: identical N=3 postfix schedule waits for this correction and handoff checkpoint to be pushed cleanly
+```
+
 ## Reset recovery
 
 ```bash
@@ -131,12 +141,12 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify --results-root D:/Mycode
 
 ## Current working state
 
-- **Last completed finding:** R181-LOCAL-F001 baseline repetition and attribution, published at `61af45679ad28a4cef7d7888cab04dfdbe07758b`.
-- **Current finding:** R181-LOCAL-F002, general alias-aware type-impact operation.
+- **Last completed finding:** R181-LOCAL-F002 implementation and deterministic oracle validation at `1c151232f1d49042d9e7ecfc3f44987fa5612625`.
+- **Current finding:** R181-LOCAL-F002 repeated postfix measurement and acceptance gate.
 - **Dirty files expected:** `NONE` at the pushed checkpoint.
 - **Unpushed commits expected:** `0` after this handoff checkpoint is pushed.
 - **Known blocker:** none.
-- **Single next action:** implement and test the bounded `lookup_source_text.type_dependents` operation without changing T01/direct callers or the persistent index format.
+- **Single next action:** push the clean correction checkpoint, capture fresh postfix environments, and execute the identical pre-registered N=3 B/C schedule without inspecting intermediate cells.
 
 ## Security confirmation
 
