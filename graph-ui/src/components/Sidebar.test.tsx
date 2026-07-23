@@ -308,7 +308,7 @@ describe("Sidebar ARIA tree keyboard navigation", () => {
     });
 
     const openDirectory = await screen.findByRole("button", {
-      name: "Open directory packages/bench",
+      name: /Open directory packages\/bench/u,
     });
     fireEvent.click(openDirectory);
     expect(onSelectPath).toHaveBeenCalledWith("packages/bench", new Set());

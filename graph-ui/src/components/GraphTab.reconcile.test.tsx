@@ -404,8 +404,7 @@ describe("GraphTab server-refresh state reconciliation", () => {
     await waitFor(() => expect(screen.getByTestId("graph-canvas-node-count")).toHaveTextContent("2"));
     expect(screen.getByTestId("graph-canvas-layout")).toHaveTextContent("exact-directory-file-v1");
     expect(screen.getByText(/3 exact nodes/i)).toBeInTheDocument();
-    expect(screen.getByLabelText("Exact scope boundary flows")).toHaveTextContent("packages/zod");
-    expect(screen.getByLabelText("Exact scope boundary flows")).toHaveTextContent("imports ×1");
+    expect(screen.getByText(/References → packages\/zod · out:1 in:0/u)).toBeInTheDocument();
     expect(useExactScopeMock).toHaveBeenLastCalledWith(
       "test",
       "domain",

@@ -32,8 +32,7 @@ function ExactScopeHud({
   selectedCount,
   boundary,
 }: ExactScopeHudProps) {
-  const outgoing = boundary.outgoing_relations;
-  const incoming = boundary.incoming_relations;
+  const dependency = boundary.dependencies[0];
   return (
     <details className="group absolute left-14 top-3 z-20 max-w-[calc(100%-8rem)] overflow-hidden rounded-xl border border-white/10 bg-[#071219]/88 text-[10px] text-foreground/70 shadow-xl backdrop-blur-md lg:left-4 lg:top-4 lg:max-w-[min(760px,calc(100%-16rem))] lg:text-[11px]">
       <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 px-3 py-2 font-mono marker:content-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400/70">
@@ -50,40 +49,15 @@ function ExactScopeHud({
             {selectedCount.toLocaleString()} selected
           </span>
         )}
-        {boundary.total_relations > 0 && (
-          <span className="hidden whitespace-nowrap text-sky-200/65 md:inline">
-            {outgoing.toLocaleString()} out / {incoming.toLocaleString()} in
+        {dependency && (
+          <span className="hidden whitespace-nowrap text-cyan-300/65 md:inline">
+            References {dependency.direction === "outgoing" ? "→" : "←"} {dependency.external_key}
+            {" · "}out:{boundary.outgoing_relations} in:{boundary.incoming_relations}
           </span>
         )}
       </summary>
       <div className="border-t border-white/[0.07] px-3 py-2 font-mono leading-relaxed text-foreground/48">
-        <p>
-          {visibleEdges.toLocaleString()} visible edges · {totalInternalEdges.toLocaleString()} internal edges
-          {boundary.total_relations > 0
-            ? ` · ${boundary.total_relations.toLocaleString()} boundary relations`
-            : ""}
-        </p>
-        {boundary.dependencies.length > 0 && (
-          <ul aria-label="Exact scope boundary flows" className="mt-1.5 grid gap-1 sm:grid-cols-2">
-            {boundary.dependencies.slice(0, 6).map((dependency) => (
-              <li
-                key={`${dependency.direction}:${dependency.external_key}:${dependency.type}`}
-                className="flex min-w-0 items-center gap-1.5 rounded-md border border-white/[0.06] bg-white/[0.025] px-2 py-1"
-              >
-                <span
-                  className={dependency.direction === "outgoing" ? "text-cyan-300/80" : "text-violet-300/80"}
-                  aria-hidden="true"
-                >
-                  {dependency.direction === "outgoing" ? "→" : "←"}
-                </span>
-                <span className="truncate text-foreground/65">{dependency.external_key}</span>
-                <span className="ml-auto shrink-0 text-[9px] text-foreground/35">
-                  {dependency.type.toLowerCase()} ×{dependency.count.toLocaleString()}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
+        <p>{visibleEdges.toLocaleString()} visible edges · {totalInternalEdges.toLocaleString()} internal edges</p>
       </div>
     </details>
   );
