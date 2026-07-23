@@ -209,6 +209,12 @@ symbol hit targets become active. Domain and relation filters reuse the layout
 response, so no additional request, full-graph client scan, renderer, or
 simulation is introduced.
 
+Macro Fit uses the complete retained domain or dependency-atlas bounds rather
+than representative-node bounds. Fit, wheel, pinch, buttons, and keyboard share
+one 0.02 minimum scale, allowing a narrow viewport to contain the whole bounded
+architecture without clipping outer domains or jumping to a different zoom
+floor on the next interaction.
+
 The focused camera is composed from directed targets only; the 1,000-node dim
 context cannot shrink the active neighborhood. Screen-space safe insets reserve
 the fidelity HUD, action rail, guide, breadcrumb, and label overhang. A

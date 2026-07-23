@@ -3,7 +3,7 @@
 > **Status:** Current implementation evidence
 > **Audience:** Maintainers, frontend contributors, and performance auditors
 > **Last verified:** `0.78.0-alpha.1` / 2026-07-23
-> **Audited code SHA:** `b8a349e3f06a4ec237af18cf9908d1ceaec10625`
+> **Audited code SHA:** `56ae321d9ef1d92e7ee078c21d86e7c54cb5d808`
 > **Repository:** `Cheurteenyt/Ariad`
 > **Date:** 2026-07-23
 
@@ -141,6 +141,21 @@ targeted regression and the packaged Edge run cover the handoff from Structure
 to atlas, semantic zoom, node activation, directed focus, Structure restore,
 and Fit.
 
+## Responsive macro-fit correction
+
+The final visible check used the in-app browser at 380 x 958 CSS pixels. Fit
+computed all 11 Structure-domain bounds, but the shared camera floor clamped
+the required scale to 0.1. The two outer domains were therefore clipped even
+though their geometry was correct.
+
+Commit `56ae321d9ef1d92e7ee078c21d86e7c54cb5d808` lowers the shared minimum
+camera scale to 0.02 across Fit, wheel, pinch, buttons, and keyboard zoom. This
+keeps a fitted narrow frame internally consistent and lets users zoom in
+gradually instead of jumping back to the old floor. A 380-pixel regression fits
+two 200-unit domains separated across 6,400 world units and proves that the
+result falls below 0.1 while remaining centered. The packaged product check
+then contained every macro domain in both Structure and Dependencies.
+
 ## Regression and performance protection
 
 The focused regressions cover:
@@ -160,9 +175,9 @@ Local evidence at the audited code SHA:
 | Command | Result |
 | --- | --- |
 | `npx vitest run src/lib/graph-domain-preview.test.ts src/components/GraphCanvas.test.tsx` | 2 files / 65 tests passed |
-| `npm test` in `graph-ui` | 26 files / 236 tests passed |
+| `npm test` in `graph-ui` | 26 files / 237 tests passed |
 | `npx tsc --noEmit` in `graph-ui` | passed |
-| `npm run build` in `graph-ui` | passed; Graph 38.65 KiB, main 69.30 KiB, CSS 14.91 KiB, manifest JS 122.75 KiB, Radix packages 11 |
+| `npm run build` in `graph-ui` | passed; Graph 38.67 KiB, main 69.30 KiB, CSS 14.91 KiB, manifest JS 122.77 KiB, Radix packages 11 |
 | `npm run typecheck` in `v2` | backend and lab configurations passed |
 | `npx vitest run tests/benchmark/graph-ui-browser-smoke.test.ts tests/benchmark/graph-ui-lab.test.ts` | 2 files / 10 tests passed |
 | `npm run build:package` in `v2` | backend compiled, Graph UI embedded, assets verified, npm audit 0 vulnerabilities |
