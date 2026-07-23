@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r183-graph-visual-intelligence
 base_sha: b6a95f23ca34ba1a141c943f1be0b045be23b9dd
-last_completed_code_sha: b6a95f23ca34ba1a141c943f1be0b045be23b9dd
+last_completed_code_sha: d54b6ac6472a42f4f445c74b3251a4df1978551e
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T11:06:08Z
+updated_at_utc: 2026-07-23T11:45:45Z
 implementer_role: codex
 ```
 
@@ -51,25 +51,39 @@ round. Findings below are provisional until the matched baseline is committed.
 
 | Finding | Source | Decision | Evidence or reason | Resolution code commit | Regression test | CI-validated head | Validation state |
 |---------|--------|----------|--------------------|------------------------|-----------------|-------------------|------------------|
-| R183-E01 | owner objective | ACCEPTED | Run matched V1/V2 visual and interaction evidence before design changes. | pending | evidence harness | pending | NOT_STARTED |
+| R183-E01 | owner objective | ACCEPTED | Run matched V1/V2 visual and interaction evidence before design changes. The first attempted baseline was rejected because its rendered V1 project did not match the preflight project. | pending | evidence harness | pending | IN_PROGRESS |
 | R183-E02 | owner objective | ACCEPTED | Isolate visual-noise and wasted-rendering mechanisms, then implement a coherent hierarchy. | pending | targeted UI regressions | pending | NOT_STARTED |
 | R183-E03 | owner objective | ACCEPTED | Validate small, medium, empty, disconnected, dense, filtered, and oversized states without regressions. | pending | existing lab plus new bounded fixtures | pending | NOT_STARTED |
+| R183-E04 | local reproduction | ACCEPTED | The comparison lab selected the first V1 card whose broad ancestor contained the target name, so the 38-node API preflight could be paired with a rendered 4,287-node project. Captures were also taken after the FPS pan/zoom. The lab now selects a card-local exact heading, verifies the rendered layout URL and complete topology, records that identity, and captures the settled pre-interaction frame. | `d54b6ac6472a42f4f445c74b3251a4df1978551e` | `v2/tests/benchmark/graph-ui-lab.test.ts` | pending | LOCAL_PASS |
 
 ## Pushed checkpoints
 
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
 | `b6a95f23ca34ba1a141c943f1be0b045be23b9dd` | pending | R183-E01–E03 | baseline and round contracts | repository identity and worktree inspected | pending |
+| `d54b6ac6472a42f4f445c74b3251a4df1978551e` | pending | R183-E01, R183-E04 | fail-closed rendered graph identity and pre-interaction blind captures | targeted Vitest 9/9; backend/lab typecheck; 38-node strict browser smoke | pending |
 
 ## Exact validation evidence
 
 ```text
-command: pending
-working_directory: pending
+command: npx vitest run tests/benchmark/graph-ui-lab.test.ts
+working_directory: v2
 environment: Windows 11 / PowerShell / Node runtime from repository
-exit_code: pending
-result_summary: Matched visual and performance baseline has not run yet.
-not_run: All product and publication suites.
+exit_code: 0
+result_summary: 1 file and 9 tests passed, including stale rendered-project and rendered-topology rejection.
+
+command: npm run typecheck
+working_directory: v2
+environment: Windows 11 / PowerShell / Node runtime from repository
+exit_code: 0
+result_summary: Backend and Graph UI lab TypeScript configurations passed.
+
+command: npm run bench:graph-ui:compare -- --project graph-ui-lab-controlled --runs 1 --max-nodes 1000 --v2-mode architecture --output ../.codex-runtime/graph-ui-lab/r183-fixed-smoke-v2
+working_directory: v2
+environment: Windows 11 / Edge / V1 345425a / V2 d54b6ac / 1440x960 DPR 1
+exit_code: 0
+result_summary: Strict rendered identity passed for both variants at 38 nodes / 84 edges; evidence grade exploratory because this was a one-run smoke.
+not_run: Five-run corrected baseline, perception task sheet, frontend suites, backend build/package, and publication gates.
 ```
 
 ## Reset recovery
@@ -98,15 +112,17 @@ npx tsc --noEmit
 
 ## Current working state
 
-- **Last completed finding:** R183 objective and baseline identity recorded.
-- **Current finding:** Trace V1 and V2 rendering/data architecture and establish
-  a controlled visual and interaction baseline.
+- **Last completed finding:** R183-E04 corrected the false matched-comparison
+  evidence path and proved the rendered 38-node graph on both variants.
+- **Current finding:** Establish the corrected five-run baseline, complete the
+  anonymous task sheet, then isolate the highest-value visual hierarchy defect.
 - **Dirty files expected:** two pre-existing CRLF status markers with
   byte-identical index/worktree blobs; never stage them.
 - **Unpushed commits expected:** `0` at a pushed checkpoint.
 - **Known blocker:** None.
-- **Single next action:** Inspect the V1/V2 graph implementations, fixtures,
-  existing perception lab, and local runtime before defining matched tasks.
+- **Single next action:** Run corrected five-run Architecture and Stellar
+  comparisons on `graph-ui-lab-controlled`, evaluate A/B tasks before opening
+  the blind key, and record the root-cause decision.
 
 ## Security confirmation
 
@@ -124,4 +140,3 @@ npx tsc --noEmit
 - [ ] GitHub Actions is green on the candidate SHA.
 - [ ] No important work exists only in the current environment.
 - [ ] The handoff is ready to archive under `docs/history/round-reports/`.
-
