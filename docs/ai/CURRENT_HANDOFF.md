@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r181-structural-cost-root-cause
 base_sha: 93e0d5c99fa5dd09a5276a9c5c7e922b16f64315
-last_completed_code_sha: 6b80e3a36481c69ad397de69297542ae80069ab5
+last_completed_code_sha: 61af45679ad28a4cef7d7888cab04dfdbe07758b
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T00:27:09Z
+updated_at_utc: 2026-07-23T00:37:05Z
 implementer_role: codex
 ```
 
@@ -39,6 +39,7 @@ No external audit is active. R181 is an evidence-first root-cause round initiate
 | Finding | Audit source | Decision | Evidence or reason | Resolution code commit | Regression test | CI-validated head | Validation state |
 |---------|--------------|----------|--------------------|------------------------|-----------------|-------------------|------------------|
 | R181-LOCAL-F001 | R176 T02-T04 single-sample evidence | ACCEPTED | Repeat N=3 and attribute token cost before deciding whether a repository defect exists. | `1ced999a49a647b22fc5e08a6a1d5a50fafc1bbe` | environment helper smoke plus existing mechanical benchmark checks | pending | IMPLEMENTED_PUSHED |
+| R181-LOCAL-F002 | R181 N=3 traces and pinned indexes | ACCEPTED | T02 lacks alias-aware type-impact evidence; 10-19 distinct B calls cause 87.5% of the one-shot gap. Add a general bounded operation inside `lookup_source_text`; do not touch T01/direct callers. | pending | pending | pending | NOT_STARTED |
 
 ## Pushed checkpoints
 
@@ -47,6 +48,7 @@ No external audit is active. R181 is an evidence-first root-cause round initiate
 | `93e0d5c99fa5dd09a5276a9c5c7e922b16f64315` | pending | R181-LOCAL-F001 | Post-PR #76 clean-main anchor. | `git status`; exact local/origin SHA | pending |
 | `1ced999a49a647b22fc5e08a6a1d5a50fafc1bbe` | pending | R181-LOCAL-F001 | N=3 protocol, mechanism/noise gates, and append-once environment capture. | helper syntax/smoke; `git diff --check`; `npm --prefix v2 run docs:check` | pending |
 | `6b80e3a36481c69ad397de69297542ae80069ab5` | pending | R181-LOCAL-F001 | Ensure raw manifests hash every pre-registered environment capture. | targeted 2-test checkpoint suite; full `docs:check` (8 tests) | pending |
+| `61af45679ad28a4cef7d7888cab04dfdbe07758b` | pending | R181-LOCAL-F001, R181-LOCAL-F002 | Three immutable baseline checkpoints and pre-fix mechanism/noise diagnosis. | 72/72 decision cells valid; `docs:check` (8 tests) | pending |
 
 ## Exact validation evidence
 
@@ -95,6 +97,15 @@ result_summary: 2 targeted tests and all 8 documentation/benchmark tests pass; r
 not_run: raw checkpoints and diagnosis are the next action
 ```
 
+```text
+command: summarize.mjs and checkpoint.mjs for baseline repetitions 1-3; trace/index attribution; npm --prefix v2 run docs:check
+working_directory: D:/Mycodex/codebase-mirror
+environment: same disclosed R181 host; all raw manifests include the pre-invocation environment records
+exit_code: 0
+result_summary: 28 selected raw cells per repetition and no invalid cell; only 2/24 token groups stable; old direction pattern rejected; T02 type-impact capability gap published before product changes
+not_run: no product correction or postfix cell existed when this diagnosis checkpoint was created
+```
+
 ## Reset recovery
 
 ```bash
@@ -120,12 +131,12 @@ node scripts/benchmark/v1-v2-truth-audit/run.mjs verify --results-root D:/Mycode
 
 ## Current working state
 
-- **Last completed finding:** all N=3 baseline cells completed; environment-manifest coverage is protected at `6b80e3a36481c69ad397de69297542ae80069ab5`; no product finding yet.
-- **Current finding:** R181-LOCAL-F001, repeated T02-T04 cost attribution.
+- **Last completed finding:** R181-LOCAL-F001 baseline repetition and attribution, published at `61af45679ad28a4cef7d7888cab04dfdbe07758b`.
+- **Current finding:** R181-LOCAL-F002, general alias-aware type-impact operation.
 - **Dirty files expected:** `NONE` at the pushed checkpoint.
 - **Unpushed commits expected:** `0` after this handoff checkpoint is pushed.
 - **Known blocker:** none.
-- **Single next action:** create and audit the three immutable baseline checkpoints, then publish the per-cell trace diagnosis before considering product code.
+- **Single next action:** implement and test the bounded `lookup_source_text.type_dependents` operation without changing T01/direct callers or the persistent index format.
 
 ## Security confirmation
 
