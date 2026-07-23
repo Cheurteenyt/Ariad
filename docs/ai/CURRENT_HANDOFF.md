@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r182-maintenance-consolidation
 base_sha: 2420906d38e585c87b3f692116531cc3e7e838f2
-last_completed_code_sha: 2420906d38e585c87b3f692116531cc3e7e838f2
+last_completed_code_sha: d1e7a81f039bbc30c2964f9ad0d9cab5a419546e
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T10:34:30Z
+updated_at_utc: 2026-07-23T10:38:22Z
 implementer_role: codex
 ```
 
@@ -49,16 +49,17 @@ No external audit is active in this owner-directed maintenance round.
 | Code SHA | CI head SHA | Findings | Summary | Local validation | GitHub run |
 |----------|-------------|----------|---------|------------------|------------|
 | `2420906d38e585c87b3f692116531cc3e7e838f2` | pending | owner decision | R182 baseline and contracts | repository state inspected | pending |
+| `d1e7a81f039bbc30c2964f9ad0d9cab5a419546e` | pending | owner decision | R169E is paused and unscheduled; `DATA-CARRY-01` remains open | `npm run docs:check` passed | pending |
 
 ## Exact validation evidence
 
 ```text
-command: gh run list --repo Cheurteenyt/Ariad --branch main
-working_directory: repository root
+command: npm run docs:check
+working_directory: v2
 environment: Windows / PowerShell / GitHub CLI
 exit_code: 0
-result_summary: Part 1 replacement PRs are merged and the final main mirror is green.
-not_run: Documentation validation awaits the R169 and benchmark edits.
+result_summary: 89 Markdown files validated; 79 are portal-reachable; benchmark specification checks passed.
+not_run: The consolidated benchmark summary has not yet been written.
 ```
 
 ## Reset recovery
@@ -87,15 +88,15 @@ npm run docs:check
 
 ## Current working state
 
-- **Last completed finding:** Part 1 gate confirmed on exact `main` SHA
-  `2420906d38e585c87b3f692116531cc3e7e838f2`.
-- **Current finding:** Record the owner decision that R169E is paused and not
-  scheduled while preserving R169A-D and `DATA-CARRY-01`.
+- **Last completed finding:** R169E is recorded as paused and unscheduled in
+  both canonical documents; `DATA-CARRY-01` remains explicitly open.
+- **Current finding:** Synthesize the published token-economy evidence without
+  introducing data or unsupported claims.
 - **Dirty files expected:** `NONE` at a pushed checkpoint.
 - **Unpushed commits expected:** `0` at a pushed checkpoint.
 - **Known blocker:** None.
-- **Single next action:** Update the two canonical R169 documents without
-  changing technical history or the open data-carry status.
+- **Single next action:** Read every required benchmark source section and map
+  each requested figure to an existing anchor before drafting the summary.
 
 ## Security confirmation
 
@@ -107,7 +108,7 @@ npm run docs:check
 ## Pre-final-audit checklist
 
 - [x] The owner decision and required scope are recorded.
-- [ ] The R169 status is updated in both canonical documents.
+- [x] The R169 status is updated in both canonical documents.
 - [ ] The consolidated benchmark summary is sourced and portal-reachable.
 - [ ] The full affordable local documentation suite is recorded above.
 - [ ] GitHub Actions is green on the candidate SHA.
