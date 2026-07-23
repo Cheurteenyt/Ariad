@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r183-graph-visual-intelligence
 base_sha: b6a95f23ca34ba1a141c943f1be0b045be23b9dd
-last_completed_code_sha: d54b6ac6472a42f4f445c74b3251a4df1978551e
+last_completed_code_sha: 0e0c4ac694393c2bc0d8ed73c0801e30533fad6c
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T11:45:45Z
+updated_at_utc: 2026-07-23T12:34:27Z
 implementer_role: codex
 ```
 
@@ -51,9 +51,9 @@ round. Findings below are provisional until the matched baseline is committed.
 
 | Finding | Source | Decision | Evidence or reason | Resolution code commit | Regression test | CI-validated head | Validation state |
 |---------|--------|----------|--------------------|------------------------|-----------------|-------------------|------------------|
-| R183-E01 | owner objective | ACCEPTED | Run matched V1/V2 visual and interaction evidence before design changes. The first attempted baseline was rejected because its rendered V1 project did not match the preflight project. | pending | evidence harness | pending | IN_PROGRESS |
-| R183-E02 | owner objective | ACCEPTED | Isolate visual-noise and wasted-rendering mechanisms, then implement a coherent hierarchy. | pending | targeted UI regressions | pending | NOT_STARTED |
-| R183-E03 | owner objective | ACCEPTED | Validate small, medium, empty, disconnected, dense, filtered, and oversized states without regressions. | pending | existing lab plus new bounded fixtures | pending | NOT_STARTED |
+| R183-E01 | owner objective | IMPLEMENTED | Lab v2 produced strict matched 38-node/84-edge five-run Architecture and Stellar comparisons. A separate 65-node/136-edge perception fixture supported the anonymous task sheet without being misrepresented as performance evidence. | `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | evidence harness and perception fixture | pending | LOCAL_PASS |
+| R183-E02 | owner objective | IMPLEMENTED | The task review found that V2 won exact-search and directed-flow work but its fitted macro domains were visually hollow. Structure and Dependencies now show at most two deterministic semantic signatures per domain plus a hidden-count disclosure, with a bounded fade before exact topology. | `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | `graph-domain-preview.test.ts`; `GraphCanvas.test.tsx` | pending | LOCAL_PASS |
+| R183-E03 | owner objective | ACCEPTED | Validate small, medium, empty, disconnected, dense, filtered, and oversized states without regressions. The complete 236-test Graph UI suite is green; backend/package and exact-main gates remain. | `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | existing Graph UI state matrix plus bounded perception fixture | pending | IN_PROGRESS |
 | R183-E04 | local reproduction | ACCEPTED | The comparison lab selected the first V1 card whose broad ancestor contained the target name, so the 38-node API preflight could be paired with a rendered 4,287-node project. Captures were also taken after the FPS pan/zoom. The lab now selects a card-local exact heading, verifies the rendered layout URL and complete topology, records that identity, and captures the settled pre-interaction frame. | `d54b6ac6472a42f4f445c74b3251a4df1978551e` | `v2/tests/benchmark/graph-ui-lab.test.ts` | pending | LOCAL_PASS |
 
 ## Pushed checkpoints
@@ -62,6 +62,7 @@ round. Findings below are provisional until the matched baseline is committed.
 |----------|-------------|----------|---------|------------------|------------|
 | `b6a95f23ca34ba1a141c943f1be0b045be23b9dd` | pending | R183-E01–E03 | baseline and round contracts | repository identity and worktree inspected | pending |
 | `d54b6ac6472a42f4f445c74b3251a4df1978551e` | pending | R183-E01, R183-E04 | fail-closed rendered graph identity and pre-interaction blind captures | targeted Vitest 9/9; backend/lab typecheck; 38-node strict browser smoke | pending |
+| `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | pending | R183-E01-E03 | bounded macro-domain intelligence and a controlled multi-domain perception fixture | Graph UI 236/236; targeted preview 65/65; frontend and backend/lab typecheck; frontend build/budgets; strict five-run Architecture and Stellar comparison candidates | pending |
 
 ## Exact validation evidence
 
@@ -83,7 +84,37 @@ working_directory: v2
 environment: Windows 11 / Edge / V1 345425a / V2 d54b6ac / 1440x960 DPR 1
 exit_code: 0
 result_summary: Strict rendered identity passed for both variants at 38 nodes / 84 edges; evidence grade exploratory because this was a one-run smoke.
-not_run: Five-run corrected baseline, perception task sheet, frontend suites, backend build/package, and publication gates.
+
+command: npm run bench:graph-ui:compare -- --project graph-ui-lab-controlled --runs 5 --max-nodes 1000 --v2-mode architecture --output ../.codex-runtime/graph-ui-lab/r183-postchange-architecture
+working_directory: v2
+environment: Windows 11 / Edge / V1 345425a / V2 0e0c4ac / 1440x960 DPR 1
+exit_code: 0
+result_summary: comparison-candidate; strict rendered identity 38/84; cold V2 first-useful p50/p95 407.7/425.7 ms versus V1 3864.5/4123.1 ms; both 165 FPS p50; V2 long-task p95 0 ms and idle CPU p50 0.02%.
+
+command: npm run bench:graph-ui:compare -- --project graph-ui-lab-controlled --runs 5 --max-nodes 1000 --v2-mode stellar --output ../.codex-runtime/graph-ui-lab/r183-postchange-stellar
+working_directory: v2
+environment: Windows 11 / Edge / V1 345425a / V2 0e0c4ac / 1440x960 DPR 1
+exit_code: 0
+result_summary: comparison-candidate; strict rendered identity 38/84; cold V2 first-useful p50/p95 403.4/409.5 ms versus V1 3832.7/3935.8 ms; both 165 FPS p50; V2 long-task p95 0 ms and idle CPU p50 0.02%.
+
+command: npm test
+working_directory: graph-ui
+environment: Windows 11 / Node runtime from repository
+exit_code: 0
+result_summary: 26 files and 236 tests passed, including the complete graph state matrix.
+
+command: npx tsc --noEmit && npm run build
+working_directory: graph-ui
+environment: Windows 11 / Node runtime from repository
+exit_code: 0
+result_summary: Frontend typecheck and production build passed; Graph chunk 38.65 KiB, main 69.30 KiB, CSS 14.91 KiB, manifest JS 122.75 KiB, Radix packages 11.
+
+command: npm run typecheck
+working_directory: v2
+environment: Windows 11 / Node runtime from repository
+exit_code: 0
+result_summary: Backend and Graph UI lab TypeScript configurations passed after the implementation.
+not_run: Documentation update/check, backend build, embedded package build, publication gates, and exact-main validation.
 ```
 
 ## Reset recovery
@@ -112,17 +143,19 @@ npx tsc --noEmit
 
 ## Current working state
 
-- **Last completed finding:** R183-E04 corrected the false matched-comparison
-  evidence path and proved the rendered 38-node graph on both variants.
-- **Current finding:** Establish the corrected five-run baseline, complete the
-  anonymous task sheet, then isolate the highest-value visual hierarchy defect.
+- **Last completed finding:** R183-E02 added bounded, deterministic macro-domain
+  signatures after the corrected lab and anonymous task review proved the
+  fitted Structure and Dependencies frames were visually hollow.
+- **Current finding:** Document the corrected evidence and semantic-zoom
+  contract, then finish the backend, package, browser, and publication gates.
 - **Dirty files expected:** two pre-existing CRLF status markers with
   byte-identical index/worktree blobs; never stage them.
-- **Unpushed commits expected:** `0` at a pushed checkpoint.
+- **Unpushed commits expected:** the code and this handoff checkpoint until the
+  next paired push.
 - **Known blocker:** None.
-- **Single next action:** Run corrected five-run Architecture and Stellar
-  comparisons on `graph-ui-lab-controlled`, evaluate A/B tasks before opening
-  the blind key, and record the root-cause decision.
+- **Single next action:** Update the Graph UI architecture, user guidance, lab
+  truth record, and R183 evidence report; run `npm run docs:check`, then execute
+  the complete backend and embedded-package validation matrix.
 
 ## Security confirmation
 
