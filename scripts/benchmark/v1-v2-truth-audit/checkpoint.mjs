@@ -169,6 +169,8 @@ async function rawManifest(resultsRoot, phase) {
   const roots = [resolve(resultsRoot, phase)];
   const preflight = resolve(resultsRoot, 'preflight');
   if (phase === 'baseline' && existsSync(preflight)) roots.push(preflight);
+  const environment = resolve(resultsRoot, 'environment');
+  if (existsSync(environment)) roots.push(environment);
   const standalone = [resolve(resultsRoot, 'invalid-runs.json')].filter(existsSync);
   const files = [...roots.flatMap(walkFiles), ...standalone]
     .sort((left, right) => left.localeCompare(right));
@@ -241,7 +243,7 @@ async function main() {
   }, null, 2));
 }
 
-export { perTaskTables, ratioTable };
+export { perTaskTables, ratioTable, rawManifest };
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
