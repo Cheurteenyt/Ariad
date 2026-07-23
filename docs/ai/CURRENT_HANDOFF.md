@@ -10,10 +10,10 @@ status: ACTIVE
 repository: Cheurteenyt/Ariad
 branch: v2/r183-graph-visual-intelligence
 base_sha: b6a95f23ca34ba1a141c943f1be0b045be23b9dd
-last_completed_code_sha: b8a349e3f06a4ec237af18cf9908d1ceaec10625
+last_completed_code_sha: 56ae321d9ef1d92e7ee078c21d86e7c54cb5d808
 active_audit: NONE
 active_audit_blob_oid: NONE
-updated_at_utc: 2026-07-23T12:45:10Z
+updated_at_utc: 2026-07-23T12:54:29Z
 implementer_role: codex
 ```
 
@@ -56,6 +56,7 @@ round. Findings below are provisional until the matched baseline is committed.
 | R183-E03 | owner objective | ACCEPTED | Validate small, medium, empty, disconnected, dense, filtered, and oversized states without regressions. The complete 236-test Graph UI suite is green; backend/package and exact-main gates remain. | `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | existing Graph UI state matrix plus bounded perception fixture | pending | IN_PROGRESS |
 | R183-E04 | local reproduction | ACCEPTED | The comparison lab selected the first V1 card whose broad ancestor contained the target name, so the 38-node API preflight could be paired with a rendered 4,287-node project. Captures were also taken after the FPS pan/zoom. The lab now selects a card-local exact heading, verifies the rendered layout URL and complete topology, records that identity, and captures the settled pre-interaction frame. | `d54b6ac6472a42f4f445c74b3251a4df1978551e` | `v2/tests/benchmark/graph-ui-lab.test.ts` | pending | LOCAL_PASS |
 | R183-E05 | packaged browser smoke | IMPLEMENTED | The packaged smoke requested keyboard node traversal immediately after opening the exact dependency atlas. The product correctly announced that symbols require domain drill-down or semantic zoom, so the stale smoke failed on a valid large project. It now follows that explicit prompt with bounded Zoom-in actions before requiring a node, while other missing-target states still fail closed. | `b8a349e3f06a4ec237af18cf9908d1ceaec10625` | `v2/tests/benchmark/graph-ui-browser-smoke.test.ts` plus packaged Edge smoke | pending | LOCAL_PASS |
+| R183-E06 | responsive browser validation | IMPLEMENTED | At 380 CSS pixels, Fit computed complete macro bounds but clamped scale to 0.1, clipping the outer Structure domains. One shared 0.02 camera floor now applies to fit, wheel, pinch, controls, and keyboard zoom; the narrow product frame contains all domains and preserves manual zoom-in. | `56ae321d9ef1d92e7ee078c21d86e7c54cb5d808` | narrow 6,400-world-unit GraphCanvas fit regression plus visible packaged check | pending | LOCAL_PASS |
 
 ## Pushed checkpoints
 
@@ -65,6 +66,7 @@ round. Findings below are provisional until the matched baseline is committed.
 | `d54b6ac6472a42f4f445c74b3251a4df1978551e` | pending | R183-E01, R183-E04 | fail-closed rendered graph identity and pre-interaction blind captures | targeted Vitest 9/9; backend/lab typecheck; 38-node strict browser smoke | pending |
 | `0e0c4ac694393c2bc0d8ed73c0801e30533fad6c` | pending | R183-E01-E03 | bounded macro-domain intelligence and a controlled multi-domain perception fixture | Graph UI 236/236; targeted preview 65/65; frontend and backend/lab typecheck; frontend build/budgets; strict five-run Architecture and Stellar comparison candidates | pending |
 | `b8a349e3f06a4ec237af18cf9908d1ceaec10625` | pending | R183-E05 | packaged browser smoke follows the exact dependency-atlas disclosure contract | targeted backend 10/10; backend/lab typecheck; packaged Edge smoke on 1,000-node project with no console, page, or HTTP errors | pending |
+| `56ae321d9ef1d92e7ee078c21d86e7c54cb5d808` | pending | R183-E06 | narrow macro Fit no longer clips complete domain bounds | targeted Graph UI 66/66; complete Graph UI 237/237; frontend typecheck/build; embedded package build; narrow visible check; packaged smoke | pending |
 
 ## Exact validation evidence
 
@@ -140,7 +142,19 @@ working_directory: v2
 environment: Windows 11 / Node runtime from repository
 exit_code: 0
 result_summary: Backend compiled; locked Graph UI install audited 0 vulnerabilities; unchanged bundle budgets passed; embedded assets were copied and verified.
-not_run: Final post-documentation package rebuild, publication gates, remote CI, and exact-main validation.
+
+command: npm test
+working_directory: graph-ui
+environment: Windows 11 / Node runtime from repository
+exit_code: 0
+result_summary: 26 files and 237 tests passed after adding the narrow macro-fit regression.
+
+command: npm run build:package && npm run smoke:graph-ui:browser -- --project codebase-mirror --base-url http://127.0.0.1:9749
+working_directory: v2
+environment: Windows 11 / Edge 150.0.4078.83 / packaged Graph UI
+exit_code: 0
+result_summary: Final responsive Graph UI assets remained within budgets and the 1,000-node packaged workflow passed with zero browser errors.
+not_run: Publication gates, remote CI, and exact-main validation.
 ```
 
 ## Reset recovery
@@ -169,19 +183,19 @@ npx tsc --noEmit
 
 ## Current working state
 
-- **Last completed finding:** R183-E05 aligned the packaged browser gate with
-  the exact dependency-atlas semantic-zoom contract and passed it on the
-  1,000-node local project without runtime errors.
-- **Current finding:** Finalize the current evidence documentation, rerun the
-  package gate against the complete diff, then finish remote publication.
+- **Last completed finding:** R183-E06 removed the stale 0.1 camera floor that
+  clipped complete macro-domain bounds at 380 CSS pixels and validated the
+  corrected packaged frame.
+- **Current finding:** Add the responsive finding to the current evidence
+  report, then finish remote publication and exact-main validation.
 - **Dirty files expected:** two pre-existing CRLF status markers with
   byte-identical index/worktree blobs; never stage them.
 - **Unpushed commits expected:** the code and this handoff checkpoint until the
   next paired push.
 - **Known blocker:** None.
-- **Single next action:** Commit the current documentation, rerun docs,
-  frontend, backend, package, and packaged-browser gates on that exact head,
-  then push and monitor the GitHub candidate.
+- **Single next action:** Update and validate the R183 report, push the paired
+  checkpoint, then monitor the GitHub candidate through merge and branch
+  cleanup.
 
 ## Security confirmation
 
