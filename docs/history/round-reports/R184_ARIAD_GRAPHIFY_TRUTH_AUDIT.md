@@ -6,13 +6,14 @@
 schema_version: 1
 kind: implementation-handoff
 round: R184
-status: LOCAL_VALIDATION_PENDING
+status: LOCAL_VALIDATED
 repository: Cheurteenyt/Ariad
 branch: codex/r184-graphify-truth-audit
 base_sha: 0789b3019d1847605ebe60a3be6abd16363249fe
 postfix_product_sha: a699e27626673d29f91344b4b2d6a059ac63d728
 benchmark_preregistration_sha: 1ed1d4c8a1697ed7ea8f5ac66f79dbf4a42105cf
-updated_at_utc: 2026-07-24T00:00:00Z
+last_local_validated_sha: 6f6cccf31ca8fbd8fbcf298a8be3f2bff312c556
+updated_at_utc: 2026-07-24T02:31:13Z
 implementer_role: codex
 ```
 
@@ -62,12 +63,23 @@ and its
 
 ## Validation and publication
 
-This section is completed only after local validation, GitHub checks, exact
-merge, mirror verification, branch deletion, final-main reindex, and packaged
-Graph UI startup.
+Local product validation is complete. GitHub checks, exact merge, mirror
+verification, branch deletion, final-main reindex, and packaged Graph UI
+startup remain publication gates.
 
 ```text
-local_validation: pending
+backend_npm_ci: pass; 0 vulnerabilities
+backend_docs_typecheck_build: pass
+backend_targeted: 132/132 pass
+benchmark_harness: 19/19 pass
+frontend_npm_ci_audit: pass; 0 vulnerabilities
+frontend_typecheck_build: pass; manifest JS 122.99/123 KiB; CSS 14.91/15 KiB
+frontend_tests: 238/238 pass
+embedded_package: pass
+packaged_browser_desktop: pass at 1440x960; zero console/page/HTTP errors
+packaged_browser_narrow: pass at 380x800; zero console/page/HTTP errors
+fresh_self_index: 664 files; 10,932 nodes; 24,834 edges; 0 errors
+windows_full_suite: 1,548/2,079 pass; 531 failures remain in POSIX-only symlink, mode, Bash, Unix-command, and shell-redirection contracts
 github_pr: pending
 github_ci: pending
 codeql: pending
