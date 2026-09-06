@@ -1,5 +1,28 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.3 — index-auto: scheduler-driven freshness (2026-09-06)
+
+- New `cbm-v2 index-auto run` command: one freshness-gated, overlap-locked
+  incremental index refresh designed to be invoked by a scheduler. The
+  freshness gate skips the run when the last auto-index success is younger
+  than `--min-age-hours` (default 20h; success marker, with the DB
+  `last_successful_index_at` as fallback). The overlap lock (lockfile with
+  pid + startedAt next to the project DB) skips while another run is active
+  and takes over stale locks after a crash or reboot. Discovery always runs
+  in tolerant mode (drive-scale ACL walls cannot fail the job); a `STALE`
+  outcome (extractor semantics mismatch) automatically reruns once as a full
+  index; a success marker is only written for SUCCESS / SUCCESS_WITH_WARNINGS
+  so a PARTIAL outcome retries failed files on the next run. Every run
+  appends to `<project>.auto.log` in the cache directory.
+- New `cbm-v2 index-auto install` / `uninstall` (Windows): register/unregister
+  a daily scheduled task (schtasks) pointing at a generated `.cmd` wrapper in
+  the cache directory (space-free path, no nested quoting). Non-Windows
+  platforms print the equivalent cron line.
+- `errorMessage` moved to `src/utils/error-message.ts` (shared by UI and the
+  new CLI command; `ui/helpers.ts` re-exports it).
+- Tests: freshness gate, lock lifecycle (active/stale/dead-pid/unreadable),
+  success marker, wrapper assembly, `--at` → cron conversion.
+
 ## 0.78.0-alpha.2 — config-driven discovery excludes (2026-09-06)
 
 - Wired the previously inert `exclude` field of `.codebase-memory.json` into

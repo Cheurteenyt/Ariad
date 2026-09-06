@@ -106,6 +106,48 @@ writable, e.g. indexing `C:/` without admin rights).
 }
 ```
 
+### `cbm-v2 index-auto`
+Freshness-gated, overlap-locked incremental refresh designed to be invoked by
+a scheduler, so indexes stay current without manual runs (added in
+`0.78.0-alpha.3`).
+
+```bash
+# Run one guarded refresh now (skips when the index is fresh enough)
+cbm-v2 index-auto run --project my-system --root D:/ --min-age-hours 20
+
+# Force a refresh regardless of freshness
+cbm-v2 index-auto run --project my-system --root D:/ --force
+
+# Windows: register/unregister a daily scheduled task
+cbm-v2 index-auto install --project my-system --root D:/ --at 03:00 --exclude ai-cache
+cbm-v2 index-auto uninstall --project my-system
+```
+
+**Behavior (`run`):**
+- **Freshness gate** — skips when the last auto-index success is younger than
+  `--min-age-hours` (default 20). The marker is the auto-index success file,
+  falling back to the DB `last_successful_index_at`; `--force` bypasses it.
+- **Overlap lock** — a lockfile (pid + startedAt) next to the project DB skips
+  the run while another one is active and takes over stale locks (crash,
+  reboot, orphaned file).
+- **Tolerant discovery always on** — EACCES/EPERM denials become warnings +
+  uncertain paths, so a nightly drive-scale job never fails on ACL walls.
+- **STALE auto-recovery** — an incremental run that returns `STALE` (extractor
+  semantics mismatch) automatically reruns once as a full index.
+- **PARTIAL does not mark fresh** — failed files are retried by the next
+  scheduled run. Only `SUCCESS` / `SUCCESS_WITH_WARNINGS` update the marker.
+- Every run appends to `<project>.auto.log` in the cache directory.
+
+**Behavior (`install`):**
+- Registers a daily scheduled task named `Ariad-Index-<project>` (override
+  with `--task-name`) running the guarded refresh via a generated `.cmd`
+  wrapper stored in the cache directory. Non-Windows platforms print the
+  equivalent cron line. The task runs under the current user while logged on;
+  the freshness gate plus an at-logon manual run cover the remaining gap.
+- Config excludes: `install` bakes the `exclude` field of the index-root
+  `.codebase-memory.json` into the wrapper together with the `--exclude`
+  flags passed at install time.
+
 ### `cbm-v2 doctor`
 Run diagnostics to verify the setup.
 
