@@ -83,7 +83,7 @@ args = ["/absolute/path/to/Ariad/v2/dist/cli/index.js", "mcp", "--project", "my-
 
 On Windows, edit `%USERPROFILE%\.codex\config.toml` and use an absolute path
 with forward slashes, such as
-`D:/Mycodex/Ariad/v2/dist/cli/index.js`. Restart Codex, then run
+`D:/Ariad/v2/dist/cli/index.js`. Restart Codex, then run
 `codex mcp list` or use `/mcp` to confirm that the server is connected.
 
 ## Graph UI
