@@ -622,6 +622,17 @@ export function discoverSourceFilesStructured(
       // R142 (DATA-R142-02): record the error instead of silently
       // continuing. The indexer will see `complete=false` and refuse to
       // clear/publish (full mode) or compute deletedRelPaths (incremental).
+      // Drive-scale exception (--discovery-tolerant): denied directory reads
+      // (other profiles, locked app caches) become warnings + an uncertain
+      // subtree so incremental runs never treat it as deleted.
+      const code = (error as { code?: string }).code ?? 'unknown';
+      if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+        const relDir = relative(realRoot, dir);
+        recordWarning(code, relDir);
+        uncertainPaths.push(relDir);
+        uncertainSubtrees.push(relDir);
+        continue;
+      }
       recordError(dir, error);
       continue;
     }
