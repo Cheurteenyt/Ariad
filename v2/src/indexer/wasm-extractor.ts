@@ -649,7 +649,16 @@ export function discoverSourceFilesStructured(
           uncertainPaths.push(relLstatPath);
           continue;
         }
-        // EACCES, EIO, etc. — fatal.
+        // EACCES, EIO, etc. — fatal, unless discovery is tolerant (drive-scale
+        // sweep): denied entries (pagefile.sys, other profiles, locked cache
+        // dirs) become warnings + uncertain paths, never deletions.
+        if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+          const relDenied = relative(realRoot, fullPath);
+          recordWarning(code, relDenied);
+          uncertainPaths.push(relDenied);
+          uncertainSubtrees.push(relDenied);
+          continue;
+        }
         recordError(fullPath, error);
         continue;
       }
@@ -918,7 +927,17 @@ export function discoverSourceFilesStructured(
             uncertainSubtrees.push(relDirPath);
             continue;
           }
-          // EACCES, EIO, ELOOP, etc. — fatal.
+          // EACCES, EIO, ELOOP, etc. — fatal, unless discovery is tolerant
+          // (see the lstat catch above): denied directories become warnings +
+          // uncertain subtrees on drive-scale sweeps. ELOOP stays fatal here —
+          // it is a configuration error, not an ACL wall.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDirPath = relative(realRoot, fullPath);
+            recordWarning(code, relDirPath);
+            uncertainPaths.push(relDirPath);
+            uncertainSubtrees.push(relDirPath);
+            continue;
+          }
           recordError(fullPath, error);
           continue;
         }
