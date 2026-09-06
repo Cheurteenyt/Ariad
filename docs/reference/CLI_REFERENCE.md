@@ -144,9 +144,10 @@ cbm-v2 index-auto uninstall --project my-system
   wrapper stored in the cache directory. Non-Windows platforms print the
   equivalent cron line. The task runs under the current user while logged on;
   the freshness gate plus an at-logon manual run cover the remaining gap.
-- Config excludes: `install` bakes the `exclude` field of the index-root
-  `.codebase-memory.json` into the wrapper together with the `--exclude`
-  flags passed at install time.
+- Config excludes: the guarded run re-reads the `exclude` field of the
+  index-root `.codebase-memory.json` on every execution (editing the config
+  is enough — no reinstall), while `--exclude` flags passed to `install` are
+  baked into the wrapper for roots that hold no config file (e.g. `C:/`).
 
 ### `cbm-v2 doctor`
 Run diagnostics to verify the setup.
