@@ -637,20 +637,20 @@ export class CodeGraphReader {
    * indexed after the first 10k files cannot disappear.
    */
   /**
-   * Materialize the per-node architecture domain (top-level directory of the
-   * normalized file path) into an indexed temp table, reused by the domain
-   * summary and dependency queries. Recomputing the normalization inline
-   * inside the edges join is O(nodes) string work per query and drove
-   * multi-minute /api/layout calls on drive-scale graphs (2M+ nodes): the
-   * edges join could not rely on an index over the CTE. The temp map costs
-   * one nodes scan per revision change and turns both queries into indexed
-   * PK lookups. Temp tables are per-connection (no cross-reader sharing) and
+   * Materialize per-node derived tables (domain map + total degree) into
+   * indexed temp tables, reused by the architecture-domain and layout
+   * ranking queries. Recomputing these inline is O(nodes) string work or a
+   * correlated edge COUNT per node and drove multi-minute /api/layout calls
+   * on drive-scale graphs (2M+ nodes, 16M+ edges). Each temp table costs one
+   * aggregate pass per revision change and turns every consumer into indexed
+   * lookups. Temp tables are per-connection (no cross-reader sharing) and
    * invalidated via the graph revision (PRAGMA data_version).
    */
-  private ensureDomainMap(project: string): void {
+  private ensureDerivedTables(project: string): void {
     const revision = this.getGraphRevision();
     if (this.domainMapProject === project && this.domainMapRevision === revision) return;
     this.db.exec('DROP TABLE IF EXISTS temp.node_domain_map');
+    this.db.exec('DROP TABLE IF EXISTS temp.node_degree');
     this.db.exec(
       `CREATE TABLE temp.node_domain_map (
          node_id INTEGER PRIMARY KEY,
@@ -687,8 +687,32 @@ export class CodeGraphReader {
          )`,
       )
       .run(project);
+    this.db.exec(
+      `CREATE TABLE temp.node_degree (
+         node_id INTEGER PRIMARY KEY,
+         degree INTEGER NOT NULL
+       )`,
+    );
+    this.db
+      .prepare(
+        `INSERT INTO temp.node_degree (node_id, degree)
+         SELECT n.id, COALESCE(so.c, 0) + COALESCE(ti.c, 0)
+         FROM nodes n
+         LEFT JOIN (
+           SELECT source_id AS s, COUNT(*) AS c FROM edges WHERE project = ? GROUP BY source_id
+         ) so ON so.s = n.id
+         LEFT JOIN (
+           SELECT target_id AS t, COUNT(*) AS c FROM edges WHERE project = ? GROUP BY target_id
+         ) ti ON ti.t = n.id
+         WHERE n.project = ?`,
+      )
+      .run(project, project, project);
     this.domainMapProject = project;
     this.domainMapRevision = revision;
+  }
+
+  private ensureDomainMap(project: string): void {
+    this.ensureDerivedTables(project);
   }
 
   listArchitectureDomains(project: string): ArchitectureDomainSummary[] {
@@ -2518,16 +2542,18 @@ export class CodeGraphReader {
     const safeLimit = Math.max(0, Math.min(10000, Math.floor(limit)));
     if (safeLimit === 0) return [];
 
+    // Ranking uses the materialized temp.node_degree table: the original
+    // correlated (SELECT COUNT(*) ...) per node re-scanned edge indexes for
+    // every candidate (1M+ nodes per label on drive-scale graphs).
+    this.ensureDerivedTables(project);
     const rows = this.db
       .prepare(
         `SELECT n.*
          FROM nodes n
+         JOIN temp.node_degree d ON d.node_id = n.id
          WHERE n.project = ? AND n.label = ?
-         ORDER BY (
-           (SELECT COUNT(*) FROM edges outgoing WHERE outgoing.source_id = n.id) +
-           (SELECT COUNT(*) FROM edges incoming WHERE incoming.target_id = n.id)
-         ) DESC, n.id ASC
-         LIMIT ?`
+         ORDER BY d.degree DESC, n.id ASC
+         LIMIT ?`,
       )
       .all(project, label, safeLimit) as CodeNodeRow[];
     return rows.map(deserializeCodeNode);
