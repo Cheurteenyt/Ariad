@@ -1180,7 +1180,14 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   const hasEmptyRelTarget = discovery.uncertainSubtrees.some(s => s === '');
   const effectiveGlobalDeletionUncertainty = hasEmptyRelTarget || coldStartLock;
   const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasEffectiveHistoricalBrokenAliases;
-  if (!opts.incremental && hasUncertainty) {
+  // Drive-scale exception (--discovery-tolerant): plain DISCOVERY_UNCERTAIN
+  // (TOCTOU races + ACL denials recorded as uncertain by discovery) must not
+  // abort a full index — best-effort is the point of the flag. Alias-integrity
+  // locks (COLD_START_LOCK, HISTORICAL_ALIAS_BROKEN) still abort: they protect
+  // an existing graph from structural alias damage, and a denied ACL wall is
+  // not alias damage. Incremental runs keep the uncertainty prefix protection.
+  const uncertainAbortsFullIndex = !opts.discoveryTolerant || coldStartLock || hasEffectiveHistoricalBrokenAliases;
+  if (!opts.incremental && hasUncertainty && uncertainAbortsFullIndex) {
     db.close();
     // R156 (OBS-R156-01 + AVAIL-R156-01): Build structured staleReason + recovery.
     let staleCode: 'DISCOVERY_UNCERTAIN' | 'HISTORICAL_ALIAS_BROKEN' | 'COLD_START_LOCK';
