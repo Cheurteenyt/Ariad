@@ -2,7 +2,7 @@
 
 > **Status:** Canonical contributor entry point
 > **Audience:** Frontend contributors and maintainers
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-24
+> **Last verified:** `0.78.0-alpha.2` / 2026-09-06
 
 The Graph UI is a React/Vite frontend embedded into the V2 npm package. Product
 usage starts in the [root README](../README.md); this file covers development

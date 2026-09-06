@@ -2,7 +2,7 @@
 
 > **Status:** Historical index
 > **Audience:** Maintainers and auditors
-> **Last verified:** 2026-07-23 R183 archive
+> **Last verified:** 2026-07-24 R184 archive
 
 Everything below this directory is non-canonical evidence. A historical file
 remains valid for its pinned revision, but it must not be treated as current

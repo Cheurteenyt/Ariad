@@ -385,26 +385,21 @@ These invariants MUST hold for every round. Violations are P1 bugs.
 
 ## Round history (last 10 rounds)
 
-| Round | Version | Theme |
+The full ledger lives in the [round reports](docs/history/round-reports/) and
+the [changelog](v2/CHANGELOG.md). The last ten recorded rounds:
+
+| Round | Theme | Report |
 |---|---|---|
-| R46 | 0.11.0 | transaction atomicity + component test coverage |
-| R47 | 0.11.1 | performance + invisible bugs |
-| R48 | 0.11.2 | CI fix + invisible bugs |
-| R49 | 0.11.3 | deep audit + perf |
-| R50 | 0.11.4 | cache invalidation + perf revert |
-| R51 | 0.12.0 | security audit (1 CRITICAL + 7 fixes) |
-| R52 | 0.12.1 | CI quality + security hardening |
-| R53 | 0.12.1 | Claude Sonnet R8 audit (D1/D2/B1-B3/Part C/Part E) |
-| R54 | 0.12.1 | CI pipeline fix (workflow:rules + block scalars + lease SHA) |
-| R55 | (see CHANGELOG) | Claude Sonnet R9 audit (Part A + D3 + D4 + D5) |
-| R56 | 0.12.3 | self-audit + MAINTAINERS_GUIDE (symlink escape test, backup version clarify) |
-| R57 | 0.12.4 | doc cleanup + private maintainers notes (12 stale refs, pitfalls/checklist/lessons) |
-| R58 | 0.12.5 | code quality + type safety + perf (18 as any→row types, 3 hot-path prepared statements) |
-| R59 | 0.12.6 | code quality in sqlite-ro.ts (30 as any→row types, 2 hot-path prepared statements) |
-| R60 | 0.12.7 | code quality in swr-cache.ts (dead ternary, evictOne extracted, defensive iteration, typed events) |
-| R61 | 0.12.8 | code quality in server.ts (7 catch(any)→catch(unknown), 2 ws as any→WeakMap, errorMessage helper) |
-| R62 | 0.12.9 | code quality in importer.ts + generator.ts (importAllFiles dedup, 4 catch(any)→catch(unknown), existingBySlug typed) |
-| R63 | 0.13.0 | **architecture refactor** — server.ts 1212→290 lines, split into 7 files (types, helpers, routes/{graph,project,human,index,system}), RouteContext abstraction |
+| R163 | atomic refusal state + success predicate | [R163-coder](docs/history/round-reports/R163-coder.md) |
+| R164 | coder work record | [R164-coder](docs/history/round-reports/R164-coder.md) |
+| R171 | exact lookup benchmark | [R171_EXACT_LOOKUP_BENCHMARK](docs/history/round-reports/R171_EXACT_LOOKUP_BENCHMARK.md) |
+| R177 | multi-hop caller correction | [R177_MULTI_HOP_CALLER_CORRECTION](docs/history/round-reports/R177_MULTI_HOP_CALLER_CORRECTION.md) |
+| R178 | fresh B/C multi-hop confirmation | [R178_FRESH_BC_MULTIHOP_CONFIRMATION](docs/history/round-reports/R178_FRESH_BC_MULTIHOP_CONFIRMATION.md) |
+| R180 | R179 forward-reference correction | [R180_R179_FORWARD_REFERENCE](docs/history/round-reports/R180_R179_FORWARD_REFERENCE.md) |
+| R181 | structural cost root-cause | [R181_STRUCTURAL_COST_ROOT_CAUSE](docs/history/round-reports/R181_STRUCTURAL_COST_ROOT_CAUSE.md) |
+| R182 | maintenance consolidation | [R182_MAINTENANCE_CONSOLIDATION](docs/history/round-reports/R182_MAINTENANCE_CONSOLIDATION.md) |
+| R183 | graph UI visual intelligence | [R183_GRAPH_UI_VISUAL_INTELLIGENCE](docs/history/round-reports/R183_GRAPH_UI_VISUAL_INTELLIGENCE.md) |
+| R184 | Ariad vs Graphify truth audit | [R184_ARIAD_GRAPHIFY_TRUTH_AUDIT](docs/history/round-reports/R184_ARIAD_GRAPHIFY_TRUTH_AUDIT.md) |
 | R64 | 0.13.1 | deep audit — 1 bug fixed (routeIndex 202→500 on spawn ENOENT), 36 catch(any)→catch(unknown) across MCP+CLI+graph-ui, schema r:any typed |
 | R65 | 0.13.2 | V1 C engine audit (65K LOC, reference read-only) — 1 HIGH strcat overflow, 2 MEDIUM unchecked malloc + slab_owns O(n), docs/history/audits/V1_AUDIT_R65.md |
 | R66 | 0.13.3 | performance benchmark suite — 19 benchmarks, all excellent. SWR 0.0003ms, prepared 0.006ms, bulk 88x speedup. docs/history/benchmarks/PERFORMANCE_BENCHMARK_R66.md |
