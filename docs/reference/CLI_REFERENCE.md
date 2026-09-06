@@ -61,8 +61,10 @@ cbm-v2 index --project my-system --root D:/ --exclude ai-cache --exclude '$RECYC
   of fatal `DISCOVERY_PARTIAL` errors (added in `0.78.0-alpha.2`). Intended
   for drive-scale sweeps where ACL walls (`pagefile.sys`, other user
   profiles, locked app caches) are routine. `EIO`/`ENOMEM`/`EMFILE` remain
-  fatal, and alias-integrity locks (`COLD_START_LOCK`,
-  `HISTORICAL_ALIAS_BROKEN`) still abort a full index.
+  fatal. Since `0.78.0-alpha.3` the alias-integrity locks
+  (`COLD_START_LOCK`, `HISTORICAL_ALIAS_BROKEN`) are bypassed too, so a
+  permanently broken leftover junction cannot deadlock scheduled refreshes;
+  the removed nodes are rebuildable derived data.
 - `--allow-partial` — Let the explicitly non-fatal `PARTIAL` outcome exit 0 for
   a deliberately tolerant interactive run. CI should keep the strict default;
   do not add this flag merely to hide a failing gate. It never masks `FAILED`

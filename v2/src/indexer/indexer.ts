@@ -1186,7 +1186,14 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // locks (COLD_START_LOCK, HISTORICAL_ALIAS_BROKEN) still abort: they protect
   // an existing graph from structural alias damage, and a denied ACL wall is
   // not alias damage. Incremental runs keep the uncertainty prefix protection.
-  const uncertainAbortsFullIndex = !opts.discoveryTolerant || coldStartLock || hasEffectiveHistoricalBrokenAliases;
+  // R185 (drive-scale auto mode): under --discovery-tolerant the alias
+  // integrity locks are bypassed too. A scheduler-driven best-effort index
+  // must not deadlock on a permanently broken leftover junction (a broken
+  // alias blocks the cold-start lock forever when the volume has no
+  // resolvable alias to initialize alias_history with). The deleted target's
+  // graph nodes are rebuildable derived data, and the tolerance contract is
+  // explicit: denials and broken aliases become warnings, never blockers.
+  const uncertainAbortsFullIndex = !opts.discoveryTolerant;
   if (!opts.incremental && hasUncertainty && uncertainAbortsFullIndex) {
     db.close();
     // R156 (OBS-R156-01 + AVAIL-R156-01): Build structured staleReason + recovery.
