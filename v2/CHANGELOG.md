@@ -29,6 +29,10 @@
   platforms print the equivalent cron line.
 - `errorMessage` moved to `src/utils/error-message.ts` (shared by UI and the
   new CLI command; `ui/helpers.ts` re-exports it).
+- Runtime cap: --max-runtime-minutes (default 90) force-exits a hung run
+  (exit 3) — observed once on the C: drive where an extraction worker blocked
+  indefinitely on a special file; the overlap lock is taken over by the next
+  run. Diagnosing the underlying blocked read is tracked separately.
 - Tests: freshness gate, lock lifecycle (active/stale/dead-pid/unreadable),
   success marker, wrapper assembly, `--at` → cron conversion.
 
