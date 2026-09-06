@@ -17,6 +17,14 @@
   fatal DISCOVERY_PARTIAL errors. Intended for drive-scale sweeps where ACL
   walls (`pagefile.sys`, other user profiles, locked app caches) are routine.
   EIO/ENOMEM/EMFILE remain fatal.
+- Graph UI at drive scale: the architecture-domain queries now materialize a
+  `node → domain` temp map once per graph revision (invalidated by
+  `data_version`) instead of re-normalizing 2M+ node paths inside the edges
+  join, and the domain list / dependency summaries are cached per revision.
+  A `/api/layout` that took ~11 minutes of synchronous event-loop time on a
+  2.4M-node graph now pays a one-time ~2 min warm-up and serves repeat calls
+  instantly. The graph-ui layout fetch timeout is raised to 300s to cover
+  that single warm-up (default stays 20s for every other endpoint).
 
 ## 0.78.0-alpha.1 — bounded exact source lookup (2026-07-20)
 

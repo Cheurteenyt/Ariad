@@ -448,6 +448,10 @@ export class CodeGraphReader {
   private readonly revisionIdentity: string;
   private cachedDataVersion = -1;
   private cachedGraphRevision = '';
+  private domainMapProject: string | null = null;
+  private domainMapRevision: string | null = null;
+  private domainListCache: { project: string; revision: string; rows: ArchitectureDomainSummary[] } | null = null;
+  private readonly domainDepsCache = new Map<string, ArchitectureDomainDependencySummary[]>();
   private readonly exactScopeIndexes = new Map<string, ProjectExactScopeIndex>();
 
   // R59: hot-path prepared statements, prepared once in the constructor.
@@ -632,58 +636,94 @@ export class CodeGraphReader {
    * exhaustive without transferring every node row to JavaScript, so a domain
    * indexed after the first 10k files cannot disappear.
    */
-  listArchitectureDomains(project: string): ArchitectureDomainSummary[] {
-    const rows = this.db
+  /**
+   * Materialize the per-node architecture domain (top-level directory of the
+   * normalized file path) into an indexed temp table, reused by the domain
+   * summary and dependency queries. Recomputing the normalization inline
+   * inside the edges join is O(nodes) string work per query and drove
+   * multi-minute /api/layout calls on drive-scale graphs (2M+ nodes): the
+   * edges join could not rely on an index over the CTE. The temp map costs
+   * one nodes scan per revision change and turns both queries into indexed
+   * PK lookups. Temp tables are per-connection (no cross-reader sharing) and
+   * invalidated via the graph revision (PRAGMA data_version).
+   */
+  private ensureDomainMap(project: string): void {
+    const revision = this.getGraphRevision();
+    if (this.domainMapProject === project && this.domainMapRevision === revision) return;
+    this.db.exec('DROP TABLE IF EXISTS temp.node_domain_map');
+    this.db.exec(
+      `CREATE TABLE temp.node_domain_map (
+         node_id INTEGER PRIMARY KEY,
+         architecture_domain TEXT NOT NULL,
+         label TEXT NOT NULL
+       )`,
+    );
+    this.db
       .prepare(
-        `WITH normalized_nodes AS (
-           SELECT n.id, n.label,
+        `INSERT INTO temp.node_domain_map (node_id, architecture_domain, label)
+         SELECT id,
+           CASE
+             WHEN normalized_path = '' THEN '(virtual)'
+             WHEN INSTR(normalized_path, '/') = 0 THEN
+               CASE
+                 WHEN label IN ('Directory', 'Folder') THEN normalized_path
+                 ELSE '(root)'
+               END
+             ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
+           END AS architecture_domain,
+           label
+         FROM (
+           SELECT id, label,
              TRIM(
                CASE
-                 WHEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 2, 2) = ':/'
-                   THEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 4)
-                 ELSE REPLACE(n.file_path, CHAR(92), '/')
+                 WHEN SUBSTR(REPLACE(file_path, CHAR(92), '/'), 2, 2) = ':/'
+                   THEN SUBSTR(REPLACE(file_path, CHAR(92), '/'), 4)
+                 ELSE REPLACE(file_path, CHAR(92), '/')
                END,
                '/'
              ) AS normalized_path
-           FROM nodes n
-           WHERE n.project = ?
-         ), node_domains AS (
-           SELECT id, label,
-             CASE
-               WHEN normalized_path = '' THEN '(virtual)'
-               WHEN INSTR(normalized_path, '/') = 0 THEN
-                 CASE
-                   WHEN label IN ('Directory', 'Folder') THEN normalized_path
-                   ELSE '(root)'
-                 END
-               ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
-             END AS architecture_domain
-           FROM normalized_nodes
-         ), domain_summaries AS (
-           SELECT
-             architecture_domain,
+           FROM nodes
+           WHERE project = ?
+         )`,
+      )
+      .run(project);
+    this.domainMapProject = project;
+    this.domainMapRevision = revision;
+  }
+
+  listArchitectureDomains(project: string): ArchitectureDomainSummary[] {
+    const revision = this.getGraphRevision();
+    if (this.domainListCache && this.domainListCache.project === project && this.domainListCache.revision === revision) {
+      return this.domainListCache.rows;
+    }
+    this.ensureDomainMap(project);
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, d.architecture_domain, d.node_count, d.file_count
+         FROM (
+           SELECT architecture_domain,
              COUNT(*) AS node_count,
              SUM(CASE WHEN label = 'File' THEN 1 ELSE 0 END) AS file_count,
-             COALESCE(MIN(CASE WHEN label = 'File' THEN id END), MIN(id)) AS representative_id
-           FROM node_domains
+             COALESCE(MIN(CASE WHEN label = 'File' THEN node_id END), MIN(node_id)) AS representative_id
+           FROM temp.node_domain_map
            GROUP BY architecture_domain
-         )
-         SELECT n.*, d.architecture_domain, d.node_count, d.file_count
-         FROM domain_summaries d
+         ) d
          JOIN nodes n ON n.id = d.representative_id AND n.project = ?
          ORDER BY d.architecture_domain ASC, n.id ASC`,
       )
-      .all(project, project) as Array<CodeNodeRow & {
+      .all(project) as Array<CodeNodeRow & {
         architecture_domain: string;
         node_count: number;
         file_count: number;
       }>;
-    return rows.map((row) => ({
+    const summaries = rows.map((row) => ({
       key: row.architecture_domain,
       node_count: row.node_count,
       file_count: row.file_count,
       representative: deserializeCodeNode(row),
     }));
+    this.domainListCache = { project, revision, rows: summaries };
+    return summaries;
   }
 
   /**
@@ -700,68 +740,55 @@ export class CodeGraphReader {
     const domainKeys = [...new Set(selectedDomainKeys)].sort();
     if (domainKeys.length === 0) return [];
     const selectedDomainsJson = JSON.stringify(domainKeys);
+    const revision = this.getGraphRevision();
+    const cacheKey = `${project}\0${revision}\0${selectedDomainsJson}`;
+    const cached = this.domainDepsCache.get(cacheKey);
+    if (cached) return cached;
+    this.ensureDomainMap(project);
     const rows = this.db
       .prepare(
-        `WITH normalized_nodes AS (
-           SELECT n.id,
-             n.label,
-             TRIM(
-               CASE
-                 WHEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 2, 2) = ':/'
-                   THEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 4)
-                 ELSE REPLACE(n.file_path, CHAR(92), '/')
-               END,
-               '/'
-             ) AS normalized_path
-           FROM nodes n
-           WHERE n.project = ?
-         ), node_domains AS (
-           SELECT id,
-             CASE
-               WHEN normalized_path = '' THEN '(virtual)'
-               WHEN INSTR(normalized_path, '/') = 0 THEN
-                 CASE
-                   WHEN label IN ('Directory', 'Folder') THEN normalized_path
-                   ELSE '(root)'
-                 END
-               ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
-             END AS architecture_domain
-           FROM normalized_nodes
-         ), selected_domains AS (
+        `WITH selected_domains AS (
            SELECT CAST(value AS TEXT) AS key FROM json_each(?)
-         ), classified_edges AS (
-           SELECT
-             CASE WHEN source_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               THEN source_domain.architecture_domain ELSE NULL END AS source_key,
-             CASE WHEN target_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               THEN target_domain.architecture_domain ELSE NULL END AS target_key,
-             e.type
-           FROM edges e
-           JOIN node_domains source_domain ON source_domain.id = e.source_id
-           JOIN node_domains target_domain ON target_domain.id = e.target_id
-           WHERE e.project = ?
-             AND (
-               source_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               OR target_domain.architecture_domain IN (SELECT key FROM selected_domains)
-             )
          )
-         SELECT source_key, target_key, type, COUNT(*) AS count
-         FROM classified_edges
+         SELECT
+           CASE WHEN sm.architecture_domain IN (SELECT key FROM selected_domains)
+             THEN sm.architecture_domain ELSE NULL END AS source_key,
+           CASE WHEN tm.architecture_domain IN (SELECT key FROM selected_domains)
+             THEN tm.architecture_domain ELSE NULL END AS target_key,
+           e.type,
+           COUNT(*) AS count
+         FROM edges e
+         JOIN temp.node_domain_map sm ON sm.node_id = e.source_id
+         JOIN temp.node_domain_map tm ON tm.node_id = e.target_id
+         WHERE e.project = ?
+           AND (
+             sm.architecture_domain IN (SELECT key FROM selected_domains)
+             OR tm.architecture_domain IN (SELECT key FROM selected_domains)
+           )
          GROUP BY source_key, target_key, type
          ORDER BY count DESC, source_key ASC, target_key ASC, type ASC`,
       )
-      .all(project, selectedDomainsJson, project) as Array<{
+      .all(selectedDomainsJson, project) as Array<{
         source_key: string | null;
         target_key: string | null;
         type: string;
         count: number;
       }>;
-    return rows.map((row) => ({
+    const summaries = rows.map((row) => ({
       source_key: row.source_key,
       target_key: row.target_key,
       type: row.type,
       count: row.count,
     }));
+    // Bounded cache: one entry per (project, revision, selection). The full
+    // edge scan behind a miss costs ~1 min on a 16M-edge drive-scale graph,
+    // so repeat /api/layout calls must not recompute the same selection.
+    if (this.domainDepsCache.size >= 8) {
+      const oldestKey = this.domainDepsCache.keys().next().value;
+      if (oldestKey !== undefined) this.domainDepsCache.delete(oldestKey);
+    }
+    this.domainDepsCache.set(cacheKey, summaries);
+    return summaries;
   }
 
   getNeighbors(nodeId: number, direction: 'in' | 'out' | 'both' = 'both', limit = 100): { edge: CodeEdge; node: CodeNode }[] {
