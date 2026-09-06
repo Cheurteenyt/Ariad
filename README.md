@@ -102,9 +102,6 @@ above, or run `npm link` once if you prefer the shorter `cbm-v2` command.
 |---|---|
 | `cbm-v2 index --project <p> --root <r>` | Index a project natively (WASM, 112 languages) |
 | `cbm-v2 index --project <p> --root <r> --incremental` | Fast incremental index (skip unchanged files) |
-| `cbm-v2 index --project <p> --root <r> --discovery-mode fast` | Explicit reduced-coverage full rebuild for benchmarks/speed-sensitive runs; incompatible with `--incremental` |
-| `cbm-v2 index --project <p> --root <r> --exclude <names...>` | Extra directory-name excludes (case-insensitive, merged with the `exclude` config field) for cache/system volumes |
-| `cbm-v2 index --project <p> --root <r> --discovery-tolerant` | ACL denials (EACCES/EPERM) become warnings + uncertain paths instead of fatal errors — for drive-scale sweeps |
 | `cbm-v2 index --project <p> --root <r> --dry-run` | Preview without writing to DB |
 | `cbm-v2 init` | Initialize `.codebase-memory.json` configuration |
 | `cbm-v2 doctor` | Run diagnostics (Node version, DB, vault path) |
@@ -114,61 +111,21 @@ above, or run `npm link` once if you prefer the shorter `cbm-v2` command.
 | `cbm-v2 ui [--allowed-root <paths...>]` | Start the graph UI web server (port 9749); optionally allow additional local browse/index roots |
 | `cbm-v2 watch` | Watch vault for changes and auto-sync (daemon) |
 
-### Human memory commands
-
-| Command | Description |
-|---|---|
-| `cbm-v2 human create --type ADR --title "ADR-001: ..."` | Create a note |
-| `cbm-v2 human list [--type ADR] [--status active]` | List notes |
-| `cbm-v2 human show <id>` | Show a note (JSON, includes edges) |
-| `cbm-v2 human link <noteId> --to-cbm-node <id> --edge DECIDES` | Link note to code node |
-
-### Obsidian commands
-
-| Command | Description |
-|---|---|
-| `cbm-v2 obsidian init` | Create vault directory structure |
-| `cbm-v2 obsidian sync` | Bidirectional sync (DB ↔ vault) |
-| `cbm-v2 obsidian sync --dry-run` | Preview without writing |
-| `cbm-v2 obsidian sync --direction export` | Export only (DB → vault) |
-| `cbm-v2 obsidian sync --direction import` | Import only (vault → DB) |
-| `cbm-v2 obsidian export` | One-shot export (DB → vault) |
-| `cbm-v2 obsidian import` | One-shot import (vault → DB) |
-| `cbm-v2 obsidian report` | Vault file report (by directory) |
-| `cbm-v2 obsidian create-adr --title "ADR-003: ..."` | Create ADR + DB record |
-| `cbm-v2 obsidian create-module-note --module auth` | Create ModuleNote |
-| `cbm-v2 obsidian create-route-note --method POST --path /api/login` | Create RouteNote |
-
-### Report commands
-
-| Command | Description |
-|---|---|
-| `cbm-v2 report hotspots` | Critical modules (high degree + complexity) |
-| `cbm-v2 report undocumented` | Code nodes without human notes |
-| `cbm-v2 report risk` | High coupling, dead code, fragile interfaces |
-
-### Backup commands
-
-| Command | Description |
-|---|---|
-| `cbm-v2 backup export --output backup.json` | Export all notes + edges to JSON |
-| `cbm-v2 backup import backup.json` | Import from JSON backup |
-| `cbm-v2 backup import backup.json --dry-run` | Preview import |
+Drive-scale indexes add `--exclude <names...>` (cache/system volumes) and
+`--discovery-tolerant` (ACL denials become warnings). The full option list and
+the human memory, Obsidian, report, and backup commands live in the
+[CLI reference](docs/reference/CLI_REFERENCE.md) — the single source of truth
+for command flags.
 
 ## MCP tools (8)
 
 The `cbm-v2 mcp` command exposes 8 tools via JSON-RPC 2.0 over stdio:
-
-| Tool | Type | Description |
-|---|---|---|
-| `get_project_overview` | read | High-level project stats (nodes, notes, coverage, freshness) |
-| `get_module_context` | read | Full module context: code + human notes + ADRs + bugs + refactors |
-| `get_undocumented_hotspots` | read | Critical code nodes without documentation |
-| `create_human_note` | write | Create ADR/BugNote/etc. + link to code nodes |
-| `link_note_to_code_node` | write | Link existing note to a code node |
-| `search_code_and_memory` | read | Unified search across code graph + human memory |
-| `lookup_source_text` | read | Bounded exact literals, TypeScript type dependents, identity-aware direct/multi-hop callers, call chains, and tracked inventory with explicit completeness |
-| `prepare_edit_context` | read | Dependency, blast-radius, risk, freshness, and linked-memory evidence when an edit needs structural context |
+`get_project_overview`, `get_module_context`, `get_undocumented_hotspots`,
+`create_human_note`, `link_note_to_code_node`, `search_code_and_memory`,
+`lookup_source_text`, `prepare_edit_context`. Contracts, parameters, and
+examples are documented in the
+[MCP tools reference](docs/reference/MCP_TOOLS.md) — the single source of
+truth for tool behavior.
 
 ### Connecting an AI agent
 
@@ -327,94 +284,18 @@ The `## HUMAN NOTES` section is **never** overwritten by V2. Edit it freely in O
 ## Graph UI
 
 The V2 graph UI replaces V1's separate 3D Three.js scene with one bounded 2D
-d3-force canvas and two task views over the same graph:
+d3-force canvas and two task views over the same graph: **Structure** (default;
+server-authored domain/community anchors, bounded captions, and progressive
+zoom down to individual symbols) and **Dependencies** (exact-degree hubs over a
+bounded dependency atlas), plus on-demand revision-bound **exact scope** pages
+and a shortest **coupling path** explainer. Both views share one topology, one
+d3 simulation, filters, the keyboard model, and the detail APIs; the Projects
+and Control tabs cover project health and system/index controls.
 
-- **Dashboard tab** (default): KPIs, graph freshness, smart recommendations
-- **Graph tab**: 2D force-directed canvas with filters, pan/zoom, node detail panel
-  - **Structure** (default): domains contain bounded, informative community
-    captions and up to two deterministic semantic signatures before zoom
-    reveals individual symbols. A compact `+N more inside` disclosure makes the
-    preview honest without drawing every node. Hovering or focusing a domain
-    with the keyboard activates one progressive insight lens: its exact volume
-    summary and related bundles remain visible while community captions are
-    limited to that domain.
-  - **Dependencies** (optional, persisted locally): exact-degree hubs form a
-    deterministic constellation. Before selection, pointer hover or keyboard
-    node focus paints a transient visible-first-hop lens in the settled frame:
-    at most two incident edges from each of the five semantic relation groups,
-    with the real color/dash grammar and direction markers. It uses only the
-    loaded topology, performs no request or simulation mutation, and disappears
-    across layout, exact-focus, filter-removal, and server-revision transitions.
-    Selecting a symbol then unfolds up to four visible incoming/outgoing
-    relation layers around a focus pinned to the semantic origin, with unrelated
-    nodes retained as dim outer context. Numbered rails expose hop depth,
-    repeated directory lanes expose module context, and the focus-only Canvas
-    label lists visible relation groups incident to the selected symbol.
-    Incoming labels open to the left and outgoing labels to the right through
-    three deterministic collision candidates. The selected frame is recomposed
-    inside the canvas area left free by the fidelity HUD, action rail,
-    breadcrumb, and detail panel; panel/viewport resizes update that camera
-    without reheating d3. Distant depths use monotonic compressed spacing and
-    moderate fan-outs expand vertically, so constrained canvases can enlarge
-    the directed frame without merging rails. Symbol labels share an adaptive
-    screen-area budget, deterministic outside-first collision fallbacks, and a
-    viewport guard that rejects text clipped or hidden under persistent graph
-    controls. Colliding priority labels are backfilled from at most four budget
-    windows, capped at 96 candidates per paint rather than the complete graph
-  - **Exact scope** (on demand): selecting a community or filesystem directory
-    replaces the representative frame with a revision-bound exact page inside
-    the same canvas. The backend adds a deterministic directory -> file ->
-    symbol plan computed from the complete exact membership, so the first page
-    already shows the whole bounded architecture while drawing only the loaded
-    symbols. Raw internal topology remains available immediately, a compact
-    reference summary exposes the strongest exact dependency with incoming and
-    outgoing totals, and dense scopes expose an explicit Load more action.
-    Selecting a loaded symbol keeps that exact scope mounted, opens its detail,
-    and emphasizes only the visible incident relations; keyboard community
-    browsing skips file surfaces whose symbols have not been loaded yet
-  - **Explain a coupling path** (on demand): arm the selected symbol as a path
-    start, then choose any other symbol with the existing project search or
-    map. The detail panel shows the exact shortest source-to-target chain,
-    every intermediate file, and the stored direction/type of each relation.
-    This uses the complete project database rather than the representative
-    frame; bounded-search outcomes never claim that two symbols are disconnected
-- **Projects tab**: Project list with node/edge counts and health status
-- **Control tab**: System info
-
-Both Graph views share one topology, canvas, d3 simulation object,
-sampling/exactness labels, filters, selection, keyboard model, and detail APIs.
-`Structure` follows server-authored domain/community anchors. Filesystem tree
-paths remain a separate exact `directory` scope even when a community has the
-same key; its breadcrumb returns to the parent domain without relabeling
-sampled data as exact. `Dependencies`
-reconfigures that same simulation with task-specific targets and one bounded
-reheat when the view or focused symbol changes; known filter subsets do not
-reheat and no renderer, canvas, or node object is rebuilt. Direct relations lead
-the focused frame while real depths 2–4 retain their semantic line grammar at a
-lower weight; cross-links that do not advance toward or away from the focus are
-not promoted as flow. Focus-label ranking is precomputed on semantic-frame
-changes rather than sorted during every Canvas paint.
-
-The unselected Dependencies overview is an exact, bounded **dependency atlas**
-rather than a 1,000-symbol particle ring. The layout response ranks at most 12
-top-level domains, packs their exact node totals into stable circles, and
-aggregates every directed relationship touching those domains inside SQLite.
-Each retained domain may show the same two-symbol non-interactive signature as
-Structure, then fades it before raw representative topology enters.
-Traffic to omitted domains remains included in the selected domains' exact
-in/out totals; it is not rendered as a misleading synthetic node. Coverage is
-labelled complete or partial, and relation-type filters reuse the returned
-exact groups without another request.
-
-Domain selection opens its sampled structure and exposes the existing
-revision-bound exact-scope action, while zooming progressively reveals the
-representative symbol constellation. At macro scale
-the Canvas skips all sampled-node fills and hit tests; it paints only bounded
-domain surfaces, traffic tiers, labels, and at most 28 directed bundles. The
-same node objects, d3 simulation, filters, keyboard model, exact neighborhood,
-and focused incoming/outgoing flow are retained. Returning to `Structure` or
-focusing a symbol therefore changes the task frame without creating a second
-renderer or downloading another graph.
+Durable design detail lives in the
+[Graph UI contributor guide](graph-ui/README.md) and
+[V2 Architecture §9](docs/architecture/V2_ARCHITECTURE.md#9-graph-ui) — this
+README keeps only the quick start.
 
 ```bash
 # From v2/ in a source checkout
