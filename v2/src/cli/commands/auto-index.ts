@@ -28,6 +28,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { indexProjectWasm } from '../../indexer/indexer.js';
+import type { IndexResult } from '../../indexer/indexer.js';
 import { loadConfig } from '../../config.js';
 import { defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
 import { cbmCacheDir } from '../../storage/generation-paths.js';
@@ -46,6 +47,7 @@ interface AutoIndexOptions {
   force: boolean;
   exclude: string[];
   discoveryMode: DiscoveryMode;
+  maxRuntimeMinutes: number;
 }
 
 export function autoLockPath(project: string): string {
@@ -226,6 +228,7 @@ export function registerAutoIndexCommand(program: Command): void {
     .option('--project <name>', 'Project name')
     .option('--root <path>', 'Root directory to index')
     .option('--min-age-hours <hours>', 'Skip when the last auto-index success is younger than this', '20')
+    .option('--max-runtime-minutes <minutes>', 'Kill the run (exit 3) after this many minutes — a scheduler job must never hang forever', '90')
     .option('--force', 'Ignore the freshness gate')
     .option('--exclude <names...>', 'Extra directory names to exclude from discovery')
     .action(async (opts) => {
@@ -237,6 +240,7 @@ export function registerAutoIndexCommand(program: Command): void {
         force: opts.force === true,
         exclude: Array.from(new Set([...(opts.exclude ?? []), ...config.exclude])),
         discoveryMode: 'full',
+        maxRuntimeMinutes: Number(opts.maxRuntimeMinutes) || 90,
       };
       await runGuardedIndex(options);
     });
@@ -350,10 +354,29 @@ async function runGuardedIndex(options: AutoIndexOptions): Promise<void> {
       discoveryMode: options.discoveryMode,
     });
 
-    let result = await runOnce(true);
+    // Runtime cap: a hung extraction (e.g. a worker blocked reading a special
+    // file) must not wedge the scheduler pipeline forever. On expiry we force-
+    // exit the whole process — worker threads die with it, the overlap lock is
+    // left behind and taken over by the next run, and the exit code (3) is
+    // distinct from success (0) and failure (1).
+    const withRuntimeCap = (run: Promise<IndexResult>): Promise<IndexResult> => new Promise<IndexResult>((resolveRun, rejectRun) => {
+      const capMs = options.maxRuntimeMinutes * 60_000;
+      const timer = setTimeout(() => {
+        appendLog(logPath, `runtime cap ${options.maxRuntimeMinutes}min exceeded — force exit (3)`);
+        console.error(`[index-auto] runtime cap ${options.maxRuntimeMinutes}min exceeded — force exit (3)`);
+        process.exit(3);
+      }, capMs);
+      timer.unref?.();
+      run.then(
+        (value) => { clearTimeout(timer); resolveRun(value); },
+        (error) => { clearTimeout(timer); rejectRun(error); },
+      );
+    });
+
+    let result = await withRuntimeCap(runOnce(true));
     if (result.outcome === 'STALE') {
       console.log('[index-auto] incremental returned STALE (semantics mismatch) — running a full reindex');
-      result = await runOnce(false);
+      result = await withRuntimeCap(runOnce(false));
     }
 
     const summary = `outcome=${result.outcome} files=${result.files} nodes=${result.nodes} edges=${result.edges} errors=${result.errors.length} durationMs=${result.durationMs}`;
