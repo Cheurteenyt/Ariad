@@ -11,6 +11,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { indexProjectWasm } from '../../indexer/indexer.js';
 import type { DiscoveryMode } from '../../indexer/wasm-extractor.js';
+import { loadConfig } from '../../config.js';
 import { basename, resolve } from 'node:path';
 
 export function registerIndexCommand(program: Command): void {
@@ -27,6 +28,7 @@ export function registerIndexCommand(program: Command): void {
     .action(async (opts) => {
       const project = opts.project || deriveProjectName();
       const rootPath = resolve(opts.root || '.');
+      const config = loadConfig(rootPath);
 
       console.log(`Codebase Memory V2 — WASM Indexer (R69)`);
       console.log(`==========================================`);
@@ -34,10 +36,14 @@ export function registerIndexCommand(program: Command): void {
       console.log(`Root:    ${rootPath}`);
       console.log(`Mode:    ${opts.dryRun ? 'dry-run' : opts.incremental ? 'incremental' : 'full'}`);
       console.log(`Discovery: ${opts.discoveryMode ?? 'full'}`);
+      console.log(`Exclude:  ${config.exclude.length > 0 ? config.exclude.join(', ') : '(none)'}`);
       console.log(`Engine:  web-tree-sitter (WASM, 112 languages)`);
       console.log();
 
       try {
+        // Wire the `exclude` field of the `.codebase-memory.json` at the index
+        // root into discovery (name-based, case-insensitive). The config file
+        // is optional; loadConfig falls back to defaults (empty excludes).
         const result = await indexProjectWasm({
           project,
           rootPath,
@@ -46,6 +52,7 @@ export function registerIndexCommand(program: Command): void {
           useWasm: true,
           workers: opts.workers,
           discoveryMode: opts.discoveryMode,
+          exclude: config.exclude,
         });
 
         console.log(`Result:`);

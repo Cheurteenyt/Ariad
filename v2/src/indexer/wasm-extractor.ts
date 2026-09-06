@@ -167,8 +167,16 @@ const FAST_IGNORED_SUFFIXES = [
   '.coverage', '.prof', '.patch', '.diff',
 ];
 
-function shouldSkipDirectory(name: string, mode: DiscoveryMode): boolean {
-  return ALWAYS_SKIP_DIRS.has(name) || (mode === 'fast' && FAST_SKIP_DIRS.has(name));
+function shouldSkipDirectory(
+  name: string,
+  mode: DiscoveryMode,
+  extraSkipDirs?: ReadonlySet<string>,
+): boolean {
+  if (ALWAYS_SKIP_DIRS.has(name) || (mode === 'fast' && FAST_SKIP_DIRS.has(name))) return true;
+  // Config-driven excludes (`.codebase-memory.json` `exclude`) are matched
+  // case-insensitively so Windows entries ("$Recycle.Bin") skip regardless of
+  // the case reported by the filesystem.
+  return extraSkipDirs?.has(name.toLowerCase()) ?? false;
 }
 
 function shouldSkipFile(name: string, mode: DiscoveryMode): boolean {
@@ -202,13 +210,18 @@ export function detectLanguage(filePath: string): string | null {
  * `realRoot` is the resolved root. `realTarget` is the resolved target path
  * (already confirmed to be inside realRoot by isPathInside).
  */
-function hasSkippedComponent(realRoot: string, realTarget: string, mode: DiscoveryMode): boolean {
+function hasSkippedComponent(
+  realRoot: string,
+  realTarget: string,
+  mode: DiscoveryMode,
+  extraSkipDirs?: ReadonlySet<string>,
+): boolean {
   const rel = relative(realRoot, realTarget);
   if (rel === '') return false; // the root itself
   const components = rel.split(sep);
   for (const component of components) {
     if (component === '') continue;
-    if (shouldSkipDirectory(component, mode)) {
+    if (shouldSkipDirectory(component, mode, extraSkipDirs)) {
       return true;
     }
   }
@@ -446,6 +459,7 @@ export function discoverSourceFilesStructured(
   rootPath: string,
   canonicalRoot?: string,
   mode: DiscoveryMode = 'full',
+  extraSkipDirs?: ReadonlySet<string>,
 ): DiscoveryResult {
   // R142 (PERF-R142-01, PATH-R142-01): If the caller already validated the
   // root via assertDiscoveryRoot and passed the canonical realpath, reuse
@@ -646,7 +660,7 @@ export function discoverSourceFilesStructured(
         // realpath (which would fail and make the entire discovery
         // incomplete). R142 called realpath first, so a single broken
         // symlink blocked the entire full index.
-        if (shouldSkipDirectory(entry, mode)) {
+        if (shouldSkipDirectory(entry, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }
@@ -731,7 +745,7 @@ export function discoverSourceFilesStructured(
         // canonical target path (relative to realRoot), not just basename.
         // Catches `link -> node_modules/pkg/src` (basename=`src` is fine,
         // but `node_modules` is in the path).
-        if (hasSkippedComponent(realRoot, realTarget, mode)) {
+        if (hasSkippedComponent(realRoot, realTarget, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }
@@ -851,7 +865,7 @@ export function discoverSourceFilesStructured(
           continue;
         }
       } else if (lst.isDirectory()) {
-        if (shouldSkipDirectory(entry, mode)) {
+        if (shouldSkipDirectory(entry, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }

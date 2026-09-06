@@ -61,6 +61,14 @@ export interface IndexOptions {
    * incremental run cannot safely update or delete source families it omits.
    */
   discoveryMode?: DiscoveryMode;
+  /**
+   * Extra directory names to exclude from discovery, matched case-insensitively
+   * against every path component in addition to the built-in skip policy.
+   * The CLI fills this from the `exclude` field of the `.codebase-memory.json`
+   * found at the index root, enabling drive-scale indexes that skip cache and
+   * system volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...).
+   */
+  exclude?: string[];
 }
 
 /**
@@ -674,7 +682,12 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     }
     let discovery: DiscoveryResult;
     try {
-      discovery = discoverSourceFilesStructured(opts.rootPath, canonicalRoot, discoveryMode);
+      discovery = discoverSourceFilesStructured(
+        opts.rootPath,
+        canonicalRoot,
+        discoveryMode,
+        opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+      );
     } catch (error) {
       const discoveryMsg = (error as Error).message;
       return {
@@ -801,7 +814,12 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // incremental mode we do NOT compute deletedRelPaths.
   let discovery: DiscoveryResult;
   try {
-    discovery = discoverSourceFilesStructured(opts.rootPath, canonicalRoot, discoveryMode);
+    discovery = discoverSourceFilesStructured(
+      opts.rootPath,
+      canonicalRoot,
+      discoveryMode,
+      opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+    );
   } catch (error) {
     // R141 (DATA-R141-01): discovery failed AFTER root validation — likely a
     // transient I/O error or a TOCTOU race. Do NOT clearProjectData.

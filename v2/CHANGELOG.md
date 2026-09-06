@@ -1,5 +1,16 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.2 — config-driven discovery excludes (2026-09-06)
+
+- Wired the previously inert `exclude` field of `.codebase-memory.json` into
+  WASM discovery. Names are matched case-insensitively against every directory
+  component, in addition to the built-in skip policy, for both regular
+  directories and symlink/junction target components.
+- The `index` CLI loads the config from the index root and passes the excludes
+  to the indexer, enabling drive-scale indexes that skip cache and system
+  volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...). The banner now prints
+  the active exclude list.
+
 ## 0.78.0-alpha.1 — bounded exact source lookup (2026-07-20)
 
 ### R184 competitive truth correction
