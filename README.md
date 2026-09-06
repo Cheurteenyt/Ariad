@@ -194,7 +194,7 @@ args = ["/absolute/path/to/Ariad/v2/dist/cli/index.js", "mcp", "--project", "my-
 
 On Windows, the global file is `%USERPROFILE%\.codex\config.toml`. Use an
 absolute path with forward slashes, for example
-`D:/Mycodex/Ariad/v2/dist/cli/index.js`, or escape each backslash in
+`D:/Ariad/v2/dist/cli/index.js`, or escape each backslash in
 the TOML string. Restart Codex after editing the configuration, then use
 `codex mcp list` or `/mcp` to verify the connection.
 
