@@ -160,7 +160,11 @@ export const api = {
   getLayout: (project: string, maxNodes = 2000, opts?: FetchOptions) =>
     fetchJson<GraphData>(
       `${API_BASE}/api/layout?project=${encodeURIComponent(project)}&max_nodes=${maxNodes}`,
-      opts,
+      // Drive-scale graphs (2M+ nodes) pay a one-time atlas warm-up per graph
+      // revision (temp domain map + full edge aggregation, ~1-2 min). The
+      // reader caches the result, so only the first layout after a server
+      // start or reindex can be slow — the default 20s timeout would kill it.
+      { timeoutMs: 300_000, ...opts },
     ),
 
   getNeighborhood: (project: string, nodeId: number, cursor?: string | null, opts?: FetchOptions) => {

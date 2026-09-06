@@ -11,6 +11,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { indexProjectWasm } from '../../indexer/indexer.js';
 import type { DiscoveryMode } from '../../indexer/wasm-extractor.js';
+import { loadConfig } from '../../config.js';
 import { basename, resolve } from 'node:path';
 
 export function registerIndexCommand(program: Command): void {
@@ -23,10 +24,17 @@ export function registerIndexCommand(program: Command): void {
     .option('--dry-run', 'Report what would be indexed without writing to DB')
     .option('--workers <count>', 'Number of worker threads (0 = single-threaded; default: auto)', parseWorkerCount)
     .option('--discovery-mode <mode>', 'Discovery coverage: full (default) or fast (non-incremental only)', parseDiscoveryMode, 'full')
+    .option('--exclude <names...>', 'Extra directory names to exclude from discovery (repeatable, case-insensitive)')
+    .option('--discovery-tolerant', 'Treat EACCES/EPERM discovery denials as warnings + uncertain paths (drive-scale indexing)')
     .option('--allow-partial', 'R82: exit 0 even if some files fail extraction (default: exit 1 on any error)')
     .action(async (opts) => {
       const project = opts.project || deriveProjectName();
       const rootPath = resolve(opts.root || '.');
+      const config = loadConfig(rootPath);
+      // CLI --exclude flags merge with the config excludes (dedup). This
+      // matters when the root itself is not writable (e.g. indexing C:/
+      // without admin rights, so no `.codebase-memory.json` can live there).
+      const exclude = Array.from(new Set([...(opts.exclude ?? []), ...config.exclude]));
 
       console.log(`Codebase Memory V2 — WASM Indexer (R69)`);
       console.log(`==========================================`);
@@ -34,6 +42,7 @@ export function registerIndexCommand(program: Command): void {
       console.log(`Root:    ${rootPath}`);
       console.log(`Mode:    ${opts.dryRun ? 'dry-run' : opts.incremental ? 'incremental' : 'full'}`);
       console.log(`Discovery: ${opts.discoveryMode ?? 'full'}`);
+      console.log(`Exclude:  ${exclude.length > 0 ? exclude.join(', ') : '(none)'}`);
       console.log(`Engine:  web-tree-sitter (WASM, 112 languages)`);
       console.log();
 
@@ -46,6 +55,8 @@ export function registerIndexCommand(program: Command): void {
           useWasm: true,
           workers: opts.workers,
           discoveryMode: opts.discoveryMode,
+          exclude,
+          discoveryTolerant: opts.discoveryTolerant ?? false,
         });
 
         console.log(`Result:`);

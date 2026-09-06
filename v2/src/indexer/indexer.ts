@@ -61,6 +61,21 @@ export interface IndexOptions {
    * incremental run cannot safely update or delete source families it omits.
    */
   discoveryMode?: DiscoveryMode;
+  /**
+   * Extra directory names to exclude from discovery, matched case-insensitively
+   * against every path component in addition to the built-in skip policy.
+   * The CLI fills this from the `exclude` field of the `.codebase-memory.json`
+   * found at the index root, enabling drive-scale indexes that skip cache and
+   * system volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...).
+   */
+  exclude?: string[];
+  /**
+   * Treat EACCES/EPERM discovery denials as warnings + uncertain paths
+   * instead of fatal errors. Intended for drive-scale indexes where ACL
+   * walls (system files, other profiles, locked app caches) are routine.
+   * EIO/ENOMEM/EMFILE remain fatal in this mode.
+   */
+  discoveryTolerant?: boolean;
 }
 
 /**
@@ -674,7 +689,13 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     }
     let discovery: DiscoveryResult;
     try {
-      discovery = discoverSourceFilesStructured(opts.rootPath, canonicalRoot, discoveryMode);
+      discovery = discoverSourceFilesStructured(
+        opts.rootPath,
+        canonicalRoot,
+        discoveryMode,
+        opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+        opts.discoveryTolerant === true,
+      );
     } catch (error) {
       const discoveryMsg = (error as Error).message;
       return {
@@ -801,7 +822,13 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // incremental mode we do NOT compute deletedRelPaths.
   let discovery: DiscoveryResult;
   try {
-    discovery = discoverSourceFilesStructured(opts.rootPath, canonicalRoot, discoveryMode);
+    discovery = discoverSourceFilesStructured(
+      opts.rootPath,
+      canonicalRoot,
+      discoveryMode,
+      opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+      opts.discoveryTolerant === true,
+    );
   } catch (error) {
     // R141 (DATA-R141-01): discovery failed AFTER root validation — likely a
     // transient I/O error or a TOCTOU race. Do NOT clearProjectData.
@@ -1153,7 +1180,14 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   const hasEmptyRelTarget = discovery.uncertainSubtrees.some(s => s === '');
   const effectiveGlobalDeletionUncertainty = hasEmptyRelTarget || coldStartLock;
   const hasUncertainty = discovery.uncertainPaths.length > 0 || discovery.uncertainSubtrees.length > 0 || effectiveGlobalDeletionUncertainty || hasEffectiveHistoricalBrokenAliases;
-  if (!opts.incremental && hasUncertainty) {
+  // Drive-scale exception (--discovery-tolerant): plain DISCOVERY_UNCERTAIN
+  // (TOCTOU races + ACL denials recorded as uncertain by discovery) must not
+  // abort a full index — best-effort is the point of the flag. Alias-integrity
+  // locks (COLD_START_LOCK, HISTORICAL_ALIAS_BROKEN) still abort: they protect
+  // an existing graph from structural alias damage, and a denied ACL wall is
+  // not alias damage. Incremental runs keep the uncertainty prefix protection.
+  const uncertainAbortsFullIndex = !opts.discoveryTolerant || coldStartLock || hasEffectiveHistoricalBrokenAliases;
+  if (!opts.incremental && hasUncertainty && uncertainAbortsFullIndex) {
     db.close();
     // R156 (OBS-R156-01 + AVAIL-R156-01): Build structured staleReason + recovery.
     let staleCode: 'DISCOVERY_UNCERTAIN' | 'HISTORICAL_ALIAS_BROKEN' | 'COLD_START_LOCK';

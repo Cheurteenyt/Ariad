@@ -167,8 +167,16 @@ const FAST_IGNORED_SUFFIXES = [
   '.coverage', '.prof', '.patch', '.diff',
 ];
 
-function shouldSkipDirectory(name: string, mode: DiscoveryMode): boolean {
-  return ALWAYS_SKIP_DIRS.has(name) || (mode === 'fast' && FAST_SKIP_DIRS.has(name));
+function shouldSkipDirectory(
+  name: string,
+  mode: DiscoveryMode,
+  extraSkipDirs?: ReadonlySet<string>,
+): boolean {
+  if (ALWAYS_SKIP_DIRS.has(name) || (mode === 'fast' && FAST_SKIP_DIRS.has(name))) return true;
+  // Config-driven excludes (`.codebase-memory.json` `exclude`) are matched
+  // case-insensitively so Windows entries ("$Recycle.Bin") skip regardless of
+  // the case reported by the filesystem.
+  return extraSkipDirs?.has(name.toLowerCase()) ?? false;
 }
 
 function shouldSkipFile(name: string, mode: DiscoveryMode): boolean {
@@ -202,13 +210,18 @@ export function detectLanguage(filePath: string): string | null {
  * `realRoot` is the resolved root. `realTarget` is the resolved target path
  * (already confirmed to be inside realRoot by isPathInside).
  */
-function hasSkippedComponent(realRoot: string, realTarget: string, mode: DiscoveryMode): boolean {
+function hasSkippedComponent(
+  realRoot: string,
+  realTarget: string,
+  mode: DiscoveryMode,
+  extraSkipDirs?: ReadonlySet<string>,
+): boolean {
   const rel = relative(realRoot, realTarget);
   if (rel === '') return false; // the root itself
   const components = rel.split(sep);
   for (const component of components) {
     if (component === '') continue;
-    if (shouldSkipDirectory(component, mode)) {
+    if (shouldSkipDirectory(component, mode, extraSkipDirs)) {
       return true;
     }
   }
@@ -446,6 +459,8 @@ export function discoverSourceFilesStructured(
   rootPath: string,
   canonicalRoot?: string,
   mode: DiscoveryMode = 'full',
+  extraSkipDirs?: ReadonlySet<string>,
+  tolerant?: boolean,
 ): DiscoveryResult {
   // R142 (PERF-R142-01, PATH-R142-01): If the caller already validated the
   // root via assertDiscoveryRoot and passed the canonical realpath, reuse
@@ -607,6 +622,17 @@ export function discoverSourceFilesStructured(
       // R142 (DATA-R142-02): record the error instead of silently
       // continuing. The indexer will see `complete=false` and refuse to
       // clear/publish (full mode) or compute deletedRelPaths (incremental).
+      // Drive-scale exception (--discovery-tolerant): denied directory reads
+      // (other profiles, locked app caches) become warnings + an uncertain
+      // subtree so incremental runs never treat it as deleted.
+      const code = (error as { code?: string }).code ?? 'unknown';
+      if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+        const relDir = relative(realRoot, dir);
+        recordWarning(code, relDir);
+        uncertainPaths.push(relDir);
+        uncertainSubtrees.push(relDir);
+        continue;
+      }
       recordError(dir, error);
       continue;
     }
@@ -634,7 +660,16 @@ export function discoverSourceFilesStructured(
           uncertainPaths.push(relLstatPath);
           continue;
         }
-        // EACCES, EIO, etc. — fatal.
+        // EACCES, EIO, etc. — fatal, unless discovery is tolerant (drive-scale
+        // sweep): denied entries (pagefile.sys, other profiles, locked cache
+        // dirs) become warnings + uncertain paths, never deletions.
+        if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+          const relDenied = relative(realRoot, fullPath);
+          recordWarning(code, relDenied);
+          uncertainPaths.push(relDenied);
+          uncertainSubtrees.push(relDenied);
+          continue;
+        }
         recordError(fullPath, error);
         continue;
       }
@@ -646,7 +681,7 @@ export function discoverSourceFilesStructured(
         // realpath (which would fail and make the entire discovery
         // incomplete). R142 called realpath first, so a single broken
         // symlink blocked the entire full index.
-        if (shouldSkipDirectory(entry, mode)) {
+        if (shouldSkipDirectory(entry, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }
@@ -718,6 +753,19 @@ export function discoverSourceFilesStructured(
           // The discovery MUST be marked incomplete so the indexer
           // preserves the existing graph instead of publishing a partial
           // one. R143's "skip all" behavior masked these critical errors.
+          // Drive-scale exception (--discovery-tolerant): on whole-drive
+          // sweeps EACCES/EPERM are routine ACL walls (system files, other
+          // user profiles, locked app caches), not health problems. Deny
+          // the entry, warn, and mark the path uncertain so incremental
+          // runs never treat the denied subtree as deleted. EIO/ENOMEM/
+          // EMFILE remain fatal regardless.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDenied = relative(realRoot, fullPath);
+            recordWarning(code, relDenied);
+            uncertainPaths.push(relDenied);
+            uncertainSubtrees.push(relDenied);
+            continue;
+          }
           recordError(fullPath, error);
           continue;
         }
@@ -731,7 +779,7 @@ export function discoverSourceFilesStructured(
         // canonical target path (relative to realRoot), not just basename.
         // Catches `link -> node_modules/pkg/src` (basename=`src` is fine,
         // but `node_modules` is in the path).
-        if (hasSkippedComponent(realRoot, realTarget, mode)) {
+        if (hasSkippedComponent(realRoot, realTarget, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }
@@ -769,7 +817,16 @@ export function discoverSourceFilesStructured(
             uncertainSubtrees.push(relTarget);
             continue;
           }
-          // EACCES, EIO, etc. — fatal.
+          // EACCES, EIO, etc. — fatal, unless discovery is tolerant (see the
+          // readdir catch above): denied symlink targets become warnings and
+          // uncertain paths on drive-scale sweeps.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDenied = relative(realRoot, realTarget);
+            recordWarning(code, relDenied);
+            uncertainPaths.push(relDenied);
+            uncertainSubtrees.push(relDenied);
+            continue;
+          }
           recordError(realTarget, error);
           continue;
         }
@@ -851,7 +908,7 @@ export function discoverSourceFilesStructured(
           continue;
         }
       } else if (lst.isDirectory()) {
-        if (shouldSkipDirectory(entry, mode)) {
+        if (shouldSkipDirectory(entry, mode, extraSkipDirs)) {
           skippedPolicyPaths++;
           continue;
         }
@@ -881,7 +938,17 @@ export function discoverSourceFilesStructured(
             uncertainSubtrees.push(relDirPath);
             continue;
           }
-          // EACCES, EIO, ELOOP, etc. — fatal.
+          // EACCES, EIO, ELOOP, etc. — fatal, unless discovery is tolerant
+          // (see the lstat catch above): denied directories become warnings +
+          // uncertain subtrees on drive-scale sweeps. ELOOP stays fatal here —
+          // it is a configuration error, not an ACL wall.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDirPath = relative(realRoot, fullPath);
+            recordWarning(code, relDirPath);
+            uncertainPaths.push(relDirPath);
+            uncertainSubtrees.push(relDirPath);
+            continue;
+          }
           recordError(fullPath, error);
           continue;
         }

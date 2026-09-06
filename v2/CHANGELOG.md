@@ -1,5 +1,31 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.2 — config-driven discovery excludes (2026-09-06)
+
+- Wired the previously inert `exclude` field of `.codebase-memory.json` into
+  WASM discovery. Names are matched case-insensitively against every directory
+  component, in addition to the built-in skip policy, for both regular
+  directories and symlink/junction target components.
+- The `index` CLI loads the config from the index root and passes the excludes
+  to the indexer, enabling drive-scale indexes that skip cache and system
+  volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...). The banner now prints
+  the active exclude list. A repeatable `--exclude <names...>` flag merges
+  with the config excludes (needed when the root is not writable, e.g. `C:/`
+  without admin rights).
+- New `--discovery-tolerant` flag: EACCES/EPERM discovery denials become
+  warnings + uncertain paths (never deleted by incremental runs) instead of
+  fatal DISCOVERY_PARTIAL errors. Intended for drive-scale sweeps where ACL
+  walls (`pagefile.sys`, other user profiles, locked app caches) are routine.
+  EIO/ENOMEM/EMFILE remain fatal.
+- Graph UI at drive scale: the architecture-domain queries now materialize a
+  `node → domain` temp map once per graph revision (invalidated by
+  `data_version`) instead of re-normalizing 2M+ node paths inside the edges
+  join, and the domain list / dependency summaries are cached per revision.
+  A `/api/layout` that took ~11 minutes of synchronous event-loop time on a
+  2.4M-node graph now pays a one-time ~2 min warm-up and serves repeat calls
+  instantly. The graph-ui layout fetch timeout is raised to 300s to cover
+  that single warm-up (default stays 20s for every other endpoint).
+
 ## 0.78.0-alpha.1 — bounded exact source lookup (2026-07-20)
 
 ### R184 competitive truth correction

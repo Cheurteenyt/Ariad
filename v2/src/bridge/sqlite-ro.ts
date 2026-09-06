@@ -448,6 +448,10 @@ export class CodeGraphReader {
   private readonly revisionIdentity: string;
   private cachedDataVersion = -1;
   private cachedGraphRevision = '';
+  private domainMapProject: string | null = null;
+  private domainMapRevision: string | null = null;
+  private domainListCache: { project: string; revision: string; rows: ArchitectureDomainSummary[] } | null = null;
+  private readonly domainDepsCache = new Map<string, ArchitectureDomainDependencySummary[]>();
   private readonly exactScopeIndexes = new Map<string, ProjectExactScopeIndex>();
 
   // R59: hot-path prepared statements, prepared once in the constructor.
@@ -632,58 +636,118 @@ export class CodeGraphReader {
    * exhaustive without transferring every node row to JavaScript, so a domain
    * indexed after the first 10k files cannot disappear.
    */
-  listArchitectureDomains(project: string): ArchitectureDomainSummary[] {
-    const rows = this.db
+  /**
+   * Materialize per-node derived tables (domain map + total degree) into
+   * indexed temp tables, reused by the architecture-domain and layout
+   * ranking queries. Recomputing these inline is O(nodes) string work or a
+   * correlated edge COUNT per node and drove multi-minute /api/layout calls
+   * on drive-scale graphs (2M+ nodes, 16M+ edges). Each temp table costs one
+   * aggregate pass per revision change and turns every consumer into indexed
+   * lookups. Temp tables are per-connection (no cross-reader sharing) and
+   * invalidated via the graph revision (PRAGMA data_version).
+   */
+  private ensureDerivedTables(project: string): void {
+    const revision = this.getGraphRevision();
+    if (this.domainMapProject === project && this.domainMapRevision === revision) return;
+    this.db.exec('DROP TABLE IF EXISTS temp.node_domain_map');
+    this.db.exec('DROP TABLE IF EXISTS temp.node_degree');
+    this.db.exec(
+      `CREATE TABLE temp.node_domain_map (
+         node_id INTEGER PRIMARY KEY,
+         architecture_domain TEXT NOT NULL,
+         label TEXT NOT NULL
+       )`,
+    );
+    this.db
       .prepare(
-        `WITH normalized_nodes AS (
-           SELECT n.id, n.label,
+        `INSERT INTO temp.node_domain_map (node_id, architecture_domain, label)
+         SELECT id,
+           CASE
+             WHEN normalized_path = '' THEN '(virtual)'
+             WHEN INSTR(normalized_path, '/') = 0 THEN
+               CASE
+                 WHEN label IN ('Directory', 'Folder') THEN normalized_path
+                 ELSE '(root)'
+               END
+             ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
+           END AS architecture_domain,
+           label
+         FROM (
+           SELECT id, label,
              TRIM(
                CASE
-                 WHEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 2, 2) = ':/'
-                   THEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 4)
-                 ELSE REPLACE(n.file_path, CHAR(92), '/')
+                 WHEN SUBSTR(REPLACE(file_path, CHAR(92), '/'), 2, 2) = ':/'
+                   THEN SUBSTR(REPLACE(file_path, CHAR(92), '/'), 4)
+                 ELSE REPLACE(file_path, CHAR(92), '/')
                END,
                '/'
              ) AS normalized_path
-           FROM nodes n
-           WHERE n.project = ?
-         ), node_domains AS (
-           SELECT id, label,
-             CASE
-               WHEN normalized_path = '' THEN '(virtual)'
-               WHEN INSTR(normalized_path, '/') = 0 THEN
-                 CASE
-                   WHEN label IN ('Directory', 'Folder') THEN normalized_path
-                   ELSE '(root)'
-                 END
-               ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
-             END AS architecture_domain
-           FROM normalized_nodes
-         ), domain_summaries AS (
-           SELECT
-             architecture_domain,
+           FROM nodes
+           WHERE project = ?
+         )`,
+      )
+      .run(project);
+    this.db.exec(
+      `CREATE TABLE temp.node_degree (
+         node_id INTEGER PRIMARY KEY,
+         degree INTEGER NOT NULL
+       )`,
+    );
+    this.db
+      .prepare(
+        `INSERT INTO temp.node_degree (node_id, degree)
+         SELECT n.id, COALESCE(so.c, 0) + COALESCE(ti.c, 0)
+         FROM nodes n
+         LEFT JOIN (
+           SELECT source_id AS s, COUNT(*) AS c FROM edges WHERE project = ? GROUP BY source_id
+         ) so ON so.s = n.id
+         LEFT JOIN (
+           SELECT target_id AS t, COUNT(*) AS c FROM edges WHERE project = ? GROUP BY target_id
+         ) ti ON ti.t = n.id
+         WHERE n.project = ?`,
+      )
+      .run(project, project, project);
+    this.domainMapProject = project;
+    this.domainMapRevision = revision;
+  }
+
+  private ensureDomainMap(project: string): void {
+    this.ensureDerivedTables(project);
+  }
+
+  listArchitectureDomains(project: string): ArchitectureDomainSummary[] {
+    const revision = this.getGraphRevision();
+    if (this.domainListCache && this.domainListCache.project === project && this.domainListCache.revision === revision) {
+      return this.domainListCache.rows;
+    }
+    this.ensureDomainMap(project);
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, d.architecture_domain, d.node_count, d.file_count
+         FROM (
+           SELECT architecture_domain,
              COUNT(*) AS node_count,
              SUM(CASE WHEN label = 'File' THEN 1 ELSE 0 END) AS file_count,
-             COALESCE(MIN(CASE WHEN label = 'File' THEN id END), MIN(id)) AS representative_id
-           FROM node_domains
+             COALESCE(MIN(CASE WHEN label = 'File' THEN node_id END), MIN(node_id)) AS representative_id
+           FROM temp.node_domain_map
            GROUP BY architecture_domain
-         )
-         SELECT n.*, d.architecture_domain, d.node_count, d.file_count
-         FROM domain_summaries d
+         ) d
          JOIN nodes n ON n.id = d.representative_id AND n.project = ?
          ORDER BY d.architecture_domain ASC, n.id ASC`,
       )
-      .all(project, project) as Array<CodeNodeRow & {
+      .all(project) as Array<CodeNodeRow & {
         architecture_domain: string;
         node_count: number;
         file_count: number;
       }>;
-    return rows.map((row) => ({
+    const summaries = rows.map((row) => ({
       key: row.architecture_domain,
       node_count: row.node_count,
       file_count: row.file_count,
       representative: deserializeCodeNode(row),
     }));
+    this.domainListCache = { project, revision, rows: summaries };
+    return summaries;
   }
 
   /**
@@ -700,68 +764,55 @@ export class CodeGraphReader {
     const domainKeys = [...new Set(selectedDomainKeys)].sort();
     if (domainKeys.length === 0) return [];
     const selectedDomainsJson = JSON.stringify(domainKeys);
+    const revision = this.getGraphRevision();
+    const cacheKey = `${project}\0${revision}\0${selectedDomainsJson}`;
+    const cached = this.domainDepsCache.get(cacheKey);
+    if (cached) return cached;
+    this.ensureDomainMap(project);
     const rows = this.db
       .prepare(
-        `WITH normalized_nodes AS (
-           SELECT n.id,
-             n.label,
-             TRIM(
-               CASE
-                 WHEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 2, 2) = ':/'
-                   THEN SUBSTR(REPLACE(n.file_path, CHAR(92), '/'), 4)
-                 ELSE REPLACE(n.file_path, CHAR(92), '/')
-               END,
-               '/'
-             ) AS normalized_path
-           FROM nodes n
-           WHERE n.project = ?
-         ), node_domains AS (
-           SELECT id,
-             CASE
-               WHEN normalized_path = '' THEN '(virtual)'
-               WHEN INSTR(normalized_path, '/') = 0 THEN
-                 CASE
-                   WHEN label IN ('Directory', 'Folder') THEN normalized_path
-                   ELSE '(root)'
-                 END
-               ELSE SUBSTR(normalized_path, 1, INSTR(normalized_path, '/') - 1)
-             END AS architecture_domain
-           FROM normalized_nodes
-         ), selected_domains AS (
+        `WITH selected_domains AS (
            SELECT CAST(value AS TEXT) AS key FROM json_each(?)
-         ), classified_edges AS (
-           SELECT
-             CASE WHEN source_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               THEN source_domain.architecture_domain ELSE NULL END AS source_key,
-             CASE WHEN target_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               THEN target_domain.architecture_domain ELSE NULL END AS target_key,
-             e.type
-           FROM edges e
-           JOIN node_domains source_domain ON source_domain.id = e.source_id
-           JOIN node_domains target_domain ON target_domain.id = e.target_id
-           WHERE e.project = ?
-             AND (
-               source_domain.architecture_domain IN (SELECT key FROM selected_domains)
-               OR target_domain.architecture_domain IN (SELECT key FROM selected_domains)
-             )
          )
-         SELECT source_key, target_key, type, COUNT(*) AS count
-         FROM classified_edges
+         SELECT
+           CASE WHEN sm.architecture_domain IN (SELECT key FROM selected_domains)
+             THEN sm.architecture_domain ELSE NULL END AS source_key,
+           CASE WHEN tm.architecture_domain IN (SELECT key FROM selected_domains)
+             THEN tm.architecture_domain ELSE NULL END AS target_key,
+           e.type,
+           COUNT(*) AS count
+         FROM edges e
+         JOIN temp.node_domain_map sm ON sm.node_id = e.source_id
+         JOIN temp.node_domain_map tm ON tm.node_id = e.target_id
+         WHERE e.project = ?
+           AND (
+             sm.architecture_domain IN (SELECT key FROM selected_domains)
+             OR tm.architecture_domain IN (SELECT key FROM selected_domains)
+           )
          GROUP BY source_key, target_key, type
          ORDER BY count DESC, source_key ASC, target_key ASC, type ASC`,
       )
-      .all(project, selectedDomainsJson, project) as Array<{
+      .all(selectedDomainsJson, project) as Array<{
         source_key: string | null;
         target_key: string | null;
         type: string;
         count: number;
       }>;
-    return rows.map((row) => ({
+    const summaries = rows.map((row) => ({
       source_key: row.source_key,
       target_key: row.target_key,
       type: row.type,
       count: row.count,
     }));
+    // Bounded cache: one entry per (project, revision, selection). The full
+    // edge scan behind a miss costs ~1 min on a 16M-edge drive-scale graph,
+    // so repeat /api/layout calls must not recompute the same selection.
+    if (this.domainDepsCache.size >= 8) {
+      const oldestKey = this.domainDepsCache.keys().next().value;
+      if (oldestKey !== undefined) this.domainDepsCache.delete(oldestKey);
+    }
+    this.domainDepsCache.set(cacheKey, summaries);
+    return summaries;
   }
 
   getNeighbors(nodeId: number, direction: 'in' | 'out' | 'both' = 'both', limit = 100): { edge: CodeEdge; node: CodeNode }[] {
@@ -2491,16 +2542,18 @@ export class CodeGraphReader {
     const safeLimit = Math.max(0, Math.min(10000, Math.floor(limit)));
     if (safeLimit === 0) return [];
 
+    // Ranking uses the materialized temp.node_degree table: the original
+    // correlated (SELECT COUNT(*) ...) per node re-scanned edge indexes for
+    // every candidate (1M+ nodes per label on drive-scale graphs).
+    this.ensureDerivedTables(project);
     const rows = this.db
       .prepare(
         `SELECT n.*
          FROM nodes n
+         JOIN temp.node_degree d ON d.node_id = n.id
          WHERE n.project = ? AND n.label = ?
-         ORDER BY (
-           (SELECT COUNT(*) FROM edges outgoing WHERE outgoing.source_id = n.id) +
-           (SELECT COUNT(*) FROM edges incoming WHERE incoming.target_id = n.id)
-         ) DESC, n.id ASC
-         LIMIT ?`
+         ORDER BY d.degree DESC, n.id ASC
+         LIMIT ?`,
       )
       .all(project, label, safeLimit) as CodeNodeRow[];
     return rows.map(deserializeCodeNode);
