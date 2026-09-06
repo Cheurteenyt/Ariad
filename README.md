@@ -103,6 +103,8 @@ above, or run `npm link` once if you prefer the shorter `cbm-v2` command.
 | `cbm-v2 index --project <p> --root <r>` | Index a project natively (WASM, 112 languages) |
 | `cbm-v2 index --project <p> --root <r> --incremental` | Fast incremental index (skip unchanged files) |
 | `cbm-v2 index --project <p> --root <r> --discovery-mode fast` | Explicit reduced-coverage full rebuild for benchmarks/speed-sensitive runs; incompatible with `--incremental` |
+| `cbm-v2 index --project <p> --root <r> --exclude <names...>` | Extra directory-name excludes (case-insensitive, merged with the `exclude` config field) for cache/system volumes |
+| `cbm-v2 index --project <p> --root <r> --discovery-tolerant` | ACL denials (EACCES/EPERM) become warnings + uncertain paths instead of fatal errors — for drive-scale sweeps |
 | `cbm-v2 index --project <p> --root <r> --dry-run` | Preview without writing to DB |
 | `cbm-v2 init` | Initialize `.codebase-memory.json` configuration |
 | `cbm-v2 doctor` | Run diagnostics (Node version, DB, vault path) |
@@ -248,6 +250,8 @@ V2 includes a **native code indexer** that does NOT require the V1 C binary:
 - **Parallel workers** — multi-threaded WASM parsing for large projects
 - **Semantics versioning** — `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 9`; incremental mode forces full reindex when extractor output changes
 - **Discovery completeness lock** — `DiscoveryResult` with structured errors; partial discovery preserves the existing graph (no silent wipe)
+- **Config-driven discovery excludes** (`0.78.0-alpha.2`) — the `exclude` field of `.codebase-memory.json` plus the repeatable `--exclude <name>` flag skip directories by name (case-insensitive, any depth, symlink targets included) in addition to the built-in policy; drive-scale indexes exclude cache/system volumes
+- **Tolerant discovery** (`0.78.0-alpha.2`) — `--discovery-tolerant` turns ACL denials (EACCES/EPERM) into warnings + uncertain paths that incremental runs never treat as deleted, so whole-drive sweeps are not blocked by `pagefile.sys`, other user profiles, or locked app caches
 - **Canonical root propagation** — symlinked roots produce `file_path` without `..`
 - **File identity contract** — `dev:ino` dedup with `0:0` fallback; deterministic hardlink selection
 
@@ -460,7 +464,8 @@ The primary entry points are:
 - **Local-first**: no network calls, no telemetry
 - **HUMAN NOTES preserved**: the `## HUMAN NOTES` section is never overwritten (regression-tested)
 - **Path traversal protection**: `obsidian_path` validated against `..` and backslashes; `assertPathInsideRoot` uses `path.relative` for cross-platform containment
-- **Discovery completeness lock**: partial discovery (subtree EACCES, fatal symlink errors) preserves the existing graph — no silent wipe. Broken symlinks (ENOENT) are treated as warnings, not fatal.
+- **Discovery completeness lock**: partial discovery (subtree EACCES, fatal symlink errors) preserves the existing graph — no silent wipe. Broken symlinks (ENOENT) are treated as warnings, not fatal. With `--discovery-tolerant` (`0.78.0-alpha.2`), ACL denials become warnings too, and their paths are recorded as uncertain so incremental runs never treat them as deleted.
+- **Config-driven excludes** (`0.78.0-alpha.2`): the `exclude` field of `.codebase-memory.json` (loaded from the index root) and the `--exclude <name>` flag are matched case-insensitively against every path component — system and cache volumes never enter the graph.
 - **Alias history** (R153): when a symlink alias was previously valid and is now broken, the old canonical target's data is preserved via the `alias_history` table. Prevents silent historical-target deletion.
 - **Warning propagation** (R152+R153): all discovery warnings (broken symlinks, ELOOP, TOCTOU races) are surfaced in `IndexResult.warnings` with root-relative paths. The CLI prints them even on success (`SUCCESS_WITH_WARNINGS` outcome).
 - **Typed outcome** (R153): `IndexResult.outcome` is `SUCCESS` | `SUCCESS_WITH_WARNINGS` | `STALE` | `PARTIAL` | `FAILED`. Exit codes: 0 (success), 1 (errors), 2 (stale without errors).

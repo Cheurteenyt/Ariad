@@ -2,7 +2,7 @@
 
 > **Status:** Canonical product snapshot
 > **Audience:** Users, integrators, contributors, and maintainers
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-24 at `a699e27`
+> **Last verified:** `0.78.0-alpha.2` / 2026-09-06 at `a1601d1`
 
 This document answers one question: **what is active in the product now?**
 Implementation history belongs in the [changelog](../../v2/CHANGELOG.md),
@@ -49,6 +49,14 @@ This boundary is intentional and regression-tested.
   set declared by the indexer.
 - Correctness-first full discovery by default and an explicit reduced-coverage
   fast mode for controlled benchmarks.
+- Config-driven discovery excludes (`0.78.0-alpha.2`): the `exclude` field of
+  `.codebase-memory.json` at the index root plus the repeatable
+  `--exclude <name>` CLI flag skip directories by name, case-insensitively,
+  at any depth (symlink/junction targets included) on top of the built-in
+  skip policy.
+- Tolerant discovery (`0.78.0-alpha.2`): `--discovery-tolerant` downgrades
+  EACCES/EPERM denials to warnings plus uncertain paths (never deleted by
+  incremental runs), so drive-scale sweeps survive routine ACL walls.
 - Persistent nodes, edges, call sites, imports, exports, file metadata, and
   discovery state in SQLite.
 - Cross-file call resolution is strongest for TypeScript and JavaScript.

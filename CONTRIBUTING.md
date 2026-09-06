@@ -50,7 +50,6 @@ v2/
 │   ├── config.ts       # .codebase-memory.json loader
 │   └── constants.ts    # Shared constants (no magic numbers)
 ├── tests/              # Vitest test files (see v2/CHANGELOG.md for current count)
-├── docs/               # Design documents and current state
 ├── scripts/            # Benchmarks and debug tools
 ├── package.json
 └── tsconfig.json
@@ -64,7 +63,7 @@ V2 includes a native code indexer (`v2/src/indexer/`) that does NOT require V1:
 - **`fast-walker.ts`** — AST walker for exports, imports, call-sites
 - **`cross-file-resolver.ts`** — matches call-sites to definitions across files
 - **`indexer.ts`** — orchestrator: full/incremental, parallel workers, semantic versioning
-- **`schema.ts`** — SQLite schema, `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 8`
+- **`schema.ts`** — SQLite schema, `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 9`
   (R144+). R153 added `alias_history` table for historical-target protection.
 - **`worker.ts`** — worker thread for parallel WASM parsing
 
@@ -154,7 +153,9 @@ Standard GitHub-hosted runners are free for public repositories; larger
 runners and storage follow separate billing/limits.
 
 Known gaps:
-- No Windows/macOS matrix (PKG-CARRY-01)
+- No macOS matrix (PKG-CARRY-01). Windows is covered by a targeted product,
+  lifecycle, security, and publication-invariant smoke job — see
+  `docs/reference/V2_CURRENT_STATE.md`.
 
 See [MAINTAINERS_GUIDE.md](MAINTAINERS_GUIDE.md) for the full workflow and invariants.
 See [AI_COLLABORATION_PROTOCOL.md](docs/operations/AI_COLLABORATION_PROTOCOL.md) for
