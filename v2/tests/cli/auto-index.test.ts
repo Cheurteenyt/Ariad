@@ -120,6 +120,7 @@ describe('buildWrapperContent', () => {
     });
     expect(content.startsWith('@echo off')).toBe(true);
     expect(content).toContain('"index-auto" "run"');
+    expect(content).toContain('max-old-space-size=24576');
     expect(content).toContain('"--project" "D-Systeme"');
     expect(content).toContain('"--exclude" "$RECYCLE.BIN"');
     expect(content).toContain('"--exclude" "System Volume Information"');

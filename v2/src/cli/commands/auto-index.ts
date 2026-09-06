@@ -171,7 +171,15 @@ export function buildWrapperContent(opts: {
   ];
   for (const name of opts.exclude) parts.push('--exclude', JSON.stringify(name));
   const command = parts.map((p) => (p.startsWith('"') ? p : `"${p}"`)).join(' ');
-  return `@echo off\r\n${command} >> ${JSON.stringify(opts.logPath)} 2>&1\r\n`;
+  // Drive-scale indexes (500k+ files) accumulate extraction results in memory
+  // during phase 1; the Node default heap OOM-crashes long before that. The
+  // wrapper raises the heap explicitly unless the environment already set one.
+  const lines = [
+    '@echo off',
+    `if not defined NODE_OPTIONS set "NODE_OPTIONS=--max-old-space-size=24576"`,
+    `${command} >> ${JSON.stringify(opts.logPath)} 2>&1`,
+  ];
+  return lines.join('\r\n') + '\r\n';
 }
 
 function appendLog(logPath: string, line: string): void {
