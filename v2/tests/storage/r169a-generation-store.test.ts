@@ -2251,6 +2251,7 @@ describe("R169A — Source inspection: legacy path consumers (section 18G)", () 
     "src/bridge/sqlite-ro.ts", // definition
     "src/indexer/indexer.ts",
     "src/cli/index.ts",
+    "src/cli/commands/auto-index.ts", // R185: guarded auto refresh reads the freshness column; generation store still inactive (§15)
     "src/cli/commands/watch.ts",
     "src/cli/commands/stats.ts",
     "src/cli/commands/obsidian.ts",
