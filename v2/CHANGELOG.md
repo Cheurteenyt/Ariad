@@ -2,6 +2,15 @@
 
 ## 0.78.0-alpha.3 — index-auto: scheduler-driven freshness (2026-09-06)
 
+- `--discovery-tolerant` now also bypasses the alias-integrity full-index
+  aborts (`COLD_START_LOCK`, `HISTORICAL_ALIAS_BROKEN`). Without this, a
+  scheduler-driven index deadlocks forever on a permanently broken leftover
+  junction when the volume has no resolvable alias to initialize
+  `alias_history` with (observed on a whole-C: sweep: incremental STALE ->
+  full rerun aborted by the cold-start lock -> never fresh). The tolerance
+  contract is explicit: denials and broken aliases become warnings, never
+  blockers; the removed graph nodes are rebuildable derived data.
+
 - New `cbm-v2 index-auto run` command: one freshness-gated, overlap-locked
   incremental index refresh designed to be invoked by a scheduler. The
   freshness gate skips the run when the last auto-index success is younger
