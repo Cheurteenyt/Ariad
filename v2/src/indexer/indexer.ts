@@ -69,6 +69,13 @@ export interface IndexOptions {
    * system volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...).
    */
   exclude?: string[];
+  /**
+   * Treat EACCES/EPERM discovery denials as warnings + uncertain paths
+   * instead of fatal errors. Intended for drive-scale indexes where ACL
+   * walls (system files, other profiles, locked app caches) are routine.
+   * EIO/ENOMEM/EMFILE remain fatal in this mode.
+   */
+  discoveryTolerant?: boolean;
 }
 
 /**
@@ -687,6 +694,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         canonicalRoot,
         discoveryMode,
         opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+        opts.discoveryTolerant === true,
       );
     } catch (error) {
       const discoveryMsg = (error as Error).message;
@@ -819,6 +827,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       canonicalRoot,
       discoveryMode,
       opts.exclude?.length ? new Set(opts.exclude.map((name) => name.toLowerCase())) : undefined,
+      opts.discoveryTolerant === true,
     );
   } catch (error) {
     // R141 (DATA-R141-01): discovery failed AFTER root validation — likely a

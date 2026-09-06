@@ -460,6 +460,7 @@ export function discoverSourceFilesStructured(
   canonicalRoot?: string,
   mode: DiscoveryMode = 'full',
   extraSkipDirs?: ReadonlySet<string>,
+  tolerant?: boolean,
 ): DiscoveryResult {
   // R142 (PERF-R142-01, PATH-R142-01): If the caller already validated the
   // root via assertDiscoveryRoot and passed the canonical realpath, reuse
@@ -732,6 +733,19 @@ export function discoverSourceFilesStructured(
           // The discovery MUST be marked incomplete so the indexer
           // preserves the existing graph instead of publishing a partial
           // one. R143's "skip all" behavior masked these critical errors.
+          // Drive-scale exception (--discovery-tolerant): on whole-drive
+          // sweeps EACCES/EPERM are routine ACL walls (system files, other
+          // user profiles, locked app caches), not health problems. Deny
+          // the entry, warn, and mark the path uncertain so incremental
+          // runs never treat the denied subtree as deleted. EIO/ENOMEM/
+          // EMFILE remain fatal regardless.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDenied = relative(realRoot, fullPath);
+            recordWarning(code, relDenied);
+            uncertainPaths.push(relDenied);
+            uncertainSubtrees.push(relDenied);
+            continue;
+          }
           recordError(fullPath, error);
           continue;
         }
@@ -783,7 +797,16 @@ export function discoverSourceFilesStructured(
             uncertainSubtrees.push(relTarget);
             continue;
           }
-          // EACCES, EIO, etc. — fatal.
+          // EACCES, EIO, etc. — fatal, unless discovery is tolerant (see the
+          // readdir catch above): denied symlink targets become warnings and
+          // uncertain paths on drive-scale sweeps.
+          if (tolerant && (code === 'EACCES' || code === 'EPERM')) {
+            const relDenied = relative(realRoot, realTarget);
+            recordWarning(code, relDenied);
+            uncertainPaths.push(relDenied);
+            uncertainSubtrees.push(relDenied);
+            continue;
+          }
           recordError(realTarget, error);
           continue;
         }

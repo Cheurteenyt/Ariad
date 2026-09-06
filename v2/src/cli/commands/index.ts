@@ -25,6 +25,7 @@ export function registerIndexCommand(program: Command): void {
     .option('--workers <count>', 'Number of worker threads (0 = single-threaded; default: auto)', parseWorkerCount)
     .option('--discovery-mode <mode>', 'Discovery coverage: full (default) or fast (non-incremental only)', parseDiscoveryMode, 'full')
     .option('--exclude <names...>', 'Extra directory names to exclude from discovery (repeatable, case-insensitive)')
+    .option('--discovery-tolerant', 'Treat EACCES/EPERM discovery denials as warnings + uncertain paths (drive-scale indexing)')
     .option('--allow-partial', 'R82: exit 0 even if some files fail extraction (default: exit 1 on any error)')
     .action(async (opts) => {
       const project = opts.project || deriveProjectName();
@@ -55,6 +56,7 @@ export function registerIndexCommand(program: Command): void {
           workers: opts.workers,
           discoveryMode: opts.discoveryMode,
           exclude,
+          discoveryTolerant: opts.discoveryTolerant ?? false,
         });
 
         console.log(`Result:`);

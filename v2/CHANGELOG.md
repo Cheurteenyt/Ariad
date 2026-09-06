@@ -9,7 +9,14 @@
 - The `index` CLI loads the config from the index root and passes the excludes
   to the indexer, enabling drive-scale indexes that skip cache and system
   volumes (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...). The banner now prints
-  the active exclude list.
+  the active exclude list. A repeatable `--exclude <names...>` flag merges
+  with the config excludes (needed when the root is not writable, e.g. `C:/`
+  without admin rights).
+- New `--discovery-tolerant` flag: EACCES/EPERM discovery denials become
+  warnings + uncertain paths (never deleted by incremental runs) instead of
+  fatal DISCOVERY_PARTIAL errors. Intended for drive-scale sweeps where ACL
+  walls (`pagefile.sys`, other user profiles, locked app caches) are routine.
+  EIO/ENOMEM/EMFILE remain fatal.
 
 ## 0.78.0-alpha.1 — bounded exact source lookup (2026-07-20)
 
