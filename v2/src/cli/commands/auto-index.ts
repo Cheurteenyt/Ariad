@@ -164,6 +164,7 @@ export function buildWrapperContent(opts: {
     JSON.stringify(opts.nodePath),
     JSON.stringify(opts.cliEntry),
     'index-auto',
+    'run',
     '--project', JSON.stringify(opts.project),
     '--root', JSON.stringify(opts.rootPath),
     '--min-age-hours', String(opts.minAgeHours),

@@ -119,6 +119,7 @@ describe('buildWrapperContent', () => {
       logPath: 'C:\\Users\\x\\.cache\\codebase-memory-mcp\\D-Systeme.auto.log',
     });
     expect(content.startsWith('@echo off')).toBe(true);
+    expect(content).toContain('"index-auto" "run"');
     expect(content).toContain('"--project" "D-Systeme"');
     expect(content).toContain('"--exclude" "$RECYCLE.BIN"');
     expect(content).toContain('"--exclude" "System Volume Information"');
