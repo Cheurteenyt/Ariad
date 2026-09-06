@@ -11,6 +11,7 @@ import { registerBackupCommand } from './commands/backup.js';
 import { registerDemoCommand } from './commands/demo.js';
 import { registerWatchCommand } from './commands/watch.js';
 import { registerIndexCommand } from './commands/index.js';
+import { registerAutoIndexCommand } from './commands/auto-index.js';
 import { isSupportedNodeVersion, MINIMUM_NODE_VERSION } from './node-version.js';
 import { McpServer } from '../mcp/server.js';
 import { UiServer } from '../ui/server.js';
@@ -39,6 +40,7 @@ registerBackupCommand(program);
 registerDemoCommand(program);
 registerWatchCommand(program);
 registerIndexCommand(program);
+registerAutoIndexCommand(program);
 
 program
   .command('mcp')

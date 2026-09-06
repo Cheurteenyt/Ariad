@@ -110,6 +110,7 @@ above, or run `npm link` once if you prefer the shorter `cbm-v2` command.
 | `cbm-v2 mcp` | Run as MCP server (JSON-RPC over stdio) |
 | `cbm-v2 ui [--allowed-root <paths...>]` | Start the graph UI web server (port 9749); optionally allow additional local browse/index roots |
 | `cbm-v2 watch` | Watch vault for changes and auto-sync (daemon) |
+| `cbm-v2 index-auto run/install/uninstall` | Scheduler-driven freshness: guarded incremental refresh + Windows scheduled task |
 
 Drive-scale indexes add `--exclude <names...>` (cache/system volumes) and
 `--discovery-tolerant` (ACL denials become warnings). The full option list and

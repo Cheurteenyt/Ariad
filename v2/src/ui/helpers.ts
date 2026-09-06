@@ -182,11 +182,7 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
  *     sendJson(res, 500, { error: 'Internal server error' });
  *   }
  */
-export function errorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === 'string') return e;
-  return String(e);
-}
+export { errorMessage } from '../utils/error-message.js';
 
 /**
  * Color for a code node label, used by the graph layout endpoint.
