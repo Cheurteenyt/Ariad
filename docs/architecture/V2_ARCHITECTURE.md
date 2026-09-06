@@ -2,7 +2,7 @@
 
 > **Status:** Canonical architecture
 > **Audience:** Contributors, maintainers, integrators, and auditors
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-23
+> **Last verified:** `0.78.0-alpha.2` / 2026-09-06
 >
 > R169A and R169B are merged;
 > R169B is on `main` at
@@ -51,6 +51,11 @@ extract:
 
 Key modules:
 - `v2/src/indexer/wasm-extractor.ts` — tree-sitter WASM parsing, discovery
+  (config-driven excludes: the `exclude` field of the index-root
+  `.codebase-memory.json` and the repeatable `--exclude <name>` CLI flag are
+  matched case-insensitively against every path component; `--discovery-tolerant`
+  downgrades EACCES/EPERM denials to warnings + uncertain paths for drive-scale
+  sweeps)
 - `v2/src/indexer/fast-walker.ts` — AST walker for exports/imports/calls
 - `v2/src/indexer/cross-file-resolver.ts` — matches call-sites to definitions
 - `v2/src/indexer/indexer.ts` — orchestrator: full/incremental, parallel workers
@@ -143,6 +148,12 @@ A React/Vite application (`graph-ui/`) served by the V2 backend:
 - **Projects** — project selector with graph counts and health indicators
 - **Control** — system information, logs, and owned index-job controls
 - **Real-time updates** via WebSocket where the active view requires them
+- **Drive-scale serving** (`0.78.0-alpha.2`) — the reader materializes a
+  per-revision `node → domain` temp table and a per-node degree table once per
+  graph revision (invalidated by `PRAGMA data_version`) and caches the domain
+  list and dependency summaries, so `/api/layout` pays a one-time warm-up and
+  serves repeat calls instantly on multi-million-node graphs. The graph-ui
+  layout fetch allows 300s for that warm-up.
 
 The Graph tab has one topology, one d3 simulation object, and one interaction
 model. The user-facing views are `Structure` and `Dependencies`; the persisted

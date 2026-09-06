@@ -156,5 +156,6 @@ mixing two graph states.
 ## Pre-release notice
 
 This package is not yet published to npm. The first public release will
-be a pre-release (`v0.78.0-alpha.1`) after atomic generation publication
-(R169) and project lease/fencing (R170) are complete.
+be a pre-release (the current version line is `0.78.0-alpha.2`) after
+atomic generation publication (R169) and project lease/fencing (R170)
+are complete.

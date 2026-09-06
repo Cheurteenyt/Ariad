@@ -2,7 +2,7 @@
 
 > **Status:** Canonical command reference
 > **Audience:** Users, integrators, and maintainers
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-20
+> **Last verified:** `0.78.0-alpha.2` / 2026-09-06
 >
 > See `v2/package.json` and `v2/CHANGELOG.md` for the authoritative version.
 
@@ -27,6 +27,9 @@ cbm-v2 index --project my-app --root /path/to/repo --dry-run
 # Explicit reduced-coverage discovery (benchmarks/speed-sensitive workflows)
 cbm-v2 index --project my-app --root /path/to/repo --discovery-mode fast
 
+# Drive-scale index: exclude cache/system directories and tolerate ACL walls
+cbm-v2 index --project my-system --root D:/ --exclude ai-cache --exclude '$RECYCLE.BIN' --discovery-tolerant
+
 ```
 
 **Options:**
@@ -45,6 +48,21 @@ cbm-v2 index --project my-app --root /path/to/repo --discovery-mode fast
   safely classified as deleted. Use a fast full rebuild or a full-coverage
   incremental pass.
 - `--dry-run` — Discover files and detect languages without writing to the DB. R153: warnings are now shown in dry-run. R155: dry-run with errors shows "Dry-run failed" instead of "Dry-run complete".
+- `--exclude <names...>` — Extra directory names to exclude from discovery
+  (repeatable, case-insensitive, matched against every path component in
+  addition to the built-in skip policy, including symlink/junction target
+  components). Merged with the `exclude` field of the
+  `.codebase-memory.json` found at the index root (added in `0.78.0-alpha.2`).
+  Intended for cache and system volumes that the built-in policy does not
+  cover (`ai-cache`, `$RECYCLE.BIN`, `Windows`, ...). The banner prints the
+  active exclude list.
+- `--discovery-tolerant` — Treat EACCES/EPERM discovery denials as warnings
+  plus uncertain paths (never treated as deleted by incremental runs) instead
+  of fatal `DISCOVERY_PARTIAL` errors (added in `0.78.0-alpha.2`). Intended
+  for drive-scale sweeps where ACL walls (`pagefile.sys`, other user
+  profiles, locked app caches) are routine. `EIO`/`ENOMEM`/`EMFILE` remain
+  fatal, and alias-integrity locks (`COLD_START_LOCK`,
+  `HISTORICAL_ALIAS_BROKEN`) still abort a full index.
 - `--allow-partial` — Let the explicitly non-fatal `PARTIAL` outcome exit 0 for
   a deliberately tolerant interactive run. CI should keep the strict default;
   do not add this flag merely to hide a failing gate. It never masks `FAILED`
@@ -73,6 +91,19 @@ Initialize `.codebase-memory.json` configuration file.
 ```bash
 cbm-v2 init --project my-app
 cbm-v2 init --project my-app --vault /custom/vault/path
+```
+
+**Config-driven discovery excludes** (since `0.78.0-alpha.2`): the optional
+`exclude` field lists directory names that discovery skips in addition to the
+built-in policy. Names are matched case-insensitively against every path
+component. The `index` CLI loads this file from the index root; a repeatable
+`--exclude <name>` flag merges with it (useful when the root itself is not
+writable, e.g. indexing `C:/` without admin rights).
+
+```json
+{
+  "exclude": ["ai-cache", "$RECYCLE.BIN", "System Volume Information"]
+}
 ```
 
 ### `cbm-v2 doctor`
