@@ -1,5 +1,25 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.4 — indexed edge cleanup + batched writes (2026-09-06)
+
+- New typed `edges.resolution` column (schema migration with a one-time
+  backfill from `$.resolution` in the JSON marker, and
+  `idx_edges_project_resolution`). `clearCrossFileCallEdges` now deletes by
+  column (`resolution LIKE 'cross_file%'`, `= 'cross_file_module_exact'`)
+  instead of two unindexable `properties_json LIKE` scans over the whole
+  edges table (12.7M+ rows on drive-scale graphs). The JSON marker is kept —
+  behavioral tests and consumers still see it. The backfill runs only when
+  the column is created; the `idx_edges_project_resolution` build is the
+  one-time migration cost on existing DBs.
+- Write-connection PRAGMA `synchronous = NORMAL` (WAL + rebuildable derived
+  data): removes the per-commit fsync cost of whole-drive write phases.
+- Parallel write path: single-row `INSERT`s replaced by 50-row multi-row
+  batched inserts for nodes and edges (parity with the sequential path) —
+  per-row statement overhead dominated the write phase on 1M+ row graphs.
+- Tests: resolution column default, indexed cleanup semantics (CALLS +
+  IMPORTS), legacy-DB backfill migration, and the returned cleanup count
+  (now CALLS + IMPORTS).
+
 ## 0.78.0-alpha.3 — index-auto: scheduler-driven freshness (2026-09-06)
 
 - `--discovery-tolerant` now also bypasses the alias-integrity full-index
