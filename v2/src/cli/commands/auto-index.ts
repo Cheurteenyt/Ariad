@@ -66,6 +66,10 @@ export function taskWrapperPath(project: string): string {
   return join(cbmCacheDir(), `Ariad-Index-${project}.cmd`);
 }
 
+export function taskScriptPath(project: string): string {
+  return join(cbmCacheDir(), `Ariad-Index-${project}.ps1`);
+}
+
 export function taskName(project: string): string {
   return `Ariad-Index-${project}`;
 }
@@ -153,35 +157,66 @@ export function readSuccessMarker(markerPath: string): string | null {
   }
 }
 
-export function buildWrapperContent(opts: {
+export interface WrapperFiles {
+  cmd: string;
+  ps1: string;
+}
+
+/**
+ * R188: the scheduled task runs a PowerShell watchdog that launches the CLI
+ * and kills the whole process tree if the run exceeds the runtime cap. The
+ * in-process runtime cap (timer) cannot fire when the event loop is wedged
+ * inside a native call (observed: a D: incremental hung 17h with the process
+ * paged out) — an EXTERNAL watchdog is the only reliable kill.
+ */
+/** PowerShell single-quoted literal (escape ' by doubling). */
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+export function buildWrapperFiles(opts: {
   nodePath: string;
   cliEntry: string;
   project: string;
   rootPath: string;
   minAgeHours: number;
+  maxRuntimeMinutes: number;
   exclude: string[];
   logPath: string;
-}): string {
-  const parts = [
-    JSON.stringify(opts.nodePath),
-    JSON.stringify(opts.cliEntry),
-    'index-auto',
-    'run',
-    '--project', JSON.stringify(opts.project),
-    '--root', JSON.stringify(opts.rootPath),
-    '--min-age-hours', String(opts.minAgeHours),
+}): WrapperFiles {
+  const args = [
+    psQuote(opts.cliEntry),
+    psQuote('index-auto'), psQuote('run'),
+    psQuote('--project'), psQuote(opts.project),
+    psQuote('--root'), psQuote(opts.rootPath),
+    psQuote('--min-age-hours'), psQuote(String(opts.minAgeHours)),
+    psQuote('--max-runtime-minutes'), psQuote(String(opts.maxRuntimeMinutes)),
   ];
-  for (const name of opts.exclude) parts.push('--exclude', JSON.stringify(name));
-  const command = parts.map((p) => (p.startsWith('"') ? p : `"${p}"`)).join(' ');
-  // Drive-scale indexes (500k+ files) accumulate extraction results in memory
-  // during phase 1; the Node default heap OOM-crashes long before that. The
-  // wrapper raises the heap explicitly unless the environment already set one.
-  const lines = [
+  for (const name of opts.exclude) args.push(psQuote('--exclude'), psQuote(name));
+  const argumentList = args.join(', ');
+  // Watchdog grace: the in-process runtime cap fires first when it can
+  // (clean logging + exit 3); the watchdog is the hard external kill for
+  // event-loop-wedged runs.
+  const watchdogMs = (opts.maxRuntimeMinutes + 10) * 60_000;
+  const ps1 = [
+    `$ErrorActionPreference = 'Continue'`,
+    `if (-not $env:NODE_OPTIONS) { $env:NODE_OPTIONS = '--max-old-space-size=24576' }`,
+    `if (-not $env:UV_THREADPOOL_SIZE) { $env:UV_THREADPOOL_SIZE = '64' }`,
+    `$p = Start-Process -FilePath ${psQuote(opts.nodePath)} -ArgumentList @(${argumentList}) -NoNewWindow -PassThru`,
+    `if (-not $p.WaitForExit(${watchdogMs})) {`,
+    `  taskkill /PID $p.Id /T /F | Out-Null`,
+    `  [Console]::Error.WriteLine('[index-auto] watchdog: ${opts.maxRuntimeMinutes}min cap + grace exceeded — process tree killed')`,
+    `  exit 3`,
+    `}`,
+    `exit $p.ExitCode`,
+    ``,
+  ].join('\r\n');
+  const cmd = [
     '@echo off',
-    `if not defined NODE_OPTIONS set "NODE_OPTIONS=--max-old-space-size=24576"`,
-    `${command} >> ${JSON.stringify(opts.logPath)} 2>&1`,
-  ];
-  return lines.join('\r\n') + '\r\n';
+    `powershell -NoProfile -ExecutionPolicy Bypass -File ${psQuote(taskScriptPath(opts.project))} >> ${psQuote(opts.logPath)} 2>&1`,
+    ``,
+  ].join('\r\n');
+  return { cmd, ps1 };
 }
 
 function appendLog(logPath: string, line: string): void {
@@ -254,21 +289,24 @@ export function registerAutoIndexCommand(program: Command): void {
     .option('--min-age-hours <hours>', 'Freshness gate passed to the guarded run', String(DEFAULT_MIN_AGE_HOURS))
     .option('--task-name <name>', 'Scheduled task name (default: Ariad-Index-<project>)')
     .option('--exclude <names...>', 'Extra directory names to exclude from discovery')
+    .option('--max-runtime-minutes <minutes>', 'Runtime cap baked into the wrapper (default 90; watchdog kills at cap + 10min)')
     .action((opts) => {
       if (!/^\d{2}:\d{2}$/.test(String(opts.at))) {
         throw new Error(`--at must be HH:MM, received: ${opts.at}`);
       }
-      const wrapper = taskWrapperPath(opts.project);
-      const content = buildWrapperContent({
+      const maxRuntimeMinutes = Number(opts.maxRuntimeMinutes) || 90;
+      const files = buildWrapperFiles({
         nodePath: process.execPath,
         cliEntry: resolveCliEntry(),
         project: opts.project,
         rootPath: resolve(opts.root),
         minAgeHours: Number(opts.minAgeHours) || DEFAULT_MIN_AGE_HOURS,
+        maxRuntimeMinutes,
         exclude: opts.exclude ?? [],
         logPath: autoLogPath(opts.project),
       });
-      writeFileSync(wrapper, content);
+      writeFileSync(taskWrapperPath(opts.project), files.cmd);
+      writeFileSync(taskScriptPath(opts.project), files.ps1);
       const name = opts.taskName || taskName(opts.project);
       if (process.platform !== 'win32') {
         throw new Error(
@@ -278,14 +316,15 @@ export function registerAutoIndexCommand(program: Command): void {
       }
       const result = spawnSync(
         'schtasks',
-        ['/Create', '/F', '/TN', name, '/SC', 'DAILY', '/ST', String(opts.at), '/TR', wrapper],
+        ['/Create', '/F', '/TN', name, '/SC', 'DAILY', '/ST', String(opts.at), '/TR', taskWrapperPath(opts.project)],
         { encoding: 'utf8', windowsHide: true },
       );
       if (result.status !== 0) {
         throw new Error(`schtasks /Create failed (code ${result.status}): ${(result.stdout || '') + (result.stderr || '')}`);
       }
       console.log(`Scheduled task "${name}" created (daily at ${opts.at}).`);
-      console.log(`Wrapper: ${wrapper}`);
+      console.log(`Wrapper: ${taskWrapperPath(opts.project)}`);
+      console.log(`Watchdog: ${taskScriptPath(opts.project)} (${maxRuntimeMinutes}min cap + 10min grace)`);
       console.log(`Log: ${autoLogPath(opts.project)}`);
     });
 
@@ -307,6 +346,7 @@ export function registerAutoIndexCommand(program: Command): void {
         }
       }
       rmSync(taskWrapperPath(opts.project), { force: true });
+      rmSync(taskScriptPath(opts.project), { force: true });
       console.log(`Scheduled task "${name}" removed.`);
     });
 }
