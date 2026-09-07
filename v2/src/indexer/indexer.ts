@@ -1892,11 +1892,11 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     `).run(opts.project, effectiveRoot, now, now);
   }
 
-  if (!opts.incremental) {
-    clearProjectData(db, opts.project);
-  }
-  // In incremental mode, we do NOT clear nodes/edges here. The extractor
-  // will delete old nodes for changed files before re-inserting.
+  // R187: full mode no longer clears the previous graph here. The clear moved
+  // INSIDE the streaming transaction (indexParallel) so a crash mid-stream
+  // rolls back to the previous graph instead of leaving an empty one.
+  // In incremental mode, the extractor deletes old nodes for changed files
+  // before re-inserting (per batch).
 
   // R154 (ALIAS-R154-02): Contribution filter. Only persist resolved aliases
   // that actually contributed code to the graph. A file alias is contributive
@@ -1977,6 +1977,15 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // to preload. This saves Parser.init() + Language.load() cost on LARGE.
   // R86: Bug 28 fix — use estimatedFilesToIndex, not files.length
   const useParallel = numWorkers > 1 && estimatedFilesToIndex > 20;
+
+  // R187: full-mode graph clear. The parallel path clears INSIDE its
+  // streaming transaction (crash = rollback to the previous graph); the
+  // sequential path (workers ≤ 1) still clears here, before its own
+  // atomic extraction transaction. Incremental never clears (per-file
+  // deletes only).
+  if (!opts.incremental && !useParallel) {
+    clearProjectData(db, opts.project);
+  }
 
   // R104/R105: Bug 37 fix — detect deleted files in incremental mode.
   // R105: use nodes ∪ file_hashes to catch legacy DBs where file_hashes
@@ -2880,7 +2889,15 @@ async function indexParallel(
     }
 
     // Split into batches of ~ceil(files / numWorkers) per language
-    const batchSize = Math.max(1, Math.ceil(filesToIndex.length / numWorkers));
+    // R187: cap batch size in FILES, not just worker count. The dominant
+    // language previously produced exactly numWorkers gigantic batches
+    // (6-7k files each on whole-drive indexes): each batch result held
+    // hundreds of MB of nodes/edges/call-sites, and 16 in-flight results
+    // plus their postMessage clones peaked the heap at 24GB. A fixed file
+    // cap keeps in-flight memory bounded (~750 files ≈ 40-50MB per result)
+    // and balances load when one huge generated file shares a batch with
+    // thousands of small ones.
+    const batchSize = Math.max(1, Math.min(Math.ceil(filesToIndex.length / numWorkers), 750));
     for (let i = 0; i < filesToIndex.length; i += batchSize) {
       batches.push({
         files: filesToIndex.slice(i, i + batchSize),
@@ -2915,295 +2932,218 @@ async function indexParallel(
     return { nodes: 0, edges: 0, files: 0, skipped: totalSkipped, errors: [], languages, crossFileCallsResolved: false };
   }
 
-  // Dispatch batches to workers. Pass the file URL directly: URL.pathname is
-  // not a native Windows path ("/D:/..."), and feeding it through node:path
-  // can make Worker resolve it as "D:\\D:\\...".
+  // R187: STREAMING WRITE — results are written to SQLite in dispatch order
+  // inside one manual transaction (BEGIN at the first write, COMMIT after the
+  // resolver). Worker results are held only in a bounded reorder buffer
+  // (≤ numWorkers batches); the old code accumulated every batch result in
+  // RAM (29GB peaks on drive-scale graphs) and re-loaded everything again in
+  // the resolver while those results were still referenced. The data now
+  // lives in the open transaction (WAL on disk) instead of the JS heap.
+  //
+  // Atomicity: the full-mode clear of the previous graph moved INSIDE the
+  // transaction (it used to run in its own transaction before dispatch), so a
+  // crash mid-stream now ROLLS BACK to the previous graph instead of leaving
+  // an empty one. Determinism (R81 Bug 19): batches are consumed strictly in
+  // dispatch sequence — batches[] is built deterministically (sorted
+  // discovery, Map insertion order) and each batch's files are already in
+  // sorted order, so ID assignment is deterministic without the post-hoc
+  // results sort.
   const workerUrl = new URL('./worker.js', import.meta.url);
-  const results: WorkerBatchResult[] = [];
   const errors: Array<{ file: string; error: string }> = [];
-  let batchIndex = 0;
-
-  // Process batches with a pool of workers
-  const workerPromises: Promise<void>[] = [];
-
-  for (let w = 0; w < Math.min(numWorkers, batches.length); w++) {
-    workerPromises.push((async () => {
-      while (batchIndex < batches.length) {
-        const myBatch = batches[batchIndex++];
-        if (!myBatch) break;
-
-        try {
-          const result = await runWorker(workerUrl, myBatch);
-          results.push(result);
-        } catch (e: unknown) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          for (const f of myBatch.files) {
-            errors.push({ file: nodeRelative(rootPath, f), error: errMsg });
-          }
-        }
-      }
-    })());
-  }
-
-  await Promise.all(workerPromises);
-
-  // R81: Bug 19 fix — sort worker results by batch order and file path for
-  // deterministic node IDs. Without this, worker scheduling order determines
-  // which batch gets IDs 1..N vs N+1..2N, making benchmarks non-reproducible.
-  results.sort((a, b) => {
-    // Sort by language first (batches are per-language), then by first file path
-    const langCmp = a.language.localeCompare(b.language);
-    if (langCmp !== 0) return langCmp;
-    const aFirst = a.results[0]?.filePath ?? '';
-    const bFirst = b.results[0]?.filePath ?? '';
-    return aFirst.localeCompare(bFirst);
-  });
-  for (const batchResult of results) {
-    batchResult.results.sort((a, b) => a.filePath.localeCompare(b.filePath));
-  }
-
-  // Collect all results and write to SQLite in a single transaction
   let nodeCount = 0;
   let edgeCount = 0;
   let fileCount = 0;
-  // R106: tracks whether cross-file CALLS resolution ran successfully.
   let crossFileResolved = false;
-
-  // Build a global QN→ID map for edge resolution
   const qnToId = new Map<string, number>();
+  const callSitesInitialized = isCallSitesInitialized(db, project);
 
-  // R80: Bug 10 fix — INSERT with explicit id. The old code used
-  // nextNodeId=1 and relied on SQLite auto-assigning 1..N, which only works
-  // on an empty table. In incremental/multi-project, real IDs are MAX(id)+1.
-  // R186: single-row prepared statements replaced by multi-row batched
-  // INSERTs inside the transaction (see INSERT_BATCH below).
+  // Per-path lookup maps for the incremental filters (avoid O(n) scans per batch).
+  const pendingChangedSet = new Set(allPendingChangedRelPaths);
+  const pendingHashByPath = new Map(allPendingHashUpdates.map(h => [h.relPath, h]));
 
-  const tx = db.transaction(() => {
-    // R82: Bug 21 fix — filter changedRelPaths and hashUpdates to only successful
-    // files. Previously (R81), all changed files were scheduled for delete+hash
-    // update BEFORE workers ran. A worker failure would still delete old nodes
-    // and update the hash, causing silent corruption.
-    const successfulRelPaths = new Set<string>();
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
-        if (!fileResult.error) {
-          successfulRelPaths.add(fileResult.filePath);
+  const INSERT_BATCH = 50;
+  let txOpen = false;
+  let fullCleared = false;
+  let nextNodeId = 0;
+  let nextSeq = 0;
+  const reorder = new Map<number, { batch: WorkerBatch; result: WorkerBatchResult | null }>();
+  // Worker edges are same-file (CONTAINS, intra-file CALLS); any edge whose
+  // endpoints were not written yet is parked here and retried once after the
+  // last batch (defensive — the resolver owns genuinely cross-file edges).
+  const deferredEdges: Array<{ sourceQn: string; targetQn: string; type: string; properties: string }> = [];
+
+  const beginTxIfNeeded = (): void => {
+    if (txOpen) return;
+    db.exec('BEGIN IMMEDIATE');
+    txOpen = true;
+    if (!incremental && !fullCleared) {
+      // Full mode: clear the previous graph INSIDE the transaction (moved from
+      // the pre-dispatch clearProjectData) — crash = rollback = previous graph.
+      db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
+      db.prepare('DELETE FROM edges WHERE project = ?').run(project);
+      db.prepare('DELETE FROM file_hashes WHERE project = ?').run(project);
+      db.prepare('DELETE FROM call_sites WHERE project = ?').run(project);
+      db.prepare('DELETE FROM imports WHERE project = ?').run(project);
+      db.prepare('DELETE FROM exports WHERE project = ?').run(project);
+      fullCleared = true;
+    }
+    nextNodeId = (db.prepare('SELECT COALESCE(MAX(id), 0) AS max_id FROM nodes').get() as { max_id: number }).max_id + 1;
+  };
+
+  const flushNodeRows = (rows: Array<{
+    nodeId: number; label: string; name: string; qualifiedName: string;
+    filePath: string; startLine: number; endLine: number; properties: string;
+  }>): void => {
+    if (rows.length === 0) return;
+    const placeholders = rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+    const stmt = db.prepare(
+      `INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json) VALUES ${placeholders}`,
+    );
+    const params: unknown[] = [];
+    for (const n of rows) {
+      params.push(n.nodeId, project, n.label, n.name, n.qualifiedName, n.filePath, n.startLine, n.endLine, n.properties);
+    }
+    stmt.run(...params);
+  };
+
+  const flushEdgeRows = (rows: Array<{ sourceId: number; targetId: number; type: string; properties: string }>): void => {
+    if (rows.length === 0) return;
+    const placeholders = rows.map(() => '(?, ?, ?, ?, ?)').join(', ');
+    const stmt = db.prepare(
+      `INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`,
+    );
+    const params: unknown[] = [];
+    for (const e of rows) {
+      params.push(project, e.sourceId, e.targetId, e.type, e.properties);
+    }
+    stmt.run(...params);
+  };
+
+  const writeBatchInTx = (result: WorkerBatchResult): void => {
+    beginTxIfNeeded();
+
+    const successfulRelPaths: string[] = [];
+    for (const fileResult of result.results) {
+      if (fileResult.error) {
+        errors.push({ file: fileResult.filePath, error: fileResult.error });
+        continue;
+      }
+      successfulRelPaths.push(fileResult.filePath);
+      fileCount++;
+    }
+
+    // R80/R82: incremental — delete old nodes/edges for changed files of THIS
+    // batch that succeeded, before re-inserting them.
+    if (incremental) {
+      const changedOk = successfulRelPaths.filter(p => pendingChangedSet.has(p));
+      if (changedOk.length > 0) {
+        const ph = changedOk.map(() => '?').join(',');
+        const oldNodeIds = db.prepare(
+          `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
+        ).all(project, ...changedOk) as Array<{ id: number }>;
+        if (oldNodeIds.length > 0) {
+          const idPh = oldNodeIds.map(() => '?').join(',');
+          const idParams = oldNodeIds.map(r => r.id);
+          db.prepare(
+            `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
+          ).run(project, ...idParams, ...idParams);
         }
-      }
-    }
-    const changedToApply = allPendingChangedRelPaths.filter(p => successfulRelPaths.has(p));
-    const hashesToApply = allPendingHashUpdates.filter(h => successfulRelPaths.has(h.relPath));
-
-    // R80: Bug 11 fix — for incremental mode, delete old nodes/edges for changed
-    // files BEFORE inserting new ones. R82: only for SUCCESSFUL files.
-    if (incremental && changedToApply.length > 0) {
-      const ph = changedToApply.map(() => '?').join(',');
-      const oldNodeIds = db.prepare(
-        `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
-      ).all(project, ...changedToApply) as Array<{ id: number }>;
-      if (oldNodeIds.length > 0) {
-        const idPh = oldNodeIds.map(() => '?').join(',');
-        const idParams = oldNodeIds.map(r => r.id);
         db.prepare(
-          `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
-        ).run(project, ...idParams, ...idParams);
+          `DELETE FROM nodes WHERE project = ? AND file_path IN (${ph})`
+        ).run(project, ...changedOk);
       }
-      db.prepare(
-        `DELETE FROM nodes WHERE project = ? AND file_path IN (${ph})`
-      ).run(project, ...changedToApply);
     }
 
-    // R80: Bug 10 fix — get real MAX(id) so explicit IDs match SQLite reality.
-    const maxNodeRow = db.prepare('SELECT COALESCE(MAX(id), 0) AS max_id FROM nodes').get() as { max_id: number };
-    let nextNodeId = maxNodeRow.max_id + 1;
-
-    // R186: multi-row batched inserts (parity with the sequential path's
-    // 50-row INSERTs) — per-row .run() on 1M+ nodes/edges dominates the write
-    // phase at drive scale. IDs are assigned in JS (explicit id column), so
-    // qnToId stays deterministic.
-    const INSERT_BATCH = 50;
-
-    // First pass: insert all nodes and build QN→ID map
-    const pendingNodes: Array<{
+    // Nodes (multi-row, bounded chunks; IDs assigned in sequence order).
+    const nodeRows: Array<{
       nodeId: number; label: string; name: string; qualifiedName: string;
       filePath: string; startLine: number; endLine: number; properties: string;
     }> = [];
-    const nodeColumns = '(?, ?, ?, ?, ?, ?, ?, ?, ?)';
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
-        if (fileResult.error) {
-          errors.push({ file: fileResult.filePath, error: fileResult.error });
+    for (const fileResult of result.results) {
+      if (fileResult.error) continue;
+      for (const node of fileResult.nodes) {
+        const nodeId = nextNodeId++;
+        nodeRows.push({
+          nodeId, label: node.label, name: node.name, qualifiedName: node.qualifiedName,
+          filePath: node.filePath, startLine: node.startLine, endLine: node.endLine,
+          properties: node.properties,
+        });
+        qnToId.set(node.qualifiedName, nodeId);
+        nodeCount++;
+        if (nodeRows.length >= INSERT_BATCH) {
+          flushNodeRows(nodeRows);
+          nodeRows.length = 0;
+        }
+      }
+    }
+    flushNodeRows(nodeRows);
+
+    // Edges (multi-row; same-file edges resolve immediately, anything else is
+    // deferred to the post-drain fallback below).
+    const edgeRows: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
+    for (const fileResult of result.results) {
+      if (fileResult.error) continue;
+      for (const edge of fileResult.edges) {
+        const sourceId = qnToId.get(edge.sourceQn);
+        const targetId = qnToId.get(edge.targetQn);
+        if (!sourceId || !targetId) {
+          deferredEdges.push({ sourceQn: edge.sourceQn, targetQn: edge.targetQn, type: edge.type, properties: edge.properties });
           continue;
         }
-
-        for (const node of fileResult.nodes) {
-          const nodeId = nextNodeId++;
-          pendingNodes.push({
-            nodeId, label: node.label, name: node.name, qualifiedName: node.qualifiedName,
-            filePath: node.filePath, startLine: node.startLine, endLine: node.endLine,
-            properties: node.properties,
-          });
-          qnToId.set(node.qualifiedName, nodeId);
-          nodeCount++;
-          if (pendingNodes.length >= INSERT_BATCH) {
-            const placeholders = pendingNodes.map(() => nodeColumns).join(', ');
-            const stmt = db.prepare(
-              `INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json) VALUES ${placeholders}`,
-            );
-            const params: unknown[] = [];
-            for (const n of pendingNodes) {
-              params.push(n.nodeId, project, n.label, n.name, n.qualifiedName, n.filePath, n.startLine, n.endLine, n.properties);
-            }
-            stmt.run(...params);
-            pendingNodes.length = 0;
-          }
-        }
-        fileCount++;
-      }
-    }
-    if (pendingNodes.length > 0) {
-      const placeholders = pendingNodes.map(() => nodeColumns).join(', ');
-      const stmt = db.prepare(
-        `INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json) VALUES ${placeholders}`,
-      );
-      const params: unknown[] = [];
-      for (const n of pendingNodes) {
-        params.push(n.nodeId, project, n.label, n.name, n.qualifiedName, n.filePath, n.startLine, n.endLine, n.properties);
-      }
-      stmt.run(...params);
-      pendingNodes.length = 0;
-    }
-
-    // Second pass: insert edges, resolving QNs to IDs
-    const pendingEdges: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
-    const edgeColumns = '(?, ?, ?, ?, ?)';
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
-        if (fileResult.error) continue;
-
-        for (const edge of fileResult.edges) {
-          const sourceId = qnToId.get(edge.sourceQn);
-          const targetId = qnToId.get(edge.targetQn);
-          if (sourceId && targetId) {
-            pendingEdges.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
-            edgeCount++;
-            if (pendingEdges.length >= INSERT_BATCH) {
-              const placeholders = pendingEdges.map(() => edgeColumns).join(', ');
-              const stmt = db.prepare(
-                `INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`,
-              );
-              const params: unknown[] = [];
-              for (const e of pendingEdges) {
-                params.push(project, e.sourceId, e.targetId, e.type, e.properties);
-              }
-              stmt.run(...params);
-              pendingEdges.length = 0;
-            }
-          }
+        edgeRows.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
+        edgeCount++;
+        if (edgeRows.length >= INSERT_BATCH) {
+          flushEdgeRows(edgeRows);
+          edgeRows.length = 0;
         }
       }
     }
-    if (pendingEdges.length > 0) {
-      const placeholders = pendingEdges.map(() => edgeColumns).join(', ');
-      const stmt = db.prepare(
-        `INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`,
-      );
-      const params: unknown[] = [];
-      for (const e of pendingEdges) {
-        params.push(project, e.sourceId, e.targetId, e.type, e.properties);
-      }
-      stmt.run(...params);
-      pendingEdges.length = 0;
-    }
+    flushEdgeRows(edgeRows);
 
-    // R82: Bug 21 fix — upsert file hashes ONLY for successful files.
-    // R80: only after all nodes/edges are inserted.
-    // R83: P3 perf — prepare statement once outside the loop
+    // Hashes: full mode → hashInfo from workers; incremental → changed files
+    // that succeeded; metadata-only updates once at tx open.
     const upsertHash = db.prepare(`
       INSERT INTO file_hashes (project, file_path, content_hash, mtime, mtime_ns, size, indexed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project, file_path) DO UPDATE SET
         content_hash = excluded.content_hash, mtime = excluded.mtime, mtime_ns = excluded.mtime_ns, size = excluded.size, indexed_at = excluded.indexed_at
     `);
-    // R86: Bug 29 fix — in full mode, allPendingHashUpdates is empty because
-    // hashes were only collected in the `if (incremental)` block. Now workers
-    // return hashInfo, so we can store hashes for all successful files in full
-    // mode too. This is critical: without it, the first incremental after a
-    // full parallel index re-indexes everything (no hashes to compare against).
     if (!incremental) {
-      // Full mode: use hashInfo from workers for all successful files
-      for (const batchResult of results) {
-        for (const fileResult of batchResult.results) {
-          if (fileResult.error || !fileResult.hashInfo) continue;
-          upsertHash.run(project, fileResult.filePath, fileResult.hashInfo.hash,
-            fileResult.hashInfo.mtime, fileResult.hashInfo.mtimeNs,
-            fileResult.hashInfo.size, new Date().toISOString());
-        }
+      for (const fileResult of result.results) {
+        if (fileResult.error || !fileResult.hashInfo) continue;
+        upsertHash.run(project, fileResult.filePath, fileResult.hashInfo.hash,
+          fileResult.hashInfo.mtime, fileResult.hashInfo.mtimeNs,
+          fileResult.hashInfo.size, new Date().toISOString());
       }
     } else {
-      // Incremental mode: only upsert hashes for changed files that succeeded
-      for (const h of hashesToApply) {
+      for (const relPath of successfulRelPaths) {
+        const h = pendingHashByPath.get(relPath);
+        if (h) upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
+      }
+      for (const h of allMetadataOnlyHashUpdates) {
         upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
       }
-    }
-    // R84: Bug 25 — metadata-only updates for parallel path (incremental only)
-    for (const h of allMetadataOnlyHashUpdates) {
-      upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
+      allMetadataOnlyHashUpdates.length = 0;
     }
 
-    // R106: Cross-file CALLS resolution via persistent call_sites table.
-    //
-    // Full mode:
-    //   1. call_sites for the project were cleared by clearProjectData() before
-    //      extraction. Now we insert all new call_sites from worker results.
-    //   2. Then rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges
-    //      from the persistent table + all current nodes.
-    //   3. Mark call_sites_initialized=1 (R107).
-    //
-    // Incremental mode:
-    //   1. Delete call_sites for changed files (changedToApply).
-    //   2. Insert new call_sites from worker results (only changed files).
-    //   3. rebuildCrossFileCallsEdges() rebuilds ALL cross-file CALLS edges from
-    //      the persistent table (has call_sites for both changed and unchanged
-    //      files) + all current nodes (has nodes for both changed and unchanged).
-    //   4. crossFileCallsStale = false (no longer stale!).
-    //
-    // R107: legacy DB detection now uses isCallSitesInitialized() instead of
-    // hasCallSites(). See cross-file-resolver.ts for explanation.
-
-    // R107: capture initialized flag BEFORE inserting new call_sites.
-    const callSitesInitialized = isCallSitesInitialized(db, project);
-
-    // Step 1: collect new call_sites from worker results.
-    const newCallSites: UnresolvedCallSite[] = [];
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
-        if (fileResult.error || !fileResult.unresolvedCalls) continue;
-        newCallSites.push(...fileResult.unresolvedCalls);
-      }
-    }
-
-    // Step 2: persist call_sites.
+    // call_sites / imports / exports: per-batch replace (incremental deletes
+    // only this batch's changed files; full mode inserts into cleared tables).
+    const batchChangedOk = incremental
+      ? successfulRelPaths.filter(p => pendingChangedSet.has(p))
+      : [];
     if (incremental) {
-      // Delete + re-insert call_sites for changed files only.
-      // call_sites for unchanged files remain in the table.
-      replaceCallSitesForFiles(db, project, changedToApply, newCallSites);
-    } else {
-      // Full mode: table was cleared by clearProjectData. Just insert.
-      replaceCallSitesForFiles(db, project, [], newCallSites);
-    }
-
-    // R110: persist imports (same pattern as call_sites).
-    // R111: also persist default export QN as a marker row.
-    const newImports: ImportBinding[] = [];
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
+      const batchSites: UnresolvedCallSite[] = [];
+      for (const fileResult of result.results) {
+        if (fileResult.error || !fileResult.unresolvedCalls) continue;
+        batchSites.push(...fileResult.unresolvedCalls);
+      }
+      replaceCallSitesForFiles(db, project, batchChangedOk, batchSites);
+      const batchImports: ImportBinding[] = [];
+      for (const fileResult of result.results) {
         if (fileResult.error || !fileResult.imports) continue;
-        newImports.push(...fileResult.imports);
-        // R111/R132: store default export QN + count as a marker row.
-        // R132: count stored in source_module for collision detection.
+        batchImports.push(...fileResult.imports);
         if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
-          newImports.push({
+          batchImports.push({
             localName: '__default_export__',
             sourceModule: String(fileResult.defaultExportCount),
             importedName: fileResult.defaultExportQn || '',
@@ -3213,36 +3153,109 @@ async function indexParallel(
           });
         }
       }
-    }
-    if (incremental) {
-      replaceImportsForFiles(db, project, changedToApply, newImports);
-    } else {
-      replaceImportsForFiles(db, project, [], newImports);
-    }
-
-    // R119: persist exports (same pattern as imports).
-    const newExports: ExportBinding[] = [];
-    for (const batchResult of results) {
-      for (const fileResult of batchResult.results) {
+      replaceImportsForFiles(db, project, batchChangedOk, batchImports);
+      const batchExports: ExportBinding[] = [];
+      for (const fileResult of result.results) {
         if (fileResult.error || !fileResult.exports) continue;
-        newExports.push(...fileResult.exports);
+        batchExports.push(...fileResult.exports);
       }
-    }
-    if (incremental) {
-      replaceExportsForFiles(db, project, changedToApply, newExports);
+      replaceExportsForFiles(db, project, batchChangedOk, batchExports);
     } else {
-      replaceExportsForFiles(db, project, [], newExports);
+      const batchSites: UnresolvedCallSite[] = [];
+      for (const fileResult of result.results) {
+        if (fileResult.error || !fileResult.unresolvedCalls) continue;
+        batchSites.push(...fileResult.unresolvedCalls);
+      }
+      replaceCallSitesForFiles(db, project, [], batchSites);
+      const batchImports: ImportBinding[] = [];
+      for (const fileResult of result.results) {
+        if (fileResult.error || !fileResult.imports) continue;
+        batchImports.push(...fileResult.imports);
+        if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
+          batchImports.push({
+            localName: '__default_export__',
+            sourceModule: String(fileResult.defaultExportCount),
+            importedName: fileResult.defaultExportQn || '',
+            importKind: 'default_export',
+            line: 0,
+            filePath: fileResult.filePath,
+          });
+        }
+      }
+      replaceImportsForFiles(db, project, [], batchImports);
+      const batchExports: ExportBinding[] = [];
+      for (const fileResult of result.results) {
+        if (fileResult.error || !fileResult.exports) continue;
+        batchExports.push(...fileResult.exports);
+      }
+      replaceExportsForFiles(db, project, [], batchExports);
+    }
+  };
+
+  const tryFlush = (): void => {
+    while (reorder.has(nextSeq)) {
+      const item = reorder.get(nextSeq)!;
+      reorder.delete(nextSeq);
+      nextSeq++;
+      if (item.result) writeBatchInTx(item.result);
+    }
+  };
+
+  // Process batches with a pool of workers
+  const workerPromises: Promise<void>[] = [];
+  let batchIndex = 0;
+
+  for (let w = 0; w < Math.min(numWorkers, batches.length); w++) {
+    workerPromises.push((async () => {
+      while (batchIndex < batches.length) {
+        const mySeq = batchIndex++;
+        const myBatch = batches[mySeq];
+        if (!myBatch) break;
+
+        try {
+          const result = await runWorker(workerUrl, myBatch);
+          reorder.set(mySeq, { batch: myBatch, result });
+          tryFlush();
+        } catch (e: unknown) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          for (const f of myBatch.files) {
+            errors.push({ file: nodeRelative(rootPath, f), error: errMsg });
+          }
+          reorder.set(mySeq, { batch: myBatch, result: null });
+          tryFlush();
+        }
+      }
+    })());
+  }
+
+  await Promise.all(workerPromises);
+  tryFlush();
+
+  // Close the streaming transaction: unresolved-edge fallback, resolver
+  // rebuild, then COMMIT. A thrown error rolls back (old graph preserved)
+  // and propagates so the caller marks the project stale.
+  try {
+    beginTxIfNeeded();
+
+    // Defensive fallback: edges deferred because their endpoints lived in a
+    // later batch (rare — worker edges are same-file).
+    if (deferredEdges.length > 0) {
+      const edgeRows: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
+      for (const edge of deferredEdges) {
+        const sourceId = qnToId.get(edge.sourceQn);
+        const targetId = qnToId.get(edge.targetQn);
+        if (!sourceId || !targetId) continue;
+        edgeRows.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
+        edgeCount++;
+        if (edgeRows.length >= INSERT_BATCH) {
+          flushEdgeRows(edgeRows);
+          edgeRows.length = 0;
+        }
+      }
+      flushEdgeRows(edgeRows);
+      deferredEdges.length = 0;
     }
 
-    // Step 3: rebuild cross-file CALLS edges.
-    // R108: when callSitesInitialized=true, ALWAYS run rebuildCrossFileCallsEdges
-    // (even if call_sites is empty). See wasm-extractor.ts for full explanation.
-    // R109: when callSitesInitialized=true && nodesCount=0, mark resolved=true
-    // without calling rebuild (empty graph is complete).
-    // R126: pass semanticsCurrent. Full mode → true (fresh extraction).
-    // R127: MIG-R127-03 — when semantics are stale (incremental with old
-    // extractor_semantics_version), DON'T run the resolver. Delete cross-file
-    // edges and leave crossFileResolved=false so the caller sets stale=true.
     if (incremental) {
       const nodesCount = (db.prepare('SELECT COUNT(*) AS c FROM nodes WHERE project = ?').get(project) as { c: number }).c;
       const semCurrent = (db.prepare('SELECT extractor_semantics_version AS v FROM projects WHERE name = ?').get(project) as { v?: number } | undefined)?.v === CURRENT_EXTRACTOR_SEMANTICS_VERSION;
@@ -3269,8 +3282,16 @@ async function indexParallel(
       edgeCount += added;
       crossFileResolved = true;
     }
-  });
-  tx();
+
+    db.exec('COMMIT');
+    txOpen = false;
+  } catch (error) {
+    if (txOpen) {
+      try { db.exec('ROLLBACK'); } catch { /* connection-level failure — close path handles it */ }
+      txOpen = false;
+    }
+    throw error;
+  }
 
   return { nodes: nodeCount, edges: edgeCount, files: fileCount, skipped: totalSkipped, errors, languages, crossFileCallsResolved: crossFileResolved };
 }
