@@ -1978,6 +1978,15 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // R86: Bug 28 fix — use estimatedFilesToIndex, not files.length
   const useParallel = numWorkers > 1 && estimatedFilesToIndex > 20;
 
+  // R187: full-mode graph clear. The parallel path clears INSIDE its
+  // streaming transaction (crash = rollback to the previous graph); the
+  // sequential path (workers ≤ 1) still clears here, before its own
+  // atomic extraction transaction. Incremental never clears (per-file
+  // deletes only).
+  if (!opts.incremental && !useParallel) {
+    clearProjectData(db, opts.project);
+  }
+
   // R104/R105: Bug 37 fix — detect deleted files in incremental mode.
   // R105: use nodes ∪ file_hashes to catch legacy DBs where file_hashes
   // may be incomplete (pre-R79 full mode didn't store hashes).
