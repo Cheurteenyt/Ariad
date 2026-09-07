@@ -2975,14 +2975,8 @@ async function indexParallel(
   // R80: Bug 10 fix — INSERT with explicit id. The old code used
   // nextNodeId=1 and relied on SQLite auto-assigning 1..N, which only works
   // on an empty table. In incremental/multi-project, real IDs are MAX(id)+1.
-  const insertNode = db.prepare(`
-    INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertEdge = db.prepare(`
-    INSERT INTO edges (project, source_id, target_id, type, properties_json)
-    VALUES (?, ?, ?, ?, ?)
-  `);
+  // R186: single-row prepared statements replaced by multi-row batched
+  // INSERTs inside the transaction (see INSERT_BATCH below).
 
   const tx = db.transaction(() => {
     // R82: Bug 21 fix — filter changedRelPaths and hashUpdates to only successful
@@ -3023,7 +3017,18 @@ async function indexParallel(
     const maxNodeRow = db.prepare('SELECT COALESCE(MAX(id), 0) AS max_id FROM nodes').get() as { max_id: number };
     let nextNodeId = maxNodeRow.max_id + 1;
 
+    // R186: multi-row batched inserts (parity with the sequential path's
+    // 50-row INSERTs) — per-row .run() on 1M+ nodes/edges dominates the write
+    // phase at drive scale. IDs are assigned in JS (explicit id column), so
+    // qnToId stays deterministic.
+    const INSERT_BATCH = 50;
+
     // First pass: insert all nodes and build QN→ID map
+    const pendingNodes: Array<{
+      nodeId: number; label: string; name: string; qualifiedName: string;
+      filePath: string; startLine: number; endLine: number; properties: string;
+    }> = [];
+    const nodeColumns = '(?, ?, ?, ?, ?, ?, ?, ?, ?)';
     for (const batchResult of results) {
       for (const fileResult of batchResult.results) {
         if (fileResult.error) {
@@ -3033,18 +3038,45 @@ async function indexParallel(
 
         for (const node of fileResult.nodes) {
           const nodeId = nextNodeId++;
-          insertNode.run(
-            nodeId, project, node.label, node.name, node.qualifiedName, node.filePath,
-            node.startLine, node.endLine, node.properties
-          );
+          pendingNodes.push({
+            nodeId, label: node.label, name: node.name, qualifiedName: node.qualifiedName,
+            filePath: node.filePath, startLine: node.startLine, endLine: node.endLine,
+            properties: node.properties,
+          });
           qnToId.set(node.qualifiedName, nodeId);
           nodeCount++;
+          if (pendingNodes.length >= INSERT_BATCH) {
+            const placeholders = pendingNodes.map(() => nodeColumns).join(', ');
+            const stmt = db.prepare(
+              `INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json) VALUES ${placeholders}`,
+            );
+            const params: unknown[] = [];
+            for (const n of pendingNodes) {
+              params.push(n.nodeId, project, n.label, n.name, n.qualifiedName, n.filePath, n.startLine, n.endLine, n.properties);
+            }
+            stmt.run(...params);
+            pendingNodes.length = 0;
+          }
         }
         fileCount++;
       }
     }
+    if (pendingNodes.length > 0) {
+      const placeholders = pendingNodes.map(() => nodeColumns).join(', ');
+      const stmt = db.prepare(
+        `INSERT INTO nodes (id, project, label, name, qualified_name, file_path, start_line, end_line, properties_json) VALUES ${placeholders}`,
+      );
+      const params: unknown[] = [];
+      for (const n of pendingNodes) {
+        params.push(n.nodeId, project, n.label, n.name, n.qualifiedName, n.filePath, n.startLine, n.endLine, n.properties);
+      }
+      stmt.run(...params);
+      pendingNodes.length = 0;
+    }
 
     // Second pass: insert edges, resolving QNs to IDs
+    const pendingEdges: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
+    const edgeColumns = '(?, ?, ?, ?, ?)';
     for (const batchResult of results) {
       for (const fileResult of batchResult.results) {
         if (fileResult.error) continue;
@@ -3053,11 +3085,35 @@ async function indexParallel(
           const sourceId = qnToId.get(edge.sourceQn);
           const targetId = qnToId.get(edge.targetQn);
           if (sourceId && targetId) {
-            insertEdge.run(project, sourceId, targetId, edge.type, edge.properties);
+            pendingEdges.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
             edgeCount++;
+            if (pendingEdges.length >= INSERT_BATCH) {
+              const placeholders = pendingEdges.map(() => edgeColumns).join(', ');
+              const stmt = db.prepare(
+                `INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`,
+              );
+              const params: unknown[] = [];
+              for (const e of pendingEdges) {
+                params.push(project, e.sourceId, e.targetId, e.type, e.properties);
+              }
+              stmt.run(...params);
+              pendingEdges.length = 0;
+            }
           }
         }
       }
+    }
+    if (pendingEdges.length > 0) {
+      const placeholders = pendingEdges.map(() => edgeColumns).join(', ');
+      const stmt = db.prepare(
+        `INSERT INTO edges (project, source_id, target_id, type, properties_json) VALUES ${placeholders}`,
+      );
+      const params: unknown[] = [];
+      for (const e of pendingEdges) {
+        params.push(project, e.sourceId, e.targetId, e.type, e.properties);
+      }
+      stmt.run(...params);
+      pendingEdges.length = 0;
     }
 
     // R82: Bug 21 fix — upsert file hashes ONLY for successful files.

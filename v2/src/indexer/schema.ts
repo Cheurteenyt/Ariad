@@ -162,7 +162,8 @@ const SCHEMA_SQL = `
     source_id INTEGER NOT NULL,
     target_id INTEGER NOT NULL,
     type TEXT NOT NULL,
-    properties_json TEXT DEFAULT '{}'
+    properties_json TEXT DEFAULT '{}',
+    resolution TEXT NOT NULL DEFAULT ''
   );
 
   CREATE TABLE IF NOT EXISTS file_hashes (
@@ -384,6 +385,11 @@ export function initIndexerSchema(db: Database.Database): void {
   db.pragma('busy_timeout = 5000');
   db.pragma('temp_store = MEMORY');
   db.pragma('cache_size = -65536');
+  // WAL + NORMAL: consistent, crash-safe, and removes the per-commit fsync
+  // cost. The index graph is rebuildable derived data, so the (tiny) window
+  // where the last checkpointed transactions could roll back on power loss is
+  // an acceptable trade for whole-drive write throughput.
+  db.pragma('synchronous = NORMAL');
   db.exec(SCHEMA_SQL);
   // R81: Bug 15 — migrate old file_hashes schema if needed
   migrateFileHashesSchema(db);
@@ -410,6 +416,34 @@ export function initIndexerSchema(db: Database.Database): void {
   // but the index idx_call_sites_project_file must exist for legacy DBs that
   // already had the table created without it. CREATE INDEX IF NOT EXISTS in
   // SCHEMA_SQL handles this idempotently.
+  // R186: typed resolution column on edges — replaces the unindexable
+  // properties_json LIKE scans in clearCrossFileCallEdges with an
+  // index-ranged delete.
+  migrateEdgesResolutionColumn(db);
+}
+
+/**
+ * R186: add the `resolution` column to edges if missing, backfill it once
+ * from the JSON marker (`$.resolution` — cross_file*, intra_file), and index
+ * it. The backfill runs ONLY when the column is just created: re-running the
+ * UPDATE on every open would full-scan millions of edge rows.
+ *
+ * Semantics: resolver-inserted edges carry one of the `cross_file*` values;
+ * extraction-time edges carry '' (their intra_file marker stays in the JSON
+ * for behavioral-test compatibility). clearCrossFileCallEdges deletes by
+ * column, so legacy rows MUST be backfilled or they would escape cleanup and
+ * duplicate on rebuild.
+ */
+function migrateEdgesResolutionColumn(db: Database.Database): void {
+  const cols = db.prepare('PRAGMA table_info(edges)').all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === 'resolution')) {
+    db.exec("ALTER TABLE edges ADD COLUMN resolution TEXT NOT NULL DEFAULT ''");
+    db.exec(`UPDATE edges
+             SET resolution = json_extract(properties_json, '$.resolution')
+             WHERE json_valid(properties_json)
+               AND json_extract(properties_json, '$.resolution') IS NOT NULL`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_edges_project_resolution ON edges(project, resolution)');
 }
 
 /**
