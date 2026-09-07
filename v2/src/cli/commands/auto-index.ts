@@ -213,7 +213,9 @@ export function buildWrapperFiles(opts: {
   ].join('\r\n');
   const cmd = [
     '@echo off',
-    `powershell -NoProfile -ExecutionPolicy Bypass -File ${psQuote(taskScriptPath(opts.project))} >> ${psQuote(opts.logPath)} 2>&1`,
+    // cmd.exe line: DOUBLE quotes (single quotes would be passed through as
+    // literal characters and PowerShell would fail to find the script).
+    `powershell -NoProfile -ExecutionPolicy Bypass -File "${taskScriptPath(opts.project)}" >> "${opts.logPath}" 2>&1`,
     ``,
   ].join('\r\n');
   return { cmd, ps1 };
