@@ -327,20 +327,25 @@ export function clearCrossFileCallEdges(
   db: Database.Database,
   project: string,
 ): number {
-  const info = db.prepare(
+  // R186: delete by the typed `resolution` column (indexed via
+  // idx_edges_project_resolution) instead of unindexable LIKE scans over the
+  // whole edges table. The column is written by this resolver and backfilled
+  // from the JSON marker by the schema migration, so pre-migration rows are
+  // covered too.
+  const calls = db.prepare(
     `DELETE FROM edges
      WHERE project = ? AND type = 'CALLS'
-       AND properties_json LIKE '%"resolution":"cross_file%'`
+       AND resolution LIKE 'cross_file%'`
   ).run(project);
   // Module dependencies are rebuilt by the same resolver. Remove only the
   // derived exact edges owned by this pass; legacy or user-authored IMPORTS
   // relationships remain untouched.
-  db.prepare(
+  const imports = db.prepare(
     `DELETE FROM edges
      WHERE project = ? AND type = 'IMPORTS'
-       AND properties_json LIKE '%"resolution":"cross_file_module_exact"%'`,
+       AND resolution = 'cross_file_module_exact'`
   ).run(project);
-  return info.changes;
+  return calls.changes + imports.changes;
 }
 
 /**
@@ -854,8 +859,8 @@ export function rebuildCrossFileCallsEdges(
   //    unresolved, OR whose exported symbol resolves to `unknown`/`missing`/
   //    `ambiguous`, is TERMINAL — no name-based fallback.
   const insertEdge = db.prepare(
-    `INSERT INTO edges (project, source_id, target_id, type, properties_json)
-     VALUES (?, ?, ?, ?, ?)`
+    `INSERT INTO edges (project, source_id, target_id, type, properties_json, resolution)
+     VALUES (?, ?, ?, ?, ?, ?)`
   );
 
   // Publish one exact file-level module dependency per source/target pair.
@@ -903,6 +908,7 @@ export function rebuildCrossFileCallsEdges(
         binding_count: dependency.bindingCount,
         import_kinds: [...dependency.importKinds].sort(),
       }),
+      'cross_file_module_exact',
     );
   }
 
@@ -968,6 +974,7 @@ export function rebuildCrossFileCallsEdges(
                         import_kind: 'namespace',
                         source_module: nsBinding.sourceModule,
                       }),
+                      'cross_file_namespace_exact',
                     );
                     edgesInserted++;
                     // Namespace resolved — skip name-based fallback
@@ -1102,6 +1109,7 @@ export function rebuildCrossFileCallsEdges(
                       import_kind: impBinding.importKind,
                       source_module: impBinding.sourceModule,
                     }),
+                    resolution,
                   );
                   edgesInserted++;
                   // Import resolved — skip name-based fallback
@@ -1166,6 +1174,7 @@ export function rebuildCrossFileCallsEdges(
           candidate_index: ci,
           call_kind: callKind,
         }),
+        resolution,
       );
       edgesInserted++;
     }
