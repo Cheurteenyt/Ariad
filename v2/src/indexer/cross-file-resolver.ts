@@ -395,15 +395,81 @@ export function rebuildCrossFileCallsEdges(
   //    - qnToId: QN → node id (for edge source_id/target_id resolution)
   //    - fileQnToPath: file QN → file path (for import-aware resolution)
   //    - knownFiles: portable path to persisted path (for module resolution)
-  const allNodes = db.prepare(
-    'SELECT id, label, name, qualified_name, file_path FROM nodes WHERE project = ?'
-  ).all(project) as Array<{
-    id: number;
-    label: string;
-    name: string;
-    qualified_name: string;
-    file_path: string;
-  }>;
+  // R187: chunked iteration over the big tables — the full-table `.all()`
+  // loads materialized 10-20M rows (several GB of transient heap) on
+  // drive-scale graphs. Generators page by id so the resolution maps are the
+  // only retained structures.
+  function* iterateNodes(): Generator<{
+    id: number; label: string; name: string; qualified_name: string; file_path: string;
+  }> {
+    let last = 0;
+    for (;;) {
+      const chunk = db.prepare(
+        'SELECT id, label, name, qualified_name, file_path FROM nodes WHERE project = ? AND id > ? ORDER BY id LIMIT ?'
+      ).all(project, last, 100_000) as Array<{
+        id: number; label: string; name: string; qualified_name: string; file_path: string;
+      }>;
+      if (chunk.length === 0) return;
+      for (const row of chunk) {
+        last = row.id;
+        yield row;
+      }
+    }
+  }
+
+  function* iterateImports(): Generator<{
+    file_path: string; local_name: string; source_module: string; imported_name: string; import_kind: string;
+  }> {
+    let last = 0;
+    for (;;) {
+      const chunk = db.prepare(
+        'SELECT file_path, local_name, source_module, imported_name, import_kind FROM imports WHERE project = ? AND id > ? ORDER BY id LIMIT ?'
+      ).all(project, last, 100_000) as Array<{
+        file_path: string; local_name: string; source_module: string; imported_name: string; import_kind: string; id: number;
+      }>;
+      if (chunk.length === 0) return;
+      for (const row of chunk) {
+        last = row.id;
+        yield row;
+      }
+    }
+  }
+
+  function* iterateExports(): Generator<{
+    file_path: string; exported_name: string; local_name: string | null; source_module: string | null; imported_name: string | null; export_kind: string;
+  }> {
+    let last = 0;
+    for (;;) {
+      const chunk = db.prepare(
+        'SELECT file_path, exported_name, local_name, source_module, imported_name, export_kind FROM exports WHERE project = ? AND id > ? ORDER BY id LIMIT ?'
+      ).all(project, last, 100_000) as Array<{
+        file_path: string; exported_name: string; local_name: string | null; source_module: string | null; imported_name: string | null; export_kind: string; id: number;
+      }>;
+      if (chunk.length === 0) return;
+      for (const row of chunk) {
+        last = row.id;
+        yield row;
+      }
+    }
+  }
+
+  function* iterateCallSites(): Generator<{
+    source_qn: string; callee: string; last_segment: string; call_kind: string; file_path: string;
+  }> {
+    let last = 0;
+    for (;;) {
+      const chunk = db.prepare(
+        'SELECT source_qn, callee, last_segment, call_kind, file_path FROM call_sites WHERE project = ? AND id > ? ORDER BY id LIMIT ?'
+      ).all(project, last, 100_000) as Array<{
+        source_qn: string; callee: string; last_segment: string; call_kind: string; file_path: string; id: number;
+      }>;
+      if (chunk.length === 0) return;
+      for (const row of chunk) {
+        last = row.id;
+        yield row;
+      }
+    }
+  }
 
   const globalSymbolIndex = new Map<string, string[]>();
   const qnToId = new Map<string, number>();
@@ -412,7 +478,7 @@ export function rebuildCrossFileCallsEdges(
   // R110: map from (filePath, symbolName) → QN for import-aware resolution.
   // This lets us resolve an import to a specific symbol in a specific file.
   const fileSymbolIndex = new Map<string, Map<string, string>>(); // filePath → (name → QN)
-  for (const node of allNodes) {
+  for (const node of iterateNodes()) {
     qnToId.set(node.qualified_name, node.id);
     const portableFilePath = toPortableProjectPath(node.file_path);
     if (!knownFiles.has(portableFilePath)) {
@@ -440,31 +506,16 @@ export function rebuildCrossFileCallsEdges(
     else globalSymbolIndex.set(node.name, [node.qualified_name]);
   }
 
-  // 3. Load ALL call_sites for the project.
-  //    R110: also load file_path for import-aware resolution.
-  const allCallSites = db.prepare(
-    'SELECT source_qn, callee, last_segment, call_kind, file_path FROM call_sites WHERE project = ?'
-  ).all(project) as Array<{
-    source_qn: string;
-    callee: string;
-    last_segment: string;
-    call_kind: string;
-    file_path: string;
-  }>;
+  // 3. Iterate call_sites via the chunked generator (R187). The table holds
+  //    every call expression on the volume (10-20M rows at drive scale).
+  //    R110: also file_path for import-aware resolution.
 
-  // R110: Load ALL imports for the project and build per-file import maps.
+  // R110: Build per-file import maps from the chunked imports iteration.
   // importsByFile: filePath → Map<localName, ImportBinding>
-  const allImports = db.prepare(
-    'SELECT file_path, local_name, source_module, imported_name, import_kind FROM imports WHERE project = ?'
-  ).all(project) as Array<{
-    file_path: string;
-    local_name: string;
-    source_module: string;
-    imported_name: string;
-    import_kind: string;
-  }>;
   const importsByFile = new Map<string, Map<string, { importedName: string; sourceModule: string; importKind: string }>>();
-  for (const imp of allImports) {
+  // R111/R132: default-export marker map (built in the same pass).
+  const defaultExportByFile = new Map<string, { qn: string | null; count: number }>();
+  for (const imp of iterateImports()) {
     let fileMap = importsByFile.get(imp.file_path);
     if (!fileMap) {
       fileMap = new Map();
@@ -475,14 +526,6 @@ export function rebuildCrossFileCallsEdges(
       sourceModule: imp.source_module,
       importKind: imp.import_kind,
     });
-  }
-
-  // R111/R132: Build a map of filePath → { qn, count } for default exports.
-  // Stored as marker rows in imports with local_name='__default_export__'.
-  // R132: source_module encodes the count of `export default` statements.
-  // imported_name is the QN (empty string if identifier reference).
-  const defaultExportByFile = new Map<string, { qn: string | null; count: number }>();
-  for (const imp of allImports) {
     if (imp.import_kind === 'default_export' && imp.local_name === '__default_export__') {
       const count = parseInt(imp.source_module || '0', 10) || 0;
       const qn = imp.imported_name || null;
@@ -490,16 +533,11 @@ export function rebuildCrossFileCallsEdges(
     }
   }
 
-  // R119/R123: Build exportsByFile with separate named and star exports.
+  // R119/R123: Build exportsByFile with separate named and star exports,
+  // chunked like the other tables (R187).
   // R123 fix: star exports (export *) are stored in an array, not a Map,
   // because multiple export * from different files would collide under the
   // same key '*' in a Map. Named exports stay in the Map for O(1) lookup.
-  const allExports = db.prepare(
-    'SELECT file_path, exported_name, local_name, source_module, imported_name, export_kind FROM exports WHERE project = ?'
-  ).all(project) as Array<{
-    file_path: string; exported_name: string; local_name: string | null;
-    source_module: string | null; imported_name: string | null; export_kind: string;
-  }>;
   interface NamedBinding {
     localName: string | null;
     sourceModule: string | null;
@@ -522,7 +560,7 @@ export function rebuildCrossFileCallsEdges(
     fileInvalidReason: UnknownReason | null;
   }
   const exportsByFile = new Map<string, FileExports>();
-  for (const exp of allExports) {
+  for (const exp of iterateExports()) {
     let fileExp = exportsByFile.get(exp.file_path);
     if (!fileExp) {
       fileExp = { named: new Map(), stars: [], fileInvalidReason: null };
@@ -873,7 +911,7 @@ export function rebuildCrossFileCallsEdges(
     bindingCount: number;
     importKinds: Set<string>;
   }>();
-  for (const imp of allImports) {
+  for (const imp of iterateImports()) {
     if (imp.import_kind === 'default_export' || !imp.source_module.startsWith('.')) continue;
     const resolvedFile = resolveModulePath(imp.source_module, imp.file_path, knownFiles);
     if (!resolvedFile) continue;
@@ -913,7 +951,7 @@ export function rebuildCrossFileCallsEdges(
   }
 
   let edgesInserted = 0;
-  for (const cs of allCallSites) {
+  for (const cs of iterateCallSites()) {
     const callKind = cs.call_kind as 'identifier_call' | 'member_call' | 'computed_call';
 
     // R115: Namespace import resolution for member calls.

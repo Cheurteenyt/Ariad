@@ -1,5 +1,30 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.5 — streaming write pipeline (2026-09-07)
+
+- `indexParallel` no longer accumulates every worker result in RAM before
+  writing. Results stream into SQLite in dispatch sequence inside one manual
+  transaction (BEGIN at the first write, COMMIT after the resolver), held
+  only in a reorder buffer of ≤ numWorkers batches. Determinism (R81 Bug 19)
+  is preserved: batches are consumed strictly in dispatch sequence and
+  batches[] is built deterministically.
+- The full-mode clear of the previous graph moved INSIDE that transaction
+  (it used to run in its own pre-dispatch transaction via clearProjectData):
+  a crash mid-stream now rolls back to the PREVIOUS graph instead of an
+  empty one. A rollback handler rethrows so the caller marks the project
+  stale.
+- `rebuildCrossFileCallsEdges` iterates nodes, imports, exports, and
+  call_sites through chunked id-paginated generators instead of materializing
+  every row (the call_sites table alone held 10-20M rows on whole-drive
+  graphs). Measured on a whole-C: index: the resolver phase now runs flat at
+  ~3GB RSS.
+- Batch sizes are capped at 750 files (the dominant language previously
+  produced exactly numWorkers gigantic batches whose results plus
+  postMessage clones dominated the extraction-phase heap).
+- Whole-C: validation: SUCCESS, 0 errors, 15m50s; edges dropped from 16.9M
+  to 8.6M because the Temp-directory exclusion removed minified-bundle JS
+  noise (playwright/chromium profiles) from the graph.
+
 ## 0.78.0-alpha.4 — indexed edge cleanup + batched writes (2026-09-06)
 
 - New typed `edges.resolution` column (schema migration with a one-time
