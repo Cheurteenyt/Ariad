@@ -121,7 +121,10 @@ describe('buildWrapperFiles', () => {
     });
     // The .cmd is a thin shim redirecting everything to the log.
     expect(files.cmd.startsWith('@echo off')).toBe(true);
-    expect(files.cmd).toContain("Ariad-Index-D-Systeme.ps1");
+    expect(files.cmd).toContain('-File "');
+    expect(files.cmd).toContain('Ariad-Index-D-Systeme.ps1"');
+    expect(files.cmd).toContain('>> "');
+    expect(files.cmd).toContain('D-Systeme.auto.log" 2>&1');
     expect(files.cmd.endsWith('2>&1\r\n')).toBe(true);
     // The .ps1 watchdog raises env, launches the CLI, and hard-kills on cap.
     expect(files.ps1).toContain('max-old-space-size=24576');
