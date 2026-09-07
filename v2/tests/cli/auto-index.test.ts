@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import {
   acquireAutoLock,
   atToCron,
-  buildWrapperContent,
+  buildWrapperFiles,
   freshSkipReason,
   releaseAutoLock,
   readSuccessMarker,
@@ -107,25 +107,33 @@ describe('readSuccessMarker', () => {
   });
 });
 
-describe('buildWrapperContent', () => {
-  it('quotes every token and appends output to the log path', () => {
-    const content = buildWrapperContent({
+describe('buildWrapperFiles', () => {
+  it('generates a watchdog .cmd/.ps1 pair with env, args, and runtime cap', () => {
+    const files = buildWrapperFiles({
       nodePath: 'C:\\Program Files\\nodejs\\node.exe',
       cliEntry: 'D:\\Ariad\\v2\\dist\\cli\\index.js',
       project: 'D-Systeme',
       rootPath: 'D:/',
       minAgeHours: 20,
+      maxRuntimeMinutes: 90,
       exclude: ['$RECYCLE.BIN', 'System Volume Information'],
       logPath: 'C:\\Users\\x\\.cache\\codebase-memory-mcp\\D-Systeme.auto.log',
     });
-    expect(content.startsWith('@echo off')).toBe(true);
-    expect(content).toContain('"index-auto" "run"');
-    expect(content).toContain('max-old-space-size=24576');
-    expect(content).toContain('"--project" "D-Systeme"');
-    expect(content).toContain('"--exclude" "$RECYCLE.BIN"');
-    expect(content).toContain('"--exclude" "System Volume Information"');
-    expect(content).toContain('"--min-age-hours" "20"');
-    expect(content.endsWith('2>&1\r\n')).toBe(true);
+    // The .cmd is a thin shim redirecting everything to the log.
+    expect(files.cmd.startsWith('@echo off')).toBe(true);
+    expect(files.cmd).toContain("Ariad-Index-D-Systeme.ps1");
+    expect(files.cmd.endsWith('2>&1\r\n')).toBe(true);
+    // The .ps1 watchdog raises env, launches the CLI, and hard-kills on cap.
+    expect(files.ps1).toContain('max-old-space-size=24576');
+    expect(files.ps1).toContain('UV_THREADPOOL_SIZE');
+    expect(files.ps1).toContain("'index-auto', 'run'");
+    expect(files.ps1).toContain("'--project', 'D-Systeme'");
+    expect(files.ps1).toContain("'--exclude', '$RECYCLE.BIN'");
+    expect(files.ps1).toContain("'--exclude', 'System Volume Information'");
+    expect(files.ps1).toContain("'--min-age-hours', '20'");
+    expect(files.ps1).toContain("'--max-runtime-minutes', '90'");
+    expect(files.ps1).toContain('WaitForExit(6000000)');
+    expect(files.ps1).toContain('taskkill /PID $p.Id /T /F');
   });
 });
 

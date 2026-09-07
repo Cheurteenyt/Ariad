@@ -16,13 +16,44 @@
 
 import { parentPort, workerData } from 'node:worker_threads';
 import { Parser, Language } from 'web-tree-sitter';
-import { readFileSync, statSync } from 'node:fs';
+import type { BigIntStats } from "node:fs";
+import { readFile as readFileAsync, stat as statAsync } from 'node:fs/promises';
 import { relative, join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { extractFast, type UnresolvedCallSite, type ImportBinding, type ExportBinding } from './fast-walker.js';
 
 const require2 = createRequire(import.meta.url);
+
+// R187: per-file read timeout. Whole-drive sweeps occasionally hit files
+// whose open/read blocks FOREVER (stale mounts, drivers holding handles).
+// A sync read would wedge the worker (and with it the whole run — observed
+// on C:/D: sweeps). The async read is raced against a timeout; on expiry the
+// FILE is abandoned with a READ_TIMEOUT error and the batch continues. The
+// abandoned libuv thread is the accepted cost (the wrapper raises
+// UV_THREADPOOL_SIZE so a handful of abandonments cannot starve the worker).
+const READ_TIMEOUT_MS = 60_000;
+
+export async function readSourceBounded(filePath: string): Promise<{ source: string; stat: BigIntStats }> {
+  const work = (async () => {
+    const source = await readFileAsync(filePath, 'utf-8');
+    const stat = await statAsync(filePath, { bigint: true });
+    return { source, stat };
+  })();
+  // Swallow late failures of an abandoned read — the timeout already
+  // classified the file as an error, and an unhandled rejection would crash
+  // the worker.
+  work.catch(() => { /* abandoned read settled */ });
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`READ_TIMEOUT after ${READ_TIMEOUT_MS}ms`)), READ_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ── Types (must be serializable — no functions, no class instances) ─────
 
@@ -114,10 +145,9 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
     for (const filePath of batch.files) {
       const relPath = relative(batch.rootPath, filePath);
       try {
-        const source = readFileSync(filePath, 'utf-8');
-        // R86: compute hash + stat in the worker so main thread doesn't need
+        const { source, stat } = await readSourceBounded(filePath);
+        // R86: compute hash in the worker so main thread doesn't need
         // to re-read files just for hash storage in full mode.
-        const stat = statSync(filePath, { bigint: true });
         const hash = createHash('sha256').update(source).digest('hex');
         const hashInfo = {
           hash,
