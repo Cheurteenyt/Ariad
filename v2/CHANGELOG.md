@@ -1,5 +1,36 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.7 — incremental cross-file resolver (2026-09-08)
+
+- P1.2: incremental runs no longer rebuild ALL cross-file CALLS edges. The
+  resolver scope is computed before the per-file deletes: the changed files
+  plus every file whose persisted cross-file edge pointed into a changed
+  file (those edges die with the changed files' old nodes and must be
+  re-resolved from their source call sites). The scoped delete and the
+  call-site read are index-driven (`idx_edges_project_resolution`,
+  `idx_call_sites_project_file`); massive change sets (<= 2000 files) fall
+  back to the global rebuild. Whole-drive incrementals with few changes
+  skip the 12M-edge delete+rebuild entirely.
+- Known trade-off: a target file that is deleted and later re-created keeps
+  a gap in inbound edges until the source file changes or a full reindex
+  runs (the scoped resolver cannot discover stale sources of deleted
+  targets once their nodes are gone). The full rebuild remains exact.
+
+## 0.78.0-alpha.6 — index-auto external watchdog + bounded reads (2026-09-07)
+
+- `index-auto install` generates a PowerShell watchdog pair (.cmd shim +
+  .ps1): the .ps1 raises NODE_OPTIONS (24GB heap) and UV_THREADPOOL_SIZE
+  (64, headroom for abandoned bounded reads), launches the CLI, and kills
+  the whole process tree (taskkill /T /F) after the runtime cap + 10min
+  grace. The in-process runtime cap cannot fire when the event loop is
+  wedged inside a native call (observed: a D: incremental hung 17h with the
+  process paged out) — the external watchdog is the only reliable kill.
+  The cmd line uses double quotes (single quotes are passed through by
+  cmd.exe as literal characters, breaking the -File path).
+- Worker file reads are bounded: async read raced against a 60s timeout; a
+  timed-out file is abandoned with a READ_TIMEOUT error and the batch
+  continues.
+
 ## 0.78.0-alpha.5 — streaming write pipeline (2026-09-07)
 
 - `indexParallel` no longer accumulates every worker result in RAM before

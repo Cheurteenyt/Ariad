@@ -382,13 +382,52 @@ export function rebuildCrossFileCallsEdges(
   db: Database.Database,
   project: string,
   semanticsCurrent: boolean = false,
+  scopedFiles?: readonly string[],
 ): number {
-  // 1. Delete ALL existing cross-file CALLS edges for this project.
+  // 1. Delete existing cross-file CALLS edges for this project.
   //    R129: QUAL-R129-01 — use the shared clearCrossFileCallEdges helper
   //    instead of inline SQL. This makes clearCrossFileCallEdges the true
   //    single source of truth for cross-file edge identification and cleanup.
   //    Intra-file CALLS edges (resolution="intra_file") are preserved.
-  clearCrossFileCallEdges(db, project);
+  //
+  //    R189 (P1.2): when scopedFiles is set (incremental runs), the delete is
+  //    SCOPED to edges whose source or target belongs to those files, and the
+  //    call-site iteration below reads only the scoped files' rows. Unchanged
+  //    files keep their persisted cross-file edges (no full rebuild per
+  //    nightly). The scope must be F(changed) ∪ {files whose edges pointed
+  //    into F} — the caller computes it BEFORE the per-file deletes, while
+  //    the old graph is still queryable.
+  if (scopedFiles && scopedFiles.length > 0) {
+    // Chunked scoped delete: edges whose source or target node belongs to a
+    // scoped file. idx_edges_source/idx_edges_target make each pass fast.
+    const CHUNK = 400;
+    for (let i = 0; i < scopedFiles.length; i += CHUNK) {
+      const chunk = scopedFiles.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(',');
+      const nodeIds = db.prepare(
+        `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
+      ).all(project, ...chunk) as Array<{ id: number }>;
+      if (nodeIds.length === 0) continue;
+      const idPh = nodeIds.map(() => '?').join(',');
+      const idParams = nodeIds.map(r => r.id);
+      db.prepare(
+        `DELETE FROM edges
+         WHERE project = ? AND type = 'CALLS'
+           AND resolution LIKE 'cross_file%'
+           AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
+      ).run(project, ...idParams, ...idParams);
+    }
+    // Module-exact IMPORTS edges are rebuilt globally (cheap: one row per
+    // source/target file pair) — clear them all here, the rebuild below
+    // re-inserts every pair from the full imports table.
+    db.prepare(
+      `DELETE FROM edges
+       WHERE project = ? AND type = 'IMPORTS'
+         AND resolution = 'cross_file_module_exact'`
+    ).run(project);
+  } else {
+    clearCrossFileCallEdges(db, project);
+  }
 
   // 2. Load ALL nodes for the project. Build:
   //    - globalSymbolIndex: name → QN[] (for name-based fallback resolution)
@@ -466,6 +505,27 @@ export function rebuildCrossFileCallsEdges(
       if (chunk.length === 0) return;
       for (const row of chunk) {
         last = row.id;
+        yield row;
+      }
+    }
+  }
+
+  // R189 (P1.2): scoped call-site iteration — only the scoped files' rows,
+  // via idx_call_sites_project_file. Chunks of 400 files stay far below the
+  // SQLite parameter limit.
+  function* iterateScopedCallSites(files: readonly string[]): Generator<{
+    source_qn: string; callee: string; last_segment: string; call_kind: string; file_path: string;
+  }> {
+    const CHUNK = 400;
+    for (let i = 0; i < files.length; i += CHUNK) {
+      const chunk = files.slice(i, i + CHUNK);
+      const ph = chunk.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT source_qn, callee, last_segment, call_kind, file_path FROM call_sites WHERE project = ? AND file_path IN (${ph})`
+      ).all(project, ...chunk) as Array<{
+        source_qn: string; callee: string; last_segment: string; call_kind: string; file_path: string;
+      }>;
+      for (const row of rows) {
         yield row;
       }
     }
@@ -951,7 +1011,10 @@ export function rebuildCrossFileCallsEdges(
   }
 
   let edgesInserted = 0;
-  for (const cs of iterateCallSites()) {
+  const callSiteSource = scopedFiles && scopedFiles.length > 0
+    ? iterateScopedCallSites(scopedFiles)
+    : iterateCallSites();
+  for (const cs of callSiteSource) {
     const callKind = cs.call_kind as 'identifier_call' | 'member_call' | 'computed_call';
 
     // R115: Namespace import resolution for member calls.
