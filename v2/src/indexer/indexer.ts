@@ -2932,6 +2932,34 @@ async function indexParallel(
     return { nodes: 0, edges: 0, files: 0, skipped: totalSkipped, errors: [], languages, crossFileCallsResolved: false };
   }
 
+  // R189 (P1.2): incremental resolver scope — the changed files PLUS every
+  // file whose persisted cross-file CALLS edge pointed into a changed file
+  // (those edges die with the changed files' old nodes and must be
+  // re-resolved from their source call sites). Computed HERE, before the
+  // per-batch deletes, while the old graph is still queryable. Massive
+  // change sets fall back to the global rebuild (the scoped IN-clause and
+  // resolution loops scale with the scope, not the graph).
+  let scopedFiles: string[] | undefined;
+  if (incremental && allPendingChangedRelPaths.length > 0 && allPendingChangedRelPaths.length <= 2000) {
+    const changed = allPendingChangedRelPaths;
+    const ph = changed.map(() => '?').join(',');
+    const oldNodeIds = db.prepare(
+      `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
+    ).all(project, ...changed) as Array<{ id: number }>;
+    const affected = new Set<string>(changed);
+    if (oldNodeIds.length > 0) {
+      const idPh = oldNodeIds.map(() => '?').join(',');
+      const sources = db.prepare(
+        `SELECT DISTINCT n2.file_path AS fp
+         FROM edges e JOIN nodes n2 ON n2.id = e.source_id
+         WHERE e.project = ? AND e.target_id IN (${idPh})
+           AND e.type = 'CALLS' AND e.resolution LIKE 'cross_file%'`
+      ).all(project, ...oldNodeIds.map(r => r.id)) as Array<{ fp: string }>;
+      for (const s of sources) affected.add(s.fp);
+    }
+    scopedFiles = [...affected];
+  }
+
   // R187: STREAMING WRITE — results are written to SQLite in dispatch order
   // inside one manual transaction (BEGIN at the first write, COMMIT after the
   // resolver). Worker results are held only in a bounded reorder buffer
@@ -3268,7 +3296,10 @@ async function indexParallel(
         // R107: Legacy DB. Skip resolution. Caller marks stale=true.
       } else if (nodesCount > 0) {
         // R108: initialized=true → always rebuild (even if call_sites=0).
-        const added = rebuildCrossFileCallsEdges(db, project, true);
+        // R189 (P1.2): when a scope was computed (changed files + files whose
+        // edges pointed into them), resolve only the scoped call sites — the
+        // full-table rebuild is reserved for full mode and scope-less paths.
+        const added = rebuildCrossFileCallsEdges(db, project, true, scopedFiles);
         edgeCount += added;
         crossFileResolved = true;
       } else {
