@@ -28,18 +28,29 @@ import {
   publishPreparedGeneration,
   reserveGenerationStaging,
 } from '../storage/generation-publisher.js';
+import {
+  applyGenerationGcPlan,
+  applyGenerationOrphanRecovery,
+  planGenerationGc,
+  planGenerationOrphanRecovery,
+} from '../storage/generation-gc.js';
 import { openCasStore } from '../storage/internal/generation-cas-store.js';
 
 /** Env kill-switch: set to 1 to disable generation publication. */
 export const GENERATION_PUBLICATION_DISABLED_ENV = 'CBM_DISABLE_GENERATION_PUBLICATION';
 
-/** R192 (R169C): outcome of one publication attempt, embedded in IndexResult. */
+/** R193 (R169D): outcome of one publication attempt, embedded in IndexResult. */
 export interface GenerationPublicationOutcome {
   status: 'published' | 'skipped' | 'failed';
   /** status='published': the new active generation ID. */
   generationId?: string;
   /** status='published': CAS dedup reused an identical existing generation. */
   deduped?: boolean;
+  /**
+   * status='published': post-publication GC/recovery failed (best-effort —
+   * the publication itself succeeded; the sweep retries next run).
+   */
+  gcError?: string;
   /** status='skipped': why the run did not publish. */
   reason?: string;
   /** status='failed': structured GenerationStoreError code when available. */
@@ -110,10 +121,22 @@ export async function publishGenerationSnapshot(
       cas.close();
     }
     const published = publishPreparedGeneration(prepared, { expectedActiveGenerationId: expectedActive });
+    // R193 (R169D): project lifecycle — after each publication, sweep tmp
+    // orphans and prune old generations (retain active + DEFAULT_RETAIN_COUNT
+    // previous). Best-effort: a GC failure never fails the run; the sweep
+    // retries on the next publication.
+    let gcError: string | undefined;
+    try {
+      applyGenerationGcPlan(planGenerationGc(params.project));
+      applyGenerationOrphanRecovery(planGenerationOrphanRecovery(params.project));
+    } catch (e) {
+      gcError = e instanceof Error ? e.message : String(e);
+    }
     return {
       status: 'published',
       generationId: published.generationId,
       deduped: published.cas.deduped,
+      gcError,
       durationMs: Date.now() - start,
     };
   } catch (error) {

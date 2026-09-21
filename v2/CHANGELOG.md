@@ -1,5 +1,34 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.10 — reader cutover to atomic generations (R169D) (2026-09-21)
+
+- R169D: readers now resolve their DB through the generation store.
+  `resolveCodeDbForRead` / `openCodeGraphReaderForRead` (sqlite-ro) prefer
+  the active generation (complete, crash-consistent snapshot) and fall back
+  to the legacy DB when none is published — so projects indexed before
+  R169C keep working with no migration step. The `missing` case returns the
+  legacy path so existing not-found errors keep firing.
+- MCP: the server's code reader resolves through a per-call provider that
+  re-opens when the active generation changes (cheap probe, open-before-
+  close). A long-lived server therefore picks up new publications instead
+  of serving a frozen generation; probe failures keep the previous handle.
+  Initial-open failure keeps human-only mode, as before.
+- UI: the project-store registry and the project health/listing routes use
+  the resolver; the registry re-resolves on access so CLI/nightly
+  publications are picked up without a UI-triggered index. Project
+  deletion now also removes the project's generation store (best-effort).
+- CLI one-shot read commands (graph status output, watch, stats, obsidian,
+  report, human) resolve once per invocation, per the reader contract.
+- Kept on the legacy DB deliberately (writer-side identities): the indexer
+  write path, the index-auto freshness gate, graph-status freshness
+  diagnostics, and the index-job collision guards. The
+  r169a consumer-inventory test documents the new baseline.
+- GC/recovery wiring: every publication now sweeps tmp orphans and prunes
+  old generations (retain active + 2 previous), best-effort via
+  `generationPublication.gcError`.
+- `DATA-CARRY-01` remains OPEN until R169E (crash matrix + concurrency +
+  performance + activation).
+
 ## 0.78.0-alpha.9 — atomic generation publication (R169C) (2026-09-21)
 
 - R169C: the indexer now integrates the merged R169B publisher primitives.

@@ -2,7 +2,7 @@
 
 > **Status:** Reference architecture — merged foundation, indexer-side publication active, readers still legacy
 > **Audience:** Maintainers, storage engineers, and auditors
-> **Last verified:** `0.78.0-alpha.9` / 2026-09-21
+> **Last verified:** `0.78.0-alpha.10` / 2026-09-21
 
 > **Authoritative status (2026-09-21): R169A and R169B are merged on
 > `main`; the R169B merge commit is
@@ -12,20 +12,25 @@
 > `0.78.0-alpha.9`: every clean main-path index run snapshots the legacy DB
 > into the generation store via the R169B publisher and reports the outcome
 > through `IndexResult.generationPublication` (Linux-certified platforms,
-> env kill-switch `CBM_DISABLE_GENERATION_PUBLICATION=1`).**
+> env kill-switch `CBM_DISABLE_GENERATION_PUBLICATION=1`). R169D
+> (reader cutover + lifecycle) is MERGED / ACTIVE as of `0.78.0-alpha.10`:
+> readers resolve through the generation store via `resolveCodeDbForRead`
+> and fall back to the legacy DB when no generation is published.**
 >
 > R169B provides the independently tested reserve, prepare/WAL-finalize,
 > validate, fd-based copy+hash, temp-fsync, no-clobber `link`, metadata,
 > manifest, CAS, GC, and recovery primitives. Since R169C, successful
-> indexer runs call the publisher (once per run, not per query); READERS
-> still open the legacy `<project>.db` through `defaultCodeDbPath`.
-> Consequently reader-visible product publication is still non-atomic and
-> `DATA-CARRY-01` remains open.
+> indexer runs call the publisher (once per run, not per query). Since
+> R169D, readers (MCP, CLI reads, UI) open the ACTIVE GENERATION — a
+> complete, crash-consistent snapshot — and fall back to the legacy DB only
+> for projects with no published generation. The indexer still writes the
+> legacy `<project>.db` as its live target.
 >
-> R169D is the future reader/lifecycle cutover. **R169E is paused, not
-> scheduled:** the production-scale reindexing-safety need it addresses has
-> not been demonstrated at the project's current test scale (2 repositories,
-> no large-scale continuous deployment).
+> R169E is paused, not scheduled: the production-scale reindexing-safety
+> need it addresses has not been demonstrated at the project's current test
+> scale. `DATA-CARRY-01` remains OPEN until R169E has passed the crash
+> matrix, concurrency analysis, performance verification, and activation
+> gating.
 >
 > This is a deliberate pause, not an abandonment. The completed foundation
 > and its technical record remain available for reactivation if a demonstrated
@@ -47,8 +52,9 @@
 
 R169A and R169B land the independently tested **plumbing and publication
 primitives** for atomic generation publication. R169C activates the
-indexer-side write path: clean index runs publish a generation (once per
-run); readers remain on the legacy DB until R169D.
+indexer-side write path and R169D cuts readers over: MCP, CLI reads, and
+the UI open the active generation (legacy fallback for projects with no
+published generation).
 
 Activation is staged across R169B–R169E (validated roadmap):
 
@@ -57,7 +63,7 @@ Activation is staged across R169B–R169E (validated roadmap):
 | R169A | Generation Store Contract + Resolver Foundation | **merged / inactive** |
 | R169B | Durable Staging Publisher + Validator + fsync + CAS + GC/recovery primitives | **merged / inactive** (`15a732d91984e5b4ffa29b4e129ac0d6316c9fca`) |
 | R169C | Indexer Integration + Outcome Contract | **merged / active** (`0.78.0-alpha.9`) |
-| R169D | Reader Cutover + Legacy Migration + Project Lifecycle | future |
+| R169D | Reader Cutover + Legacy Migration + Project Lifecycle | **merged / active** (`0.78.0-alpha.10`) |
 | R169E | Integrated Crash Matrix + Performance + Activation + Version | **paused, not scheduled** |
 
 `DATA-CARRY-01` (P1) is **not** closed by the merged R169A/R169B
@@ -784,8 +790,12 @@ integration work, while R169E is paused and not scheduled. There is no
   reports `IndexResult.generationPublication`. The indexer still writes
   the legacy DB; readers still read it (R169D).
 - **R169D — Reader Cutover + Legacy Migration + Project Lifecycle.**
-  Future reader switch from `legacyCodeDbPath` to `resolveActiveCodeDb`,
-  legacy migration, and lifecycle wiring.
+  **Merged / active as of `0.78.0-alpha.10`**: readers resolve through
+  `resolveCodeDbForRead` (active generation, legacy fallback — the legacy
+  DB itself is the implicit migration for projects with no published
+  generation); the MCP re-resolves per tool call so long-lived servers pick
+  up new publications; project deletion removes the generation store;
+  GC/recovery run after each publication (best-effort).
 - **R169E — Crash Matrix + Performance + Activation + Version.** **Paused,
   not scheduled.** If reactivated, replay C01–C20 against the integrated
   pipeline, verify performance, complete the concurrency analysis (single-host
@@ -1273,7 +1283,7 @@ that share a cache directory (rare, but possible over NFS) are not safe
 under the merged foundation alone. The single-host contract (section 2)
 is the only contract currently provided by these primitives.
 
-## 15. Status: MERGED — indexer-side publication ACTIVE (R169C), readers LEGACY
+## 15. Status: MERGED — indexer publication + reader cutover ACTIVE (R169C+R169D)
 
 To repeat the headline, because it is the most important fact in this
 document:
@@ -1282,8 +1292,11 @@ document:
 > `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`. R169C is merged as of
 > `0.78.0-alpha.9`: successful indexer runs publish a generation through
 > the R169B publisher (once per run, Linux-certified platforms) and report
-> the outcome through `IndexResult.generationPublication`. READERS still
-> open the legacy DB directly — the reader cutover is R169D.
+> the outcome through `IndexResult.generationPublication`. R169D is merged
+> as of `0.78.0-alpha.10`: MCP, CLI read commands, and the UI resolve their
+> read target through `resolveCodeDbForRead` (active generation, legacy
+> fallback), and project deletion removes the generation store. The
+> indexer still writes the legacy DB as its live target.
 > `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix +
 > concurrency + performance + activation).**
 
@@ -1309,7 +1322,6 @@ What the merged foundation delivers:
 
 What remains unactivated:
 
-- R169D — Reader Cutover + Legacy Migration + Project Lifecycle.
 - R169E — **paused, not scheduled** Crash Matrix + Performance + Activation
   + Version (and the formal close-out of `DATA-CARRY-01` if reactivated and
   completed).

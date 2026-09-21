@@ -2,7 +2,7 @@
 
 import { Command } from 'commander';
 import { HumanMemoryStore, defaultHumanDbPath } from '../../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { CodeGraphReader, openCodeGraphReaderForRead } from '../../bridge/sqlite-ro.js';
 import { generateVault } from '../../obsidian/generator.js';
 import { importVault } from '../../obsidian/importer.js';
 import { ensureVaultDirs, walkVault } from '../../obsidian/vault.js';
@@ -88,7 +88,7 @@ export function registerObsidianCommand(program: Command): void {
       try {
         humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
         try {
-          codeReader = new CodeGraphReader(defaultCodeDbPath(project));
+          codeReader = openCodeGraphReaderForRead(project).reader;
         } catch (e: unknown) {
           console.warn(`⚠️  Code graph not available: ${(e instanceof Error ? e.message : String(e))}`);
           console.warn('    Sync will work in human-only mode (no auto module/route notes).');
@@ -173,7 +173,7 @@ export function registerObsidianCommand(program: Command): void {
       const vaultPath = deriveVault(opts, config);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch {}
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch {}
 
       try {
         const result = generateVault({
@@ -204,7 +204,7 @@ export function registerObsidianCommand(program: Command): void {
       const vaultPath = deriveVault(opts, config);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch {}
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch {}
 
       try {
         const result = importVault({ project, vaultPath, humanStore, codeReader, dryRun: !!opts.dryRun });
@@ -276,7 +276,7 @@ export function registerObsidianCommand(program: Command): void {
       const project = deriveProject(opts);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch {}
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch {}
 
       try {
         const cbmNodeIds: number[] = [];
@@ -336,7 +336,7 @@ export function registerObsidianCommand(program: Command): void {
       const project = deriveProject(opts);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch {}
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch {}
 
       try {
         if (!codeReader) {
@@ -402,7 +402,7 @@ export function registerObsidianCommand(program: Command): void {
       const project = deriveProject(opts);
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch {}
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch {}
 
       try {
         if (!codeReader) {

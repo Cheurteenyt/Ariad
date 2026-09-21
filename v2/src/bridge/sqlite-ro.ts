@@ -6,6 +6,7 @@ import { existsSync, realpathSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { BULK_CHUNK_SIZE } from '../constants.js';
 import { resolveProjectStoragePath } from '../storage/project-path.js';
+import { resolveActiveCodeDb } from '../storage/generation-store.js';
 import {
   graphCommunityKey,
   graphDomainKey,
@@ -439,6 +440,71 @@ function databaseIdentity(dbPath: string): string {
 
 export function defaultCodeDbPath(project: string): string {
   return resolveProjectStoragePath(project, '.db');
+}
+
+// ── R193 (R169D): reader cutover to atomic generations ─────────────────
+
+/**
+ * R193 (R169D): platforms whose generation-store RESOLUTION is certified.
+ * Mirrors the publication gate (R192): the R169B primitives are
+ * Linux-certified only (doc §15.1) — their permission walk rejects the
+ * synthesized directory modes other platforms report (e.g. NTFS 0777), so
+ * on those platforms resolution would fail-closed on every call and the
+ * fallbacks would degrade readers to human-only. Non-certified platforms
+ * therefore keep the exact pre-R169D behavior: read the legacy DB.
+ */
+const GENERATION_RESOLVE_CERTIFIED_PLATFORMS = new Set(['linux']);
+
+function generationResolutionCertified(): boolean {
+  return GENERATION_RESOLVE_CERTIFIED_PLATFORMS.has(process.platform);
+}
+
+export interface CodeDbReadTarget {
+  dbPath: string;
+  /** 'generation' = active published snapshot; 'legacy' = live legacy DB. */
+  source: 'generation' | 'legacy';
+  generationId: string | null;
+}
+
+/**
+ * R193 (R169D): resolve the DB a reader should open, per the reader
+ * contract (ATOMIC_GENERATION_PUBLICATION.md §7): the active generation
+ * when one is published (complete, crash-consistent snapshot), else the
+ * legacy DB. A `missing` resolution returns the legacy path so existing
+ * "Code graph DB not found" errors keep firing with their current message.
+ *
+ * Fail-closed resolver errors (corrupt manifest, symlinked paths, …)
+ * propagate — callers must NOT fall back to a hand-constructed path.
+ */
+export function resolveCodeDbForRead(project: string, cacheRoot?: string): CodeDbReadTarget {
+  if (!generationResolutionCertified()) {
+    return { dbPath: defaultCodeDbPath(project), source: 'legacy', generationId: null };
+  }
+  const resolved = resolveActiveCodeDb(project, cacheRoot ? { cacheRoot } : undefined);
+  if (resolved.source === 'generation') {
+    return { dbPath: resolved.dbPath, source: 'generation', generationId: resolved.generationId };
+  }
+  // legacy and missing both read the legacy path (missing keeps the
+  // caller's not-found error and message).
+  return { dbPath: defaultCodeDbPath(project), source: 'legacy', generationId: null };
+}
+
+/**
+ * R193 (R169D): non-throwing probe for long-lived readers — has the ACTIVE
+ * generation changed relative to the dbPath the caller is holding? Probe
+ * errors mean "cannot prove a change" → false, so the held handle (a
+ * complete immutable snapshot or the live legacy DB) stays in service.
+ * Passing `undefined` as the held path reports a change (nothing held yet).
+ */
+export function activeGenerationChanged(project: string, heldDbPath: string | undefined, cacheRoot?: string): boolean {
+  if (!generationResolutionCertified()) return false;
+  try {
+    const resolved = resolveActiveCodeDb(project, cacheRoot ? { cacheRoot } : undefined);
+    if (resolved.source !== 'generation') return false;
+    return heldDbPath === undefined || resolved.dbPath !== heldDbPath;
+  } catch {
+    return false;
+  }
 }
 
 export class CodeGraphReader {
@@ -2723,4 +2789,18 @@ function deserializeCodeNode(row: CodeNodeRow): CodeNode {
     end_line: row.end_line,
     properties_json: rowPropertiesJson(row),
   };
+}
+
+/**
+ * R193 (R169D): open a CodeGraphReader on the resolved read target (active
+ * generation when published, legacy DB otherwise). One-shot readers (CLI
+ * commands) call this once per process, honoring the "resolve once, keep
+ * the handle" reader contract (ATOMIC_GENERATION_PUBLICATION.md §7).
+ */
+export function openCodeGraphReaderForRead(
+  project: string,
+  cacheRoot?: string,
+): { reader: CodeGraphReader; target: CodeDbReadTarget } {
+  const target = resolveCodeDbForRead(project, cacheRoot);
+  return { reader: new CodeGraphReader(target.dbPath), target };
 }

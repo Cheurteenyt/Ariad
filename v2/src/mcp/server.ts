@@ -13,6 +13,13 @@ export interface McpServerOptions {
   project: string;
   humanStore: HumanMemoryStore;
   codeReader?: CodeGraphReader;
+  /**
+   * R193 (R169D): per-call reader provider. When set, tools resolve through
+   * it so a long-lived server picks up newly published generations; the
+   * static `codeReader` is then only the shutdown-close target for
+   * providers that seed it.
+   */
+  codeReaderProvider?: () => CodeGraphReader | undefined;
 }
 
 interface JsonRpcRequest {

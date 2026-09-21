@@ -17,8 +17,16 @@ export abstract class BaseTool implements ToolHandler {
     return this.opts.humanStore;
   }
 
+  /**
+   * R193 (R169D): the code graph reader, resolved through the provider when
+   * one is installed. The provider re-resolves the ACTIVE generation per
+   * tool call (cheap probe) so a long-lived MCP server picks up new
+   * publications — a held handle on an immutable generation would otherwise
+   * serve frozen data forever (the reader contract's "resolve once" applies
+   * per read session; each tool call is a session).
+   */
   protected get codeReader(): CodeGraphReader | undefined {
-    return this.opts.codeReader;
+    return this.opts.codeReaderProvider ? this.opts.codeReaderProvider() : this.opts.codeReader;
   }
 
   protected get project(): string {
