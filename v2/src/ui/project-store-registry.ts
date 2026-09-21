@@ -1,6 +1,6 @@
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { CodeGraphReader, defaultCodeDbPath } from '../bridge/sqlite-ro.js';
+import { CodeGraphReader, activeGenerationChanged, defaultCodeDbPath, openCodeGraphReaderForRead, resolveCodeDbForRead } from '../bridge/sqlite-ro.js';
 import { HumanMemoryStore, defaultHumanDbPath } from '../human/store.js';
 import { validateProjectStorageName } from '../storage/project-path.js';
 import { getNotifyHub } from './notify-hub.js';
@@ -180,23 +180,25 @@ export class ProjectStoreRegistry {
     const canonicalProject = this.resolveProjectName(project);
     const entry = this.entries.get(canonicalProject)
       ?? this.openEntry(canonicalProject, canonicalProject === this.defaultProject);
-    const replacement = new CodeGraphReader(entry.codeDbPath);
-    const previous = entry.codeReaderHandle;
-    entry.codeReaderHandle = replacement;
-    entry.codeReaderInitialized = true;
-    entry.lastUsed = ++this.clock;
-    try {
-      previous?.close();
-    } catch {
-      // The new reader is already installed; a close failure must not roll it back.
-    }
+    // R193 (R169D): resolve fresh (active generation or legacy). If the
+    // resolve/open throws, nothing is mutated, the previous handle stays
+    // usable, and the error propagates to the index job.
+    this.reopenCodeReader(entry);
     this.evictIdleEntries();
-    return replacement;
+    return entry.codeReaderHandle!;
   }
 
   /** Return true when deleting the named DBs would remove an open store. */
   isProjectStoreOpen(project: string): boolean {
-    const candidatePaths = [defaultCodeDbPath(project), defaultHumanDbPath(project)];
+    // R193 (R169D): the candidate set is the RESOLVED read target — an open
+    // generation handle must guard deletion just like the legacy DB.
+    let codeCandidate = defaultCodeDbPath(project);
+    try {
+      codeCandidate = resolveCodeDbForRead(project).dbPath;
+    } catch {
+      /* keep the legacy path */
+    }
+    const candidatePaths = [codeCandidate, defaultHumanDbPath(project)];
     for (const entry of this.entries.values()) {
       const openPaths: string[] = [];
       // The startup project is intentionally owned for the full server
@@ -251,7 +253,15 @@ export class ProjectStoreRegistry {
 
   private openEntry(project: string, pinned: boolean): StoreEntry {
     const humanDbPath = defaultHumanDbPath(project);
-    const codeDbPath = defaultCodeDbPath(project);
+    // R193 (R169D): prefer the active generation for reader opens. Fail-closed
+    // store errors fall back to the legacy path so entry opening (used for
+    // listings and logs) never breaks on a corrupt store.
+    let codeDbPath = defaultCodeDbPath(project);
+    try {
+      codeDbPath = resolveCodeDbForRead(project).dbPath;
+    } catch {
+      /* keep the legacy path */
+    }
     const entry: StoreEntry = {
       project,
       humanStoreHandle: undefined,
@@ -290,14 +300,40 @@ export class ProjectStoreRegistry {
   }
 
   private getCodeReader(entry: StoreEntry): CodeGraphReader | undefined {
+    // R193 (R169D): pick up publications made outside this server (CLI,
+    // nightly index-auto) — a held handle on an immutable generation would
+    // otherwise serve frozen data forever. Probe failures keep the current
+    // handle ("cannot prove a change").
+    if (entry.codeReaderInitialized && activeGenerationChanged(entry.project, entry.codeDbPath)) {
+      this.reopenCodeReader(entry);
+    }
     if (entry.codeReaderInitialized) return entry.codeReaderHandle;
     entry.codeReaderInitialized = true;
     try {
-      entry.codeReaderHandle = new CodeGraphReader(entry.codeDbPath);
+      this.reopenCodeReader(entry);
     } catch {
       entry.codeReaderHandle = undefined;
     }
     return entry.codeReaderHandle;
+  }
+
+  /**
+   * R193 (R169D): resolve the read target fresh and swap the handle
+   * open-before-close. If the resolve or open throws, nothing is mutated
+   * and the previous handle remains usable.
+   */
+  private reopenCodeReader(entry: StoreEntry): void {
+    const { reader, target } = openCodeGraphReaderForRead(entry.project);
+    const previous = entry.codeReaderHandle;
+    entry.codeReaderHandle = reader;
+    entry.codeReaderInitialized = true;
+    entry.codeDbPath = target.dbPath;
+    entry.lastUsed = ++this.clock;
+    try {
+      previous?.close();
+    } catch {
+      // The new reader is already installed; a close failure must not roll it back.
+    }
   }
 
   private evictIdleEntries(): void {

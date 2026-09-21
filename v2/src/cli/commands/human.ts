@@ -2,7 +2,7 @@
 
 import { Command } from 'commander';
 import { HumanMemoryStore, defaultHumanDbPath } from '../../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { CodeGraphReader, openCodeGraphReaderForRead } from '../../bridge/sqlite-ro.js';
 import {
   HumanNodeLabel,
   HumanEdgeType,
@@ -210,7 +210,7 @@ export function registerHumanCommand(program: Command): void {
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       // R22: open a code reader to validate the cbm_node_id (like create_human_note MCP tool).
       let codeReader: CodeGraphReader | undefined;
-      try { codeReader = new CodeGraphReader(defaultCodeDbPath(project)); } catch { /* code graph not available */ }
+      try { codeReader = openCodeGraphReaderForRead(project).reader; } catch { /* code graph not available */ }
 
       try {
         const noteId = parseIntStrict(noteIdStr, '<noteId>');

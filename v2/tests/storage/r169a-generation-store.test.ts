@@ -2247,21 +2247,22 @@ describe("R169A — Source inspection: legacy path consumers (section 18G)", () 
   // Expected files that import defaultCodeDbPath. This list is the
   // baseline — new files should NOT be added without migration.
   // Note: src/bridge/sqlite-ro.ts is the DEFINITION, not a consumer.
+  //
+  // R193 (R169D) reader cutover: the one-shot CLI read commands
+  // (cli/index, watch, stats, obsidian, report, human) now resolve their
+  // read target through resolveCodeDbForRead / openCodeGraphReaderForRead
+  // and no longer consume defaultCodeDbPath. The remaining consumers are
+  // writer-side or lifecycle-side identities, where the legacy path IS the
+  // correct key (the indexer writes it; index jobs are identified by it):
   const EXPECTED_CONSUMERS = [
-    "src/bridge/sqlite-ro.ts", // definition
-    "src/indexer/indexer.ts",
-    "src/cli/index.ts",
-    "src/cli/commands/auto-index.ts", // R185: guarded auto refresh reads the freshness column; generation store still inactive (§15)
-    "src/cli/commands/watch.ts",
-    "src/cli/commands/stats.ts",
-    "src/cli/commands/obsidian.ts",
-    "src/cli/commands/report.ts",
-    "src/cli/commands/human.ts",
-    "src/intelligence/graph-status.ts",
-    "src/ui/project-store-registry.ts",
-    "src/ui/routes/index.ts",
-    "src/ui/routes/project.ts",
-    "src/ui/server.ts",
+    "src/bridge/sqlite-ro.ts", // definition + missing→legacy fallback in resolveCodeDbForRead
+    "src/indexer/indexer.ts", // writer: opens the legacy DB for read/write
+    "src/cli/commands/auto-index.ts", // R185: freshness gate reads the writer-side last-success marker (R193 kept on legacy deliberately)
+    "src/intelligence/graph-status.ts", // freshness diagnostics against the live write target (R193 kept on legacy deliberately)
+    "src/ui/project-store-registry.ts", // openEntry/isProjectStoreOpen legacy fallbacks behind the R193 resolver
+    "src/ui/routes/index.ts", // index-job collision guard: jobs are keyed by their legacy store
+    "src/ui/routes/project.ts", // deletion + missing-status lifecycle (legacy files are what deletion removes)
+    "src/ui/server.ts", // index-job collision guard (same as routes/index.ts)
   ];
 
   it("inventory of defaultCodeDbPath consumers matches expected list", () => {

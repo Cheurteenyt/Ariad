@@ -13,8 +13,10 @@ import {
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { rmSync } from 'node:fs';
+import { CodeGraphReader, defaultCodeDbPath, openCodeGraphReaderForRead, resolveCodeDbForRead } from '../../bridge/sqlite-ro.js';
 import { defaultHumanDbPath } from '../../human/store.js';
+import { projectStoreDir } from '../../storage/generation-paths.js';
 import { sendJson, errorMessage, parseJsonBody } from '../helpers.js';
 import { isValidProjectName } from '../project-store-registry.js';
 import type { RouteContext } from '../types.js';
@@ -118,7 +120,8 @@ export async function routeProjects(
         let status = 'healthy';
         let reader: CodeGraphReader | undefined;
         try {
-          reader = new CodeGraphReader(dbPath);
+          // R193 (R169D): resolve the read target (active generation or legacy).
+          reader = openCodeGraphReaderForRead(name).reader;
           const counts = reader.countAll(name);
           nodeCount = counts.nodes;
           edgeCount = counts.edges;
@@ -158,7 +161,14 @@ export async function routeProjectHealth(
     sendJson(res, 400, { error: 'Invalid project name for cross-platform storage' });
     return;
   }
-  const dbPath = defaultCodeDbPath(name);
+  // R193 (R169D): resolve the read target (active generation or legacy).
+  let dbPath: string;
+  try {
+    dbPath = resolveCodeDbForRead(name).dbPath;
+  } catch {
+    sendJson(res, 200, { name, status: 'corrupt', reason: 'Generation store unreadable' });
+    return;
+  }
   if (!existsSync(dbPath)) {
     sendJson(res, 200, { name, status: 'missing', reason: 'DB file not found' });
     return;
@@ -215,6 +225,18 @@ export async function routeProjectDelete(
   const humanDbPath = defaultHumanDbPath(name);
   try {
     const { deleted, cleanupPending } = deleteProjectStores(dbPath, humanDbPath);
+    // R193 (R169D): project lifecycle — remove the generation store with the
+    // legacy DBs. Best-effort: on Windows an open handle in another process
+    // makes the removal fail; the leftover directory is inert (its project
+    // no longer resolves) and harmless.
+    const storeDir = projectStoreDir(name);
+    if (existsSync(storeDir)) {
+      try {
+        rmSync(storeDir, { recursive: true, force: true });
+      } catch {
+        ctx.log(`Generation store cleanup deferred for name="${name}" (open handles or FS error)`);
+      }
+    }
     ctx.log(`Project deleted: name="${name}" db=${dbPath}`);
     if (cleanupPending) {
       ctx.log(`Project deletion cleanup pending: name="${name}"`);

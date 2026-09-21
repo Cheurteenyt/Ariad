@@ -3,7 +3,7 @@
 
 import { Command } from 'commander';
 import { HumanMemoryStore, defaultHumanDbPath } from '../../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { CodeGraphReader, openCodeGraphReaderForRead } from '../../bridge/sqlite-ro.js';
 import { loadConfig, deriveProjectName } from '../../config.js';
 import { computeHotspotsReport, renderHotspotsReportMarkdown } from '../../reports/hotspots.js';
 import { computeUndocumentedReport, renderUndocumentedReportMarkdown } from '../../reports/undocumented.js';
@@ -28,7 +28,7 @@ function withProjectStores<T>(
   let codeReader: CodeGraphReader | undefined;
   try {
     try {
-      codeReader = new CodeGraphReader(defaultCodeDbPath(project));
+      codeReader = openCodeGraphReaderForRead(project).reader;
     } catch (e: unknown) {
       // Code graph not available — the report functions all accept an
       // undefined codeReader and degrade gracefully (human-only mode).

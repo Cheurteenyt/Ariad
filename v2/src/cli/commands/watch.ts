@@ -25,7 +25,7 @@
 
 import { Command } from 'commander';
 import { HumanMemoryStore, defaultHumanDbPath } from '../../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { CodeGraphReader, openCodeGraphReaderForRead } from '../../bridge/sqlite-ro.js';
 import { importVault } from '../../obsidian/importer.js';
 import { generateVault } from '../../obsidian/generator.js';
 import { getNotifyHub } from '../../ui/notify-hub.js';
@@ -82,7 +82,7 @@ export function registerWatchCommand(program: Command): void {
       const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
       let codeReader: CodeGraphReader | undefined;
       try {
-        codeReader = new CodeGraphReader(defaultCodeDbPath(project));
+        codeReader = openCodeGraphReaderForRead(project).reader;
       } catch {
         // Code graph not available — watch will work in human-only mode.
         console.warn('[cbm-v2 watch] Code graph not available — running in human-only mode.');

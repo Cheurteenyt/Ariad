@@ -16,14 +16,25 @@ vi.mock('node:fs', async (importOriginal) => ({
   statSync: mocks.statSync,
 }));
 
-vi.mock('../../src/bridge/sqlite-ro.js', () => ({
-  CodeGraphReader: class {
+vi.mock('../../src/bridge/sqlite-ro.js', () => {
+  const MockReader = class {
     countNodes = mocks.countNodes;
     countEdges = mocks.countEdges;
     close = mocks.close;
-  },
-  defaultCodeDbPath: (name: string) => `/cache/${name}.db`,
-}));
+  };
+  return {
+    CodeGraphReader: MockReader,
+    defaultCodeDbPath: (name: string) => `/cache/${name}.db`,
+    // R193 (R169D): the health route resolves its read target through the
+    // generation-aware resolver. Pin it to the legacy path so this suite keeps
+    // testing exactly the reader lifecycle (construct → fail → close).
+    resolveCodeDbForRead: (name: string) => ({ dbPath: `/cache/${name}.db`, source: 'legacy', generationId: null }),
+    openCodeGraphReaderForRead: (name: string) => ({
+      reader: new MockReader(),
+      target: { dbPath: `/cache/${name}.db`, source: 'legacy' as const, generationId: null },
+    }),
+  };
+});
 
 import { routeProjectHealth } from '../../src/ui/routes/project.js';
 

@@ -16,7 +16,7 @@ import { isSupportedNodeVersion, MINIMUM_NODE_VERSION } from './node-version.js'
 import { McpServer } from '../mcp/server.js';
 import { UiServer } from '../ui/server.js';
 import { HumanMemoryStore, defaultHumanDbPath } from '../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../bridge/sqlite-ro.js';
+import { CodeGraphReader, activeGenerationChanged, openCodeGraphReaderForRead } from '../bridge/sqlite-ro.js';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { loadConfig, DEFAULT_CONFIG, deriveProjectName, deepMerge } from '../config.js';
 
@@ -50,14 +50,30 @@ program
     const config = loadConfig();
     const project = opts.project || config.projectName || deriveProjectName();
     const humanStore = new HumanMemoryStore(defaultHumanDbPath(project));
+    // R193 (R169D): the MCP server is long-lived, so the reader resolves
+    // through a provider that re-opens when the ACTIVE generation changes
+    // (the reader contract's "resolve once" applies per read session; each
+    // tool call is a session). Probe failures keep the previous handle
+    // (a complete immutable snapshot or the live legacy DB). Initial open
+    // failure keeps human-only mode, as before.
     let codeReader: CodeGraphReader | undefined;
+    let heldDbPath: string | undefined;
+    const codeReaderProvider = (): CodeGraphReader | undefined => {
+      if (!activeGenerationChanged(project, heldDbPath)) return codeReader;
+      try {
+        const { reader, target } = openCodeGraphReaderForRead(project);
+        const previous = codeReader;
+        codeReader = reader;
+        heldDbPath = target.dbPath;
+        try { previous?.close(); } catch { /* the new reader is installed */ }
+      } catch (e) {
+        process.stderr.write(`[cbm-v2 mcp] code graph reader refresh failed, keeping previous handle: ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+      return codeReader;
+    };
+    codeReaderProvider();
     try {
-      codeReader = new CodeGraphReader(defaultCodeDbPath(project));
-    } catch {
-      // Code graph not available — operate in human-only mode.
-    }
-    try {
-      const server = new McpServer({ project, humanStore, codeReader });
+      const server = new McpServer({ project, humanStore, codeReader, codeReaderProvider });
       await server.run();
     } finally {
       humanStore.close();
@@ -165,10 +181,11 @@ program
 
     // 4. Code graph DB.
     try {
-      const codeReader = new CodeGraphReader(defaultCodeDbPath(project));
+      // R193 (R169D): resolve the read target (active generation or legacy).
+      const { reader: codeReader, target } = openCodeGraphReaderForRead(project);
       const nodeCount = codeReader.countNodes(project);
       const edgeCount = codeReader.countEdges(project);
-      console.log(`✅ Code graph DB: ${defaultCodeDbPath(project)} (${nodeCount} nodes, ${edgeCount} edges)`);
+      console.log(`✅ Code graph DB: ${target.dbPath} (${target.source}) (${nodeCount} nodes, ${edgeCount} edges)`);
       codeReader.close();
     } catch (e: unknown) {
       console.log(`❌ Code graph DB not available: ${(e instanceof Error ? e.message : String(e)).split('\n')[0]}`);

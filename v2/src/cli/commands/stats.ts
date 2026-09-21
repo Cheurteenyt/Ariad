@@ -3,7 +3,7 @@
 
 import { Command } from 'commander';
 import { HumanMemoryStore, defaultHumanDbPath } from '../../human/store.js';
-import { CodeGraphReader, defaultCodeDbPath } from '../../bridge/sqlite-ro.js';
+import { CodeGraphReader, openCodeGraphReaderForRead } from '../../bridge/sqlite-ro.js';
 import { deriveProjectName } from '../../config.js';
 
 export function registerStatsCommand(program: Command): void {
@@ -18,7 +18,7 @@ export function registerStatsCommand(program: Command): void {
 
       let codeReader: CodeGraphReader | undefined;
       try {
-        codeReader = new CodeGraphReader(defaultCodeDbPath(project));
+        codeReader = openCodeGraphReaderForRead(project).reader;
       } catch {
         // Code graph not available
       }
