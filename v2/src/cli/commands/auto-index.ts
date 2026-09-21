@@ -40,6 +40,18 @@ const STALE_LOCK_MS = 3 * 60 * 60 * 1000;
 const SUCCESS_OUTCOMES = new Set(['SUCCESS', 'SUCCESS_WITH_WARNINGS']);
 const LOG_TAIL_BYTES = 20_000;
 
+/**
+ * R191 (OBS-R191-01): Log line for the incremental→full STALE fallback.
+ * The label used to be a hard-coded "(semantics mismatch)" for EVERY STALE
+ * outcome, mislabeling the other structured stale reasons (R156: e.g.
+ * DISCOVERY_UNCERTAIN) and sending nightly-verdict triage down the wrong
+ * path. It now carries the real structured code when the indexer provides
+ * one.
+ */
+export function staleFallbackMessage(result: Pick<IndexResult, 'staleReason'>): string {
+  return `[index-auto] incremental returned STALE (${result.staleReason?.code ?? 'reason unknown'}) — running a full reindex`;
+}
+
 interface AutoIndexOptions {
   project: string;
   rootPath: string;
@@ -417,7 +429,7 @@ async function runGuardedIndex(options: AutoIndexOptions): Promise<void> {
 
     let result = await withRuntimeCap(runOnce(true));
     if (result.outcome === 'STALE') {
-      console.log('[index-auto] incremental returned STALE (semantics mismatch) — running a full reindex');
+      console.log(staleFallbackMessage(result));
       result = await withRuntimeCap(runOnce(false));
     }
 

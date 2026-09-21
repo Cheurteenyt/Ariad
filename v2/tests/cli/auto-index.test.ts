@@ -14,7 +14,23 @@ import {
   freshSkipReason,
   releaseAutoLock,
   readSuccessMarker,
+  staleFallbackMessage,
 } from '../../src/cli/commands/auto-index.js';
+
+describe('staleFallbackMessage', () => {
+  it('carries the structured stale reason code when present (R191)', () => {
+    const msg = staleFallbackMessage({ staleReason: { code: 'DISCOVERY_UNCERTAIN', message: 'partial discovery', paths: ['src/gen'] } });
+    expect(msg).toContain('DISCOVERY_UNCERTAIN');
+    expect(msg).not.toContain('semantics mismatch');
+    expect(msg).toContain('running a full reindex');
+  });
+
+  it('reports reason unknown when the indexer provided no structured reason', () => {
+    const msg = staleFallbackMessage({});
+    expect(msg).toContain('reason unknown');
+    expect(msg).toContain('running a full reindex');
+  });
+});
 
 describe('freshSkipReason', () => {
   const now = new Date('2026-09-06T12:00:00Z');

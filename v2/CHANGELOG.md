@@ -14,6 +14,9 @@
   mismatch or NULL `mtime_ns` → read+hash → metadata-only backfill or
   re-index. An all-unchanged refresh now costs the walk plus one query, so
   nightly refreshes of unchanged trees are dominated by the walk itself.
+- index-auto: the incremental→full STALE fallback log now carries the
+  structured stale-reason code (R191) instead of a hard-coded
+  "semantics mismatch" label that mislabeled every other R156 reason.
 
 ## 0.78.0-alpha.7 — incremental cross-file resolver (2026-09-08)
 
