@@ -16,9 +16,18 @@ describe('source-discovery coverage modes', () => {
   let tmpDir: string;
   let projectDir: string;
   let createdDbPaths: string[];
+  // R192 (R169C) test-hygiene fix: these tests run indexProjectWasm, which
+  // now publishes generations. Without XDG_CACHE_HOME isolation the runs
+  // wrote DBs — and now generation stores — into the REAL user cache.
+  let realXdgCacheHome: string | undefined;
 
   beforeEach(() => {
+    realXdgCacheHome = process.env.XDG_CACHE_HOME;
     tmpDir = mkdtempSync(join(tmpdir(), 'cbm-discovery-mode-'));
+    // Isolate the cache BEFORE any indexProjectWasm call so DBs and
+    // generation stores land in the test tmp dir, not the user cache.
+    process.env.XDG_CACHE_HOME = join(tmpDir, 'cache');
+    mkdirSync(join(tmpDir, 'cache'), { recursive: true });
     projectDir = join(tmpDir, 'project');
     createdDbPaths = [];
     mkdirSync(projectDir, { recursive: true });
@@ -55,6 +64,8 @@ describe('source-discovery coverage modes', () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    if (realXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = realXdgCacheHome;
     for (const dbPath of createdDbPaths) {
       rmSync(dbPath, { force: true });
       rmSync(`${dbPath}-shm`, { force: true });
