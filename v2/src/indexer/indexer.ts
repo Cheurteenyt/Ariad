@@ -18,6 +18,7 @@ import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION, CURRENT_DISCOVERY_POLICY_VERSION, loadAliasHistory, computeRootFingerprint, commitAliasStateAtomically } from './schema.js';
 import { discoverSourceFilesStructured, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
 import type { DiscoveryMode, DiscoveryResult, FileStatMeta } from './wasm-extractor.js';
+import { generationPublicationDecision, publishGenerationSnapshot, GENERATION_PUBLICATION_DISABLED_ENV, type GenerationPublicationOutcome } from './generation-publication.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
 import { assertDiscoveryRoot, DiscoveryRootError } from '../utils/safe-path.js';
 import { Worker } from 'node:worker_threads';
@@ -265,6 +266,16 @@ export interface IndexResult {
    * R156 (OBS-R156-01): Recovery recommendation.
    */
   recovery?: 'retry_incremental' | 'fix_filesystem' | 'full_reindex' | 'none';
+  /**
+   * R192 (R169C): Atomic generation publication outcome. Present on every
+   * main-path run (published / skipped+reason / failed); absent on early
+   * fast paths (no-op, deletion-only, dry-run, partial discovery). A clean
+   * run snapshots the legacy DB into the generation store via the R169B
+   * publisher; the legacy DB stays the product of record (reader cutover
+   * is R169D), so publication failures never fail the run — they append a
+   * warning and downgrade SUCCESS to SUCCESS_WITH_WARNINGS.
+   */
+  generationPublication?: GenerationPublicationOutcome;
   /**
    * R163 (API-R163-01): When true, the index did not publish new data but a
    * previous snapshot exists in the DB. The `nodes=0`/`edges=0` in the result
@@ -2701,6 +2712,38 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
         })
       : undefined;
 
+    // R192 (R169C): warnings used for the outcome computation — starts as the
+    // discovery warnings; a publication failure below appends
+    // GENERATION_PUBLICATION_FAILED so SUCCESS downgrades to
+    // SUCCESS_WITH_WARNINGS.
+    let warningsForOutcome = discoveryWarnings;
+
+    // R192 (R169C): atomic generation publication. Runs BEFORE the outcome is
+    // computed so a publication failure appends a warning and downgrades
+    // SUCCESS → SUCCESS_WITH_WARNINGS. Gate = Linux-certified platform + not
+    // env-disabled + clean run (errors=0 AND graph not stale). Every main-path
+    // run reports an outcome; early fast paths omit the field.
+    const publicationDecision = generationPublicationDecision({
+      platform: process.platform,
+      envDisabled: process.env[GENERATION_PUBLICATION_DISABLED_ENV] === '1',
+      hasErrors: result.errors.length > 0,
+      crossFileStale,
+    });
+    let generationPublication: GenerationPublicationOutcome;
+    if (publicationDecision.publish) {
+      generationPublication = await publishGenerationSnapshot(db, { project: opts.project, rootFingerprint });
+      if (generationPublication.status === 'failed') {
+        const base = discoveryWarnings;
+        warningsForOutcome = {
+          total: (base?.total ?? 0) + 1,
+          countsByCode: { ...base?.countsByCode, GENERATION_PUBLICATION_FAILED: 1 },
+          samples: [...(base?.samples ?? []), { path: opts.project, code: 'GENERATION_PUBLICATION_FAILED' }],
+        };
+      }
+    } else {
+      generationPublication = { status: 'skipped', reason: publicationDecision.reason, durationMs: 0 };
+    }
+
     return {
       ...result,
       dbPath,
@@ -2709,8 +2752,8 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       parallel: useParallel,
       workerCount: useParallel ? numWorkers : 0,
       crossFileCallsStale: crossFileStale,
-      warnings: discoveryWarnings,
-      outcome: computeOutcome(result.errors, crossFileStale, discoveryWarnings, false),
+      warnings: warningsForOutcome,
+      outcome: computeOutcome(result.errors, crossFileStale, warningsForOutcome, false),
       // R159 (OUTCOME-R159-02): When the classifier returns undefined (e.g.,
       // extraction errors), DON'T fall back to PREVIOUSLY_STALE with the
       // indexError message. R158's fallback mislabeled extraction errors as
@@ -2735,6 +2778,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
       recovery: mainClassified?.recovery ?? (crossFileStale
         ? 'retry_incremental'
         : undefined),
+      generationPublication,
     };
   } catch (error) {
     // R159 (RES-R159-01): outer catch — best-effort persist stale + error.

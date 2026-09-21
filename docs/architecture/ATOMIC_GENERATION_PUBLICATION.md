@@ -1,23 +1,27 @@
 # Atomic Generation Publication — Merged Foundation and Activation Plan
 
-> **Status:** Reference architecture — merged foundation, inactive product path
+> **Status:** Reference architecture — merged foundation, indexer-side publication active, readers still legacy
 > **Audience:** Maintainers, storage engineers, and auditors
-> **Last verified:** `0.78.0-alpha.1` / 2026-07-23
+> **Last verified:** `0.78.0-alpha.9` / 2026-09-21
 
-> **Authoritative status (2026-07-15): R169A and R169B are merged on
+> **Authoritative status (2026-09-21): R169A and R169B are merged on
 > `main`; the R169B merge commit is
 > `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`. The generation-store
-> foundation and publisher primitives are MERGED / INACTIVE.**
+> foundation and publisher primitives are MERGED. R169C
+> (indexer integration + outcome contract) is MERGED / ACTIVE as of
+> `0.78.0-alpha.9`: every clean main-path index run snapshots the legacy DB
+> into the generation store via the R169B publisher and reports the outcome
+> through `IndexResult.generationPublication` (Linux-certified platforms,
+> env kill-switch `CBM_DISABLE_GENERATION_PUBLICATION=1`).**
 >
 > R169B provides the independently tested reserve, prepare/WAL-finalize,
 > validate, fd-based copy+hash, temp-fsync, no-clobber `link`, metadata,
-> manifest, CAS, GC, and recovery primitives. These primitives are not
-> called by the production indexer or readers. The active product still
-> writes and opens the legacy `<project>.db` through `defaultCodeDbPath`.
-> Consequently full product publication is still non-atomic and
+> manifest, CAS, GC, and recovery primitives. Since R169C, successful
+> indexer runs call the publisher (once per run, not per query); READERS
+> still open the legacy `<project>.db` through `defaultCodeDbPath`.
+> Consequently reader-visible product publication is still non-atomic and
 > `DATA-CARRY-01` remains open.
 >
-> R169C is the future indexer integration and outcome-contract round;
 > R169D is the future reader/lifecycle cutover. **R169E is paused, not
 > scheduled:** the production-scale reindexing-safety need it addresses has
 > not been demonstrated at the project's current test scale (2 repositories,
@@ -32,7 +36,7 @@
 > merged primitive contract or the future activated product, as labelled.
 >
 > **Foundation package version:** 0.75.0 (R169A/R169B history)
-> **Current package version at last verification:** 0.76.0
+> **Current package version at last verification:** 0.78.0-alpha.9
 > **Semantics:** `CURRENT_EXTRACTOR_SEMANTICS_VERSION = 9`,
 > `CURRENT_DISCOVERY_POLICY_VERSION = 3`
 > **Manifest format:** `CURRENT_GENERATION_MANIFEST_VERSION = 1`
@@ -42,8 +46,9 @@
 ## 0. TL;DR
 
 R169A and R169B land the independently tested **plumbing and publication
-primitives** for atomic generation publication. They remain inert in the
-product and impose **zero hot-path overhead** while unused.
+primitives** for atomic generation publication. R169C activates the
+indexer-side write path: clean index runs publish a generation (once per
+run); readers remain on the legacy DB until R169D.
 
 Activation is staged across R169B–R169E (validated roadmap):
 
@@ -51,7 +56,7 @@ Activation is staged across R169B–R169E (validated roadmap):
 |-------|-------|--------|
 | R169A | Generation Store Contract + Resolver Foundation | **merged / inactive** |
 | R169B | Durable Staging Publisher + Validator + fsync + CAS + GC/recovery primitives | **merged / inactive** (`15a732d91984e5b4ffa29b4e129ac0d6316c9fca`) |
-| R169C | Indexer Integration + Outcome Contract | future |
+| R169C | Indexer Integration + Outcome Contract | **merged / active** (`0.78.0-alpha.9`) |
 | R169D | Reader Cutover + Legacy Migration + Project Lifecycle | future |
 | R169E | Integrated Crash Matrix + Performance + Activation + Version | **paused, not scheduled** |
 
@@ -772,8 +777,12 @@ integration work, while R169E is paused and not scheduled. There is no
   production readers do not call the resolver.
 - **R169C — Indexer Integration + Outcome Contract.** Wire those
   primitives into `indexProjectWasm` and propagate the publication
-  outcome through `IndexResult`. This is future work. Until it lands,
-  the indexer writes only the legacy DB.
+  outcome through `IndexResult`. **Merged / active as of
+  `0.78.0-alpha.9`**: clean main-path runs publish a generation
+  (Linux-certified platforms, env kill-switch
+  `CBM_DISABLE_GENERATION_PUBLICATION=1`) and every main-path run
+  reports `IndexResult.generationPublication`. The indexer still writes
+  the legacy DB; readers still read it (R169D).
 - **R169D — Reader Cutover + Legacy Migration + Project Lifecycle.**
   Future reader switch from `legacyCodeDbPath` to `resolveActiveCodeDb`,
   legacy migration, and lifecycle wiring.
@@ -939,8 +948,10 @@ generations. Older generations are deleted.**
 - Interrupted `DELETING` entries and filesystem orphans are handled by
   the merged recovery primitives. `tmp/` sweeping uses captured file
   identity so a replacement is not deleted by path alone.
-- These GC/recovery APIs are **merged but inactive**. The production
-  indexer and readers do not invoke them before R169C/R169D integration.
+- These GC/recovery APIs are **merged but not yet wired into the product
+  run loop**. The production indexer invokes the publisher (R169C) but not
+  GC/recovery; readers invoke neither. GC/recovery wiring belongs to the
+  reader cutover / lifecycle rounds (R169D+).
 
 ## 11. Recovery
 
@@ -1044,7 +1055,8 @@ The merged, independently callable pipeline is:
 RESERVE              reserveGenerationStaging
                      → tmp/generation-<uuid>.db (0600, O_CREAT|O_EXCL)
 
-POPULATE             (by future R169C caller — the indexer)
+POPULATE             (R169C: the indexer, via SQLite online backup of the
+                      legacy DB into the reserved staging file)
 
 FINALIZE WAL         prepareGenerationForPublication
                      → synchronous = FULL (BEFORE checkpoint)
@@ -1174,35 +1186,44 @@ indeterminate state and the caller must run recovery.
 
 ### Activation boundary
 
-- R169B is MERGED / INACTIVE — no production code calls the publisher.
-- Linux-only certified at this stage.
+- R169B is MERGED — the publisher is production-called by the indexer
+  since R169C (`0.78.0-alpha.9`).
+- Linux-only certified at this stage (other platforms skip publication
+  with reason `platform-not-certified`).
 - Multi-host coordination is NOT safe (R170 fencing is absent).
-- R169C indexer integration is absent.
+- R169C indexer integration is merged and active; R169D reader cutover is
+  not (readers still open the legacy DB).
 - R169B includes targeted fault injection, child-process crash, concurrency,
   publisher/GC race, GC, CAS, and recovery tests. The end-to-end product
-  crash matrix remains part of the paused R169E activation gate because the indexer
-  and readers have not been integrated.
+  crash matrix remains part of the paused R169E activation gate because the
+  readers have not been integrated (and GC/recovery is not yet wired into
+  the run loop).
 
 ## 13. Performance contract
 
-The merged R169A/R169B generation-store path has **zero hot-path
-overhead while unused**.
+The R169A/R169B generation-store path had **zero hot-path overhead while
+unused**; since R169C the indexer pays a **once-per-run publication cost**
+on clean runs.
 
-- No production code imports `generation-store.js` at startup. The
-  module is only loaded by its own tests.
-- No `fsync`, no `mkdir`, no `lstat` is performed on the hot path. The
-  indexer, readers, UI, MCP, and CLI all continue to use
-  `defaultCodeDbPath` (which equals `legacyCodeDbPath`).
-- The test suite that verifies the no-overhead property lives at
-  `v2/tests/storage/r169a-generation-store.test.ts`, in the
+- The publisher modules now load with the indexer (R169C import), but no
+  filesystem publication work happens unless a clean main-path run reaches
+  the publication step. Readers, UI, MCP, and CLI still use
+  `defaultCodeDbPath` (which equals `legacyCodeDbPath`) and pay nothing.
+- On publishable runs the cost is bounded and once-per-run: one SQLite
+  online backup of the legacy DB into the reserved staging file (R169C
+  POPULATE), plus the publisher promotion costs below. No per-query cost.
+- The test suite that verifies the reader-facing no-overhead property
+  lives at `v2/tests/storage/r169a-generation-store.test.ts`, in the
   `R169A — No production behavior change` block. It checks that:
   - `defaultCodeDbPath` still exists and is importable.
   - `legacyCodeDbPath(project)` produces the same path as
     `defaultCodeDbPath(project)`.
   - `CURRENT_GENERATION_MANIFEST_VERSION` is still `1`.
 
-When R169C integrates the R169B publisher primitives, the cost model includes:
+Since R169C integrated the R169B publisher primitives, the per-run cost model includes:
 
+- One SQLite online backup of the legacy DB into the reserved staging file
+  (`db.backup`), producing a compacted, WAL-free snapshot.
 - An fd-based copy+hash from the staging DB into an exclusive temp in
   `generations/`, followed by temp-file and directory fsyncs.
 - One no-clobber `link` from that temp name to the canonical generation
@@ -1252,16 +1273,17 @@ that share a cache directory (rare, but possible over NFS) are not safe
 under the merged foundation alone. The single-host contract (section 2)
 is the only contract currently provided by these primitives.
 
-## 15. Status: MERGED / INACTIVE
+## 15. Status: MERGED — indexer-side publication ACTIVE (R169C), readers LEGACY
 
 To repeat the headline, because it is the most important fact in this
 document:
 
 > **R169A and R169B are merged; R169B is present on `main` at
-> `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`. The generation-store
-> primitives remain inactive. No production code path uses them. The
-> indexer still writes to the
-> legacy DB. Readers still open the legacy DB directly.
+> `15a732d91984e5b4ffa29b4e129ac0d6316c9fca`. R169C is merged as of
+> `0.78.0-alpha.9`: successful indexer runs publish a generation through
+> the R169B publisher (once per run, Linux-certified platforms) and report
+> the outcome through `IndexResult.generationPublication`. READERS still
+> open the legacy DB directly — the reader cutover is R169D.
 > `DATA-CARRY-01` (P1) remains OPEN until R169E (after crash matrix +
 > concurrency + performance + activation).**
 
@@ -1279,22 +1301,24 @@ What the merged foundation delivers:
 - `v2/src/storage/generation-gc.ts` and
   `v2/src/storage/internal/generation-cas-store.ts` — GC planning/apply,
   orphan recovery, catalog, history, pinning, and reconciliation.
+- `v2/src/indexer/generation-publication.ts` — R169C integration module:
+  publication gate, snapshot (`db.backup` into the reserved staging file),
+  and the outcome contract embedded in `IndexResult`.
 - `v2/tests/storage/r169b-*.test.ts` — publisher, CAS, GC, recovery,
   concurrency, race, and crash-harness evidence.
 
 What remains unactivated:
 
-- R169C — Indexer Integration + Outcome Contract. Wire those primitives
-  into `indexProjectWasm` and outcome paths.
 - R169D — Reader Cutover + Legacy Migration + Project Lifecycle.
 - R169E — **paused, not scheduled** Crash Matrix + Performance + Activation
   + Version (and the formal close-out of `DATA-CARRY-01` if reactivated and
   completed).
 - R170 — Multi-host fencing / lease.
 
-The R169A/R169B foundation is merged and remains inactive so that
-R169C–R169E can integrate, cut over, and activate it with their own
-tests and audits. There is no "big bang" activation.
+The R169A/R169B foundation is merged; R169C activated the indexer-side
+write path without touching the reader side. R169D–R169E cut readers over
+and gate full activation with their own tests and audits. There is no
+"big bang" activation.
 `DATA-CARRY-01` (P1) remains OPEN until R169E has passed the crash
 matrix, concurrency analysis, performance verification, and activation
 gating.

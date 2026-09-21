@@ -1,5 +1,27 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.9 — atomic generation publication (R169C) (2026-09-21)
+
+- R169C: the indexer now integrates the merged R169B publisher primitives.
+  After a clean main-path run (errors=0 and graph not stale — the
+  SUCCESS / SUCCESS_WITH_WARNINGS precondition), the legacy DB is
+  snapshotted with the SQLite online backup into the publisher-reserved
+  staging file, prepared (WAL finalize + validate + hash), and published
+  under the CAS optimistic lock. Readers still open the legacy DB — the
+  reader cutover remains R169D.
+- Outcome contract: `IndexResult.generationPublication` reports
+  `published` (with generationId and dedup flag), `skipped` (+reason), or
+  `failed` (+structured error code) on every main-path run. Publication
+  failures never fail the run: the legacy DB stays the product of record
+  and the outcome downgrades to SUCCESS_WITH_WARNINGS via a
+  GENERATION_PUBLICATION_FAILED warning.
+- Gates: Linux-only (the R169B primitives are Linux-certified; other
+  platforms record `platform-not-certified`), env kill-switch
+  `CBM_DISABLE_GENERATION_PUBLICATION=1`, and STALE/PARTIAL/FAILED runs
+  never publish. Early fast paths (no-op, deletion-only, dry-run) omit the
+  field. Cost: paid once per run (backup + validate + hash + CAS), not per
+  query.
+
 ## 0.78.0-alpha.8 — mtime pruning of the incremental refresh path (2026-09-21)
 
 - P1.3: the incremental refresh path no longer re-stats and re-queries every
