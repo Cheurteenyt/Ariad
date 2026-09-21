@@ -135,14 +135,47 @@ async function getParserForLanguage(lang: string): Promise<Parser> {
 
 // ── Worker entry point ─────────────────────────────────────────────────
 
-async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
+export interface WorkerRunMessage {
+  kind: 'run';
+  seq: number;
+  batch: WorkerBatch;
+}
+
+/**
+ * R194: worker → main stream messages. The worker posts one 'file' message
+ * per parsed file (immediately, before the rest of the batch finishes) and
+ * one 'done' message per batch, so the main thread writes each file inside
+ * the streaming transaction and frees it at once. In-flight memory is then
+ * bounded by one FILE per in-flight parse instead of one BATCH result plus
+ * its structured-clone copy.
+ */
+export type WorkerStreamMessage =
+  | { kind: 'file'; seq: number; fileIndex: number; result: WorkerFileResult }
+  | { kind: 'done'; seq: number; language: string; durationMs: number; error?: string };
+
+/**
+ * Parse every file of a batch. When `onFileResult` is provided (streaming
+ * mode) each file's result is emitted the moment it is ready and NOT
+ * accumulated; when it is omitted the legacy batch-result array is built.
+ * Per-file failures surface as error results through the same channel in
+ * both modes — only a catastrophic failure of the batch loop itself
+ * rejects.
+ */
+async function processBatch(
+  batch: WorkerBatch,
+  onFileResult?: (fileIndex: number, result: WorkerFileResult) => void,
+): Promise<WorkerBatchResult> {
   const start = Date.now();
   const results: WorkerFileResult[] = [];
+  const emit = (fileIndex: number, result: WorkerFileResult): void => {
+    if (onFileResult) onFileResult(fileIndex, result);
+    else results.push(result);
+  };
 
   try {
     const p = await getParserForLanguage(batch.language);
 
-    for (const filePath of batch.files) {
+    for (const [fileIndex, filePath] of batch.files.entries()) {
       const relPath = relative(batch.rootPath, filePath);
       try {
         const { source, stat } = await readSourceBounded(filePath);
@@ -157,7 +190,7 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
         };
         const tree = p.parse(source);
         if (!tree) {
-          results.push({ filePath: relPath, language: batch.language, nodes: [], edges: [], error: 'parse returned null', hashInfo: null, unresolvedCalls: [], imports: [], defaultExportQn: null, defaultExportCount: 0, exports: [] });
+          emit(fileIndex, { filePath: relPath, language: batch.language, nodes: [], edges: [], error: 'parse returned null', hashInfo: null, unresolvedCalls: [], imports: [], defaultExportQn: null, defaultExportCount: 0, exports: [] });
           continue;
         }
 
@@ -174,7 +207,7 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
           // R72: use fast-walker (descendantsOfType) instead of recursive walkAST
           const extracted = extractFast(tree.rootNode, batch.project, relPath, fileQn, source.length);
 
-          results.push({
+          emit(fileIndex, {
             filePath: relPath,
             language: batch.language,
             nodes: extracted.nodes,
@@ -190,7 +223,7 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
           tree.delete();
         }
       } catch (e: unknown) {
-        results.push({
+        emit(fileIndex, {
           filePath: relPath, language: batch.language, nodes: [], edges: [], unresolvedCalls: [], imports: [],
           defaultExportQn: null,
           defaultExportCount: 0,
@@ -202,6 +235,21 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
     }
   } catch (e: unknown) {
     const errMsg = e instanceof Error ? e.message : String(e);
+    if (onFileResult) {
+      // Streaming mode: the batch loop itself failed (e.g. grammar load) —
+      // emit error results for the files that never got a result so the
+      // main thread can account for every file of the batch.
+      for (const [fileIndex, filePath] of batch.files.entries()) {
+        emit(fileIndex, {
+          filePath: relative(batch.rootPath, filePath), language: batch.language,
+          nodes: [], edges: [], error: errMsg, hashInfo: null, unresolvedCalls: [], imports: [],
+          defaultExportQn: null,
+          defaultExportCount: 0,
+          exports: [],
+        });
+      }
+      throw e;
+    }
     for (const filePath of batch.files) {
       results.push({
         filePath: relative(batch.rootPath, filePath), language: batch.language,
@@ -219,17 +267,24 @@ async function processBatch(batch: WorkerBatch): Promise<WorkerBatchResult> {
 // ── Worker message handling ────────────────────────────────────────────
 
 if (parentPort && workerData) {
-  const batch = workerData as WorkerBatch;
-  processBatch(batch)
-    .then((result) => {
-      parentPort!.postMessage(result);
+  // R194: persistent slot worker. The worker is spawned once per pool slot
+  // and receives batches via postMessage — the WASM parser and language
+  // cache live for the slot's lifetime instead of being reloaded per batch.
+  parentPort.on('message', (msg: WorkerRunMessage) => {
+    if (!msg || msg.kind !== 'run') return;
+    processBatch(msg.batch, (fileIndex, result) => {
+      parentPort!.postMessage({ kind: 'file', seq: msg.seq, fileIndex, result } satisfies WorkerStreamMessage);
     })
-    .catch((e: unknown) => {
-      parentPort!.postMessage({
-        results: [],
-        language: batch.language,
-        durationMs: 0,
-        error: e instanceof Error ? e.message : String(e),
-      } as WorkerBatchResult & { error: string });
-    });
+      .then(({ language, durationMs }) => {
+        parentPort!.postMessage({ kind: 'done', seq: msg.seq, language, durationMs } satisfies WorkerStreamMessage);
+      })
+      .catch((e: unknown) => {
+        // Catastrophic batch failure after per-file error emission — the
+        // main thread marks the batch failed and respawns the slot worker.
+        parentPort!.postMessage({
+          kind: 'done', seq: msg.seq, language: msg.batch.language, durationMs: 0,
+          error: e instanceof Error ? e.message : String(e),
+        } satisfies WorkerStreamMessage);
+      });
+  });
 }

@@ -26,8 +26,8 @@ import { cpus } from 'node:os';
 import { dirname, join, relative as nodeRelative, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
-import type { WorkerBatch, WorkerBatchResult } from './worker.js';
-import type { UnresolvedCallSite, ImportBinding, ExportBinding } from './fast-walker.js';
+import type { WorkerBatch, WorkerFileResult, WorkerRunMessage, WorkerStreamMessage } from './worker.js';
+import type { ImportBinding } from './fast-walker.js';
 
 /**
  * R161 (OBS-R161-03): Unified MAX_STALE_PATHS module-level constant.
@@ -2997,11 +2997,12 @@ async function indexParallel(
     // language previously produced exactly numWorkers gigantic batches
     // (6-7k files each on whole-drive indexes): each batch result held
     // hundreds of MB of nodes/edges/call-sites, and 16 in-flight results
-    // plus their postMessage clones peaked the heap at 24GB. A fixed file
-    // cap keeps in-flight memory bounded (~750 files ≈ 40-50MB per result)
-    // and balances load when one huge generated file shares a batch with
-    // thousands of small ones.
-    const batchSize = Math.max(1, Math.min(Math.ceil(filesToIndex.length / numWorkers), 750));
+    // plus their postMessage clones peaked the heap at 24GB.
+    // R194: the cap is 250 files (~15MB per fully-buffered batch) AND
+    // results stream per file, so the heap holds at most the not-yet-
+    // in-order batches' received files, and the in-order batch's files are
+    // written and freed on arrival.
+    const batchSize = Math.max(1, Math.min(Math.ceil(filesToIndex.length / numWorkers), 250));
     for (let i = 0; i < filesToIndex.length; i += batchSize) {
       batches.push({
         files: filesToIndex.slice(i, i + batchSize),
@@ -3066,20 +3067,26 @@ async function indexParallel(
 
   // R187: STREAMING WRITE — results are written to SQLite in dispatch order
   // inside one manual transaction (BEGIN at the first write, COMMIT after the
-  // resolver). Worker results are held only in a bounded reorder buffer
-  // (≤ numWorkers batches); the old code accumulated every batch result in
-  // RAM (29GB peaks on drive-scale graphs) and re-loaded everything again in
-  // the resolver while those results were still referenced. The data now
-  // lives in the open transaction (WAL on disk) instead of the JS heap.
+  // resolver). The old code accumulated every batch result in RAM (29GB
+  // peaks on drive-scale graphs) and re-loaded everything again in the
+  // resolver while those results were still referenced. The data now lives
+  // in the open transaction (WAL on disk) instead of the JS heap.
   //
-  // Atomicity: the full-mode clear of the previous graph moved INSIDE the
-  // transaction (it used to run in its own transaction before dispatch), so a
-  // crash mid-stream now ROLLS BACK to the previous graph instead of leaving
-  // an empty one. Determinism (R81 Bug 19): batches are consumed strictly in
-  // dispatch sequence — batches[] is built deterministically (sorted
-  // discovery, Map insertion order) and each batch's files are already in
-  // sorted order, so ID assignment is deterministic without the post-hoc
-  // results sort.
+  // R194 (memory levers): results stream PER FILE — the worker posts each
+  // file the moment it is parsed (no batch-result accumulation, no
+  // batch-sized structured clones) and the main thread writes each file in
+  // strict (seq, fileIndex) order, freeing it immediately. Batches are
+  // capped at 250 files, so the worst-case reorder buffer is
+  // (numWorkers-1) × 250 file results (the in-order batch's files are
+  // written on arrival). Slot workers are persistent: the WASM parser loads
+  // once per slot per run instead of once per batch.
+  //
+  // Atomicity: the full-mode clear of the previous graph stays INSIDE the
+  // transaction (a crash mid-stream ROLLS BACK to the previous graph).
+  // Determinism (R81 Bug 19): files are consumed strictly in dispatch
+  // sequence — batches[] is built deterministically (sorted discovery, Map
+  // insertion order) and each batch's files are already in sorted order, so
+  // ID assignment is deterministic without any post-hoc sort.
   const workerUrl = new URL('./worker.js', import.meta.url);
   const errors: Array<{ file: string; error: string }> = [];
   let nodeCount = 0;
@@ -3098,7 +3105,21 @@ async function indexParallel(
   let fullCleared = false;
   let nextNodeId = 0;
   let nextSeq = 0;
-  const reorder = new Map<number, { batch: WorkerBatch; result: WorkerBatchResult | null }>();
+  let nextFileIndex = 0;
+  // R194: per-slot streaming state. Each dispatched batch registers a slot
+  // holding the file results received so far; the main thread writes files
+  // strictly in (dispatch seq, file index) order and frees each result as
+  // soon as it is written, so in-flight memory is bounded by the files of
+  // the not-yet-in-order batches (≤ (numWorkers-1) × 250 files) instead of
+  // full batch results.
+  const reorder = new Map<number, {
+    received: Map<number, WorkerFileResult>;
+    expected: number;
+    written: number;
+    done: boolean;
+    failed: boolean;
+    failError?: string;
+  }>();
   // Worker edges are same-file (CONTAINS, intra-file CALLS); any edge whose
   // endpoints were not written yet is parked here and retried once after the
   // last batch (defensive — the resolver owns genuinely cross-file edges).
@@ -3151,39 +3172,36 @@ async function indexParallel(
     stmt.run(...params);
   };
 
-  const writeBatchInTx = (result: WorkerBatchResult): void => {
+  // R194: per-file write — the streaming counterpart of R187's
+  // writeBatchInTx. Every per-batch operation was already a per-file loop,
+  // so semantics are identical; only the DB statement granularity changes
+  // (per file instead of per batch) and each result is freed as soon as it
+  // is written.
+  let metaApplied = false;
+  const writeOneFileInTx = (fileResult: WorkerFileResult): void => {
     beginTxIfNeeded();
-
-    const successfulRelPaths: string[] = [];
-    for (const fileResult of result.results) {
-      if (fileResult.error) {
-        errors.push({ file: fileResult.filePath, error: fileResult.error });
-        continue;
-      }
-      successfulRelPaths.push(fileResult.filePath);
-      fileCount++;
+    if (fileResult.error) {
+      errors.push({ file: fileResult.filePath, error: fileResult.error });
+      return;
     }
+    fileCount++;
+    const relPath = fileResult.filePath;
+    const isChanged = pendingChangedSet.has(relPath);
 
-    // R80/R82: incremental — delete old nodes/edges for changed files of THIS
-    // batch that succeeded, before re-inserting them.
-    if (incremental) {
-      const changedOk = successfulRelPaths.filter(p => pendingChangedSet.has(p));
-      if (changedOk.length > 0) {
-        const ph = changedOk.map(() => '?').join(',');
-        const oldNodeIds = db.prepare(
-          `SELECT id FROM nodes WHERE project = ? AND file_path IN (${ph})`
-        ).all(project, ...changedOk) as Array<{ id: number }>;
-        if (oldNodeIds.length > 0) {
-          const idPh = oldNodeIds.map(() => '?').join(',');
-          const idParams = oldNodeIds.map(r => r.id);
-          db.prepare(
-            `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
-          ).run(project, ...idParams, ...idParams);
-        }
+    // R80/R82: incremental — delete old nodes/edges for THIS changed file
+    // before re-inserting it.
+    if (incremental && isChanged) {
+      const oldNodeIds = db.prepare(
+        'SELECT id FROM nodes WHERE project = ? AND file_path = ?'
+      ).all(project, relPath) as Array<{ id: number }>;
+      if (oldNodeIds.length > 0) {
+        const idPh = oldNodeIds.map(() => '?').join(',');
+        const idParams = oldNodeIds.map(r => r.id);
         db.prepare(
-          `DELETE FROM nodes WHERE project = ? AND file_path IN (${ph})`
-        ).run(project, ...changedOk);
+          `DELETE FROM edges WHERE project = ? AND (source_id IN (${idPh}) OR target_id IN (${idPh}))`
+        ).run(project, ...idParams, ...idParams);
       }
+      db.prepare('DELETE FROM nodes WHERE project = ? AND file_path = ?').run(project, relPath);
     }
 
     // Nodes (multi-row, bounded chunks; IDs assigned in sequence order).
@@ -3191,21 +3209,18 @@ async function indexParallel(
       nodeId: number; label: string; name: string; qualifiedName: string;
       filePath: string; startLine: number; endLine: number; properties: string;
     }> = [];
-    for (const fileResult of result.results) {
-      if (fileResult.error) continue;
-      for (const node of fileResult.nodes) {
-        const nodeId = nextNodeId++;
-        nodeRows.push({
-          nodeId, label: node.label, name: node.name, qualifiedName: node.qualifiedName,
-          filePath: node.filePath, startLine: node.startLine, endLine: node.endLine,
-          properties: node.properties,
-        });
-        qnToId.set(node.qualifiedName, nodeId);
-        nodeCount++;
-        if (nodeRows.length >= INSERT_BATCH) {
-          flushNodeRows(nodeRows);
-          nodeRows.length = 0;
-        }
+    for (const node of fileResult.nodes) {
+      const nodeId = nextNodeId++;
+      nodeRows.push({
+        nodeId, label: node.label, name: node.name, qualifiedName: node.qualifiedName,
+        filePath: node.filePath, startLine: node.startLine, endLine: node.endLine,
+        properties: node.properties,
+      });
+      qnToId.set(node.qualifiedName, nodeId);
+      nodeCount++;
+      if (nodeRows.length >= INSERT_BATCH) {
+        flushNodeRows(nodeRows);
+        nodeRows.length = 0;
       }
     }
     flushNodeRows(nodeRows);
@@ -3213,27 +3228,25 @@ async function indexParallel(
     // Edges (multi-row; same-file edges resolve immediately, anything else is
     // deferred to the post-drain fallback below).
     const edgeRows: Array<{ sourceId: number; targetId: number; type: string; properties: string }> = [];
-    for (const fileResult of result.results) {
-      if (fileResult.error) continue;
-      for (const edge of fileResult.edges) {
-        const sourceId = qnToId.get(edge.sourceQn);
-        const targetId = qnToId.get(edge.targetQn);
-        if (!sourceId || !targetId) {
-          deferredEdges.push({ sourceQn: edge.sourceQn, targetQn: edge.targetQn, type: edge.type, properties: edge.properties });
-          continue;
-        }
-        edgeRows.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
-        edgeCount++;
-        if (edgeRows.length >= INSERT_BATCH) {
-          flushEdgeRows(edgeRows);
-          edgeRows.length = 0;
-        }
+    for (const edge of fileResult.edges) {
+      const sourceId = qnToId.get(edge.sourceQn);
+      const targetId = qnToId.get(edge.targetQn);
+      if (!sourceId || !targetId) {
+        deferredEdges.push({ sourceQn: edge.sourceQn, targetQn: edge.targetQn, type: edge.type, properties: edge.properties });
+        continue;
+      }
+      edgeRows.push({ sourceId, targetId, type: edge.type, properties: edge.properties });
+      edgeCount++;
+      if (edgeRows.length >= INSERT_BATCH) {
+        flushEdgeRows(edgeRows);
+        edgeRows.length = 0;
       }
     }
     flushEdgeRows(edgeRows);
 
-    // Hashes: full mode → hashInfo from workers; incremental → changed files
-    // that succeeded; metadata-only updates once at tx open.
+    // Hashes: full mode → the file's hashInfo from the worker; incremental →
+    // the pending hash update for this file; metadata-only backfills apply
+    // once, at the first written file (R88 Bug 30).
     const upsertHash = db.prepare(`
       INSERT INTO file_hashes (project, file_path, content_hash, mtime, mtime_ns, size, indexed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3241,123 +3254,164 @@ async function indexParallel(
         content_hash = excluded.content_hash, mtime = excluded.mtime, mtime_ns = excluded.mtime_ns, size = excluded.size, indexed_at = excluded.indexed_at
     `);
     if (!incremental) {
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.hashInfo) continue;
+      if (fileResult.hashInfo) {
         upsertHash.run(project, fileResult.filePath, fileResult.hashInfo.hash,
           fileResult.hashInfo.mtime, fileResult.hashInfo.mtimeNs,
           fileResult.hashInfo.size, new Date().toISOString());
       }
     } else {
-      for (const relPath of successfulRelPaths) {
-        const h = pendingHashByPath.get(relPath);
-        if (h) upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
+      if (!metaApplied) {
+        for (const h of allMetadataOnlyHashUpdates) {
+          upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
+        }
+        allMetadataOnlyHashUpdates.length = 0;
+        metaApplied = true;
       }
-      for (const h of allMetadataOnlyHashUpdates) {
-        upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
-      }
-      allMetadataOnlyHashUpdates.length = 0;
+      const h = pendingHashByPath.get(relPath);
+      if (h) upsertHash.run(project, h.relPath, h.hash, h.mtime, h.mtimeNs, h.size, h.indexedAt);
     }
 
-    // call_sites / imports / exports: per-batch replace (incremental deletes
-    // only this batch's changed files; full mode inserts into cleared tables).
-    const batchChangedOk = incremental
-      ? successfulRelPaths.filter(p => pendingChangedSet.has(p))
-      : [];
-    if (incremental) {
-      const batchSites: UnresolvedCallSite[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.unresolvedCalls) continue;
-        batchSites.push(...fileResult.unresolvedCalls);
-      }
-      replaceCallSitesForFiles(db, project, batchChangedOk, batchSites);
-      const batchImports: ImportBinding[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.imports) continue;
-        batchImports.push(...fileResult.imports);
-        if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
-          batchImports.push({
-            localName: '__default_export__',
-            sourceModule: String(fileResult.defaultExportCount),
-            importedName: fileResult.defaultExportQn || '',
-            importKind: 'default_export',
-            line: 0,
-            filePath: fileResult.filePath,
-          });
-        }
-      }
-      replaceImportsForFiles(db, project, batchChangedOk, batchImports);
-      const batchExports: ExportBinding[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.exports) continue;
-        batchExports.push(...fileResult.exports);
-      }
-      replaceExportsForFiles(db, project, batchChangedOk, batchExports);
-    } else {
-      const batchSites: UnresolvedCallSite[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.unresolvedCalls) continue;
-        batchSites.push(...fileResult.unresolvedCalls);
-      }
-      replaceCallSitesForFiles(db, project, [], batchSites);
-      const batchImports: ImportBinding[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.imports) continue;
-        batchImports.push(...fileResult.imports);
-        if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
-          batchImports.push({
-            localName: '__default_export__',
-            sourceModule: String(fileResult.defaultExportCount),
-            importedName: fileResult.defaultExportQn || '',
-            importKind: 'default_export',
-            line: 0,
-            filePath: fileResult.filePath,
-          });
-        }
-      }
-      replaceImportsForFiles(db, project, [], batchImports);
-      const batchExports: ExportBinding[] = [];
-      for (const fileResult of result.results) {
-        if (fileResult.error || !fileResult.exports) continue;
-        batchExports.push(...fileResult.exports);
-      }
-      replaceExportsForFiles(db, project, [], batchExports);
+    // call_sites / imports / exports: per-file replace (incremental deletes
+    // only this file's rows when it is a changed file; full mode inserts
+    // into cleared tables).
+    const changedOk = incremental && isChanged ? [relPath] : [];
+    replaceCallSitesForFiles(db, project, changedOk, fileResult.unresolvedCalls ?? []);
+    const imports: ImportBinding[] = [...(fileResult.imports ?? [])];
+    if (fileResult.defaultExportQn || fileResult.defaultExportCount > 0) {
+      imports.push({
+        localName: '__default_export__',
+        sourceModule: String(fileResult.defaultExportCount),
+        importedName: fileResult.defaultExportQn || '',
+        importKind: 'default_export',
+        line: 0,
+        filePath: relPath,
+      });
     }
+    replaceImportsForFiles(db, project, changedOk, imports);
+    replaceExportsForFiles(db, project, changedOk, fileResult.exports ?? []);
   };
 
   const tryFlush = (): void => {
-    while (reorder.has(nextSeq)) {
-      const item = reorder.get(nextSeq)!;
-      reorder.delete(nextSeq);
-      nextSeq++;
-      if (item.result) writeBatchInTx(item.result);
+    for (;;) {
+      const slot = reorder.get(nextSeq);
+      if (!slot) break;
+      if (slot.failed) {
+        // R194: the slot's worker died on this batch. Keep the file results
+        // that arrived (they parsed fine), fail the files that never made
+        // it, then free the slot — the same whole-batch failure semantics
+        // as before, minus discarding work already done.
+        beginTxIfNeeded();
+        for (let i = slot.written; i < slot.expected; i++) {
+          const r = slot.received.get(i);
+          const absPath = batches[nextSeq]?.files[i];
+          if (r) {
+            writeOneFileInTx(r);
+          } else if (absPath !== undefined) {
+            errors.push({ file: nodeRelative(rootPath, absPath), error: slot.failError ?? 'worker failed' });
+          }
+        }
+        reorder.delete(nextSeq);
+        nextSeq++;
+        nextFileIndex = 0;
+        continue;
+      }
+      // Write the files of the in-order batch that have already arrived.
+      while (slot.received.has(nextFileIndex)) {
+        const r = slot.received.get(nextFileIndex)!;
+        slot.received.delete(nextFileIndex);
+        writeOneFileInTx(r);
+        slot.written++;
+        nextFileIndex++;
+      }
+      if (slot.done && nextFileIndex >= slot.expected) {
+        reorder.delete(nextSeq);
+        nextSeq++;
+        nextFileIndex = 0;
+        continue;
+      }
+      break; // waiting for more files of this batch
     }
   };
 
-  // Process batches with a pool of workers
+  // Process batches with persistent per-slot workers (R194): one worker per
+  // slot for the whole run — the WASM parser loads once per slot instead of
+  // once per batch — pulling batches in dispatch order and streaming file
+  // results back as they parse.
   const workerPromises: Promise<void>[] = [];
   let batchIndex = 0;
+  let slotCounter = 0;
+
+  const spawnSlotWorker = (url: URL): Worker =>
+    new Worker(url, { workerData: { slot: slotCounter++ } });
+
+  const runBatchOnWorker = (worker: Worker, seq: number, batch: WorkerBatch): Promise<void> =>
+    new Promise((resolveBatch, rejectBatch) => {
+      const onMessage = (msg: WorkerStreamMessage) => {
+        if (msg.seq !== seq) return;
+        if (msg.kind === 'file') {
+          const slot = reorder.get(seq);
+          if (slot) {
+            slot.received.set(msg.fileIndex, msg.result);
+            tryFlush();
+          }
+          return;
+        }
+        cleanup();
+        if (msg.error) rejectBatch(new Error(msg.error));
+        else resolveBatch();
+      };
+      const onError = (err: Error) => { cleanup(); rejectBatch(err); };
+      const onExit = (code: number) => { cleanup(); rejectBatch(new Error(`Worker exited with code ${code}`)); };
+      const cleanup = () => {
+        worker.off('message', onMessage);
+        worker.off('error', onError);
+        worker.off('exit', onExit);
+      };
+      worker.on('message', onMessage);
+      worker.on('error', onError);
+      worker.on('exit', onExit);
+      worker.postMessage({ kind: 'run', seq, batch } satisfies WorkerRunMessage);
+    });
+
+  const runSlot = async (url: URL): Promise<void> => {
+    let worker: Worker | undefined;
+    for (;;) {
+      const mySeq = batchIndex++;
+      if (mySeq >= batches.length) break;
+      const myBatch = batches[mySeq];
+      if (!myBatch) break;
+      reorder.set(mySeq, { received: new Map(), expected: myBatch.files.length, written: 0, done: false, failed: false });
+      try {
+        // Lazy spawn + respawn: a slot's worker survives across batches and
+        // is only rebuilt after a failure.
+        worker = worker ?? spawnSlotWorker(url);
+        await runBatchOnWorker(worker, mySeq, myBatch);
+        // R194: mark the batch complete so tryFlush can advance past it
+        // (files were written as they arrived; 'done' releases the slot).
+        const slot = reorder.get(mySeq);
+        if (slot) slot.done = true;
+        tryFlush();
+      } catch (e: unknown) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        markBatchFailed(mySeq, errMsg);
+        try { worker?.terminate(); } catch { /* already dead */ }
+        worker = undefined; // fresh worker for the next batch
+      }
+    }
+    try { worker?.terminate(); } catch { /* best effort */ }
+  };
+
+  function markBatchFailed(seq: number, failError: string): void {
+    const slot = reorder.get(seq);
+    if (slot) {
+      slot.failed = true;
+      slot.failError = failError;
+    }
+    tryFlush();
+  }
 
   for (let w = 0; w < Math.min(numWorkers, batches.length); w++) {
-    workerPromises.push((async () => {
-      while (batchIndex < batches.length) {
-        const mySeq = batchIndex++;
-        const myBatch = batches[mySeq];
-        if (!myBatch) break;
-
-        try {
-          const result = await runWorker(workerUrl, myBatch);
-          reorder.set(mySeq, { batch: myBatch, result });
-          tryFlush();
-        } catch (e: unknown) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          for (const f of myBatch.files) {
-            errors.push({ file: nodeRelative(rootPath, f), error: errMsg });
-          }
-          reorder.set(mySeq, { batch: myBatch, result: null });
-          tryFlush();
-        }
-      }
-    })());
+    workerPromises.push(runSlot(workerUrl));
   }
 
   await Promise.all(workerPromises);
@@ -3431,27 +3485,9 @@ async function indexParallel(
   return { nodes: nodeCount, edges: edgeCount, files: fileCount, skipped: totalSkipped, errors, languages, crossFileCallsResolved: crossFileResolved };
 }
 
-/**
- * Run a single worker thread to process a batch of files.
- */
-function runWorker(workerUrl: URL, batch: WorkerBatch): Promise<WorkerBatchResult> {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(workerUrl, { workerData: batch });
-    worker.on('message', (result: WorkerBatchResult) => {
-      worker.terminate();
-      resolve(result);
-    });
-    worker.on('error', (err: Error) => {
-      worker.terminate();
-      reject(err);
-    });
-    worker.on('exit', (code: number) => {
-      if (code !== 0) {
-        reject(new Error(`Worker exited with code ${code}`));
-      }
-    });
-  });
-}
+// R194: runWorker was replaced by the persistent per-slot pool (runSlot +
+// runBatchOnWorker) — one worker per slot for the whole run, streaming file
+// results as they parse. See the R194 comment block in indexParallel.
 
 // R78: removed buggy custom relative() helper. It used startsWith() which
 // returns true for sibling-prefix paths (e.g. '/foo/bar' is a prefix of

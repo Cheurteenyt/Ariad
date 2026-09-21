@@ -1,5 +1,26 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.11 — streaming worker pipeline (memory levers) (2026-09-21)
+
+- R194: the parallel write pipeline streams worker results PER FILE. The
+  worker posts each file the moment it is parsed (no batch-result
+  accumulation, no batch-sized structured-clone spikes) and the main
+  thread writes files strictly in (dispatch seq, file index) order inside
+  the streaming transaction, freeing each result as soon as it is written.
+  Batch size cap 750 → 250 files, so the worst-case reorder buffer is
+  (numWorkers−1) × 250 file results (previously numWorkers × 750 full
+  batch results plus their postMessage clones — the 24 GB peak class).
+- Persistent per-slot workers: one worker thread per pool slot for the
+  whole run (WASM parser + grammar loaded once per slot, not once per
+  batch). A failed batch keeps its already-parsed files, fails the rest,
+  and respawns its worker for the next batch.
+- Semantics preserved: deterministic ID assignment (R81 Bug 19 — strict
+  dispatch-order writes), per-file failure injection (R92), incremental
+  deletes/hash upserts/call-sites/imports/exports (per-file versions of
+  the R187 batch operations), full-mode clear inside the transaction.
+- Covered by r194 (compiled-CLI determinism + accounting, the only harness
+  that exercises real worker threads) plus the full indexer suite.
+
 ## 0.78.0-alpha.10 — reader cutover to atomic generations (R169D) (2026-09-21)
 
 - R169D: readers now resolve their DB through the generation store.
