@@ -26,7 +26,7 @@ import { Parser, Language } from 'web-tree-sitter';
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 import { relative, extname, basename, dirname, join, sep } from 'node:path';
-import { readFileSync, statSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { readFileSync, statSync, readdirSync, lstatSync, realpathSync, type BigIntStats } from 'node:fs';
 import { createRequire } from 'node:module';
 import { extractFast, type UnresolvedCallSite, type ImportBinding, type ExportBinding } from './fast-walker.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized, isExtractorSemanticsCurrent } from './cross-file-resolver.js';
@@ -357,6 +357,27 @@ export interface DiscoveryResult {
   skippedExternalSymlinks: number;
   skippedPolicyPaths: number;
   duplicates: number;
+  /**
+   * R190 (P1.3): Stat metadata for every discovered code file, keyed by the
+   * same canonical absolute path listed in `files`. Collected from the
+   * bigint stat discovery already performs to build identity keys, so the
+   * indexer's mtime_ns+size fast-skip needs NO re-stat per file. Entries may
+   * be absent for exotic files (stat failed, realpath-fallback identity) —
+   * consumers must fall back to their own statSync for missing keys.
+   */
+  fileStats: ReadonlyMap<string, FileStatMeta>;
+}
+
+/**
+ * R190 (P1.3): The stat metadata discovery carries for one code file.
+ * `mtimeMs` is pre-floored exactly as the indexer's upsert path expects
+ * (`Math.floor(Number(stat.mtimeMs))`), so consumers use the values
+ * verbatim with no re-derivation.
+ */
+export interface FileStatMeta {
+  mtimeMs: number;
+  mtimeNs: string;
+  size: number;
 }
 
 /**
@@ -391,8 +412,18 @@ export interface DiscoveryResult {
  *
  * Returns null only if both stat AND realpath fail — at which point the
  * caller skips the file (treat as inaccessible).
+ *
+ * R190 (P1.3): returns the successful bigint stat alongside the identity so
+ * discovery can hand it to the indexer. The indexer's mtime_ns+size
+ * fast-skip needs exactly this stat and discovery already paid the syscall;
+ * carrying it removes one statSync per file per incremental run. `stat` is
+ * undefined only in the stat-failed realpath-fallback case (3) — consumers
+ * must fall back to their own statSync for those entries.
  */
-function fileIdentityKey(fullPath: string, language: string): string | null {
+function fileIdentityWithStat(
+  fullPath: string,
+  language: string,
+): { identity: string; stat: BigIntStats | undefined } | null {
   try {
     const st = statSync(fullPath, { bigint: true });
     // R142 (ID-R142-01): detect untrustworthy dev:ino (both zero).
@@ -406,17 +437,17 @@ function fileIdentityKey(fullPath: string, language: string): string | null {
       // produce unstable keys across readdir order. The caller will skip
       // the file and record an error.
       try {
-        return `path:${realpathSync(fullPath)}:${language}`;
+        return { identity: `path:${realpathSync(fullPath)}:${language}`, stat: st };
       } catch {
         return null;
       }
     }
-    return `inode:${st.dev}:${st.ino}:${language}`;
+    return { identity: `inode:${st.dev}:${st.ino}:${language}`, stat: st };
   } catch {
     // R143 (ID-R143-02): stat failed — try realpath. If realpath also
     // fails, return null (fail-closed).
     try {
-      return `path:${realpathSync(fullPath)}:${language}`;
+      return { identity: `path:${realpathSync(fullPath)}:${language}`, stat: undefined };
     } catch {
       return null;
     }
@@ -447,7 +478,7 @@ function fileIdentityKey(fullPath: string, language: string): string | null {
  *     `realStat.isFile()` (SEC-R142-01). Previously the `else` branch of
  *     `isDirectory()` treated ALL non-dir types as file candidates, which
  *     could cause `readFileSync` to block forever on a FIFO.
- *   - `fileIdentityKey` detects `dev:ino = 0n` and falls back to
+ *   - `fileIdentityWithStat` detects `dev:ino = 0n` and falls back to
  *     `path:<realpath>` (ID-R142-01).
  *
  * Throws if the root is missing, not a directory, or not readable
@@ -511,7 +542,7 @@ export function discoverSourceFilesStructured(
   const visitedDirs = new Set<string>([realRoot]);
   // R141 (IDX-R141-01): Track visited file identities so two aliases to the
   // same file produce exactly one result. The key is `dev:ino:lang` (with
-  // realpath fallback) — see fileIdentityKey.
+  // realpath fallback) — see fileIdentityWithStat.
   // R143 (ID-R143-01): Map identity → chosen canonical path. When a second
   // candidate for the same identity is found, we keep the lexicographically
   // smaller path. This makes hardlink selection deterministic across readdir
@@ -525,6 +556,10 @@ export function discoverSourceFilesStructured(
   // making it O(N²)). Instead, we build results at the end from
   // visitedFiles.values().
   const visitedFiles = new Map<string, string>();
+  // R190 (P1.3): absolute path → stat metadata, collected at the same
+  // fileIdentityWithStat call sites that already stat the file. Keyed by the
+  // same path passed to addFileCandidate (which is what lands in `files`).
+  const fileStats = new Map<string, FileStatMeta>();
   // R143 (ID-R143-01) / R144 (PERF-R144-02): Helper to add a file with
   // deterministic tie-breaking. Returns true if the file was added or
   // replaced, false if the existing entry was kept.
@@ -882,9 +917,16 @@ export function discoverSourceFilesStructured(
           // regular file with a supported language. The indexer's contribution
           // filter re-checks detectLanguage before persisting.
           resolvedAliases.push({ aliasPath: relAlias, canonicalTarget: relTarget, targetKind: 'file' });
-          const identity = fileIdentityKey(realTarget, lang);
+          const identityResult = fileIdentityWithStat(realTarget, lang);
+          const identity = identityResult?.identity ?? null;
+          if (identityResult !== null && identityResult.stat !== undefined) {
+            // R190 (P1.3): carry the stat discovery already paid for so the
+            // indexer's mtime_ns+size fast-skip needs no re-stat.
+            const st = identityResult.stat;
+            fileStats.set(realTarget, { mtimeMs: Math.floor(Number(st.mtimeMs)), mtimeNs: st.mtimeNs.toString(), size: Number(st.size) });
+          }
           if (identity === null) {
-            // R147 (DISC-R147-01): fileIdentityKey returned null — the file
+            // R147 (DISC-R147-01): fileIdentityWithStat returned null — the file
             // disappeared between lstat and stat/realpath (TOCTOU race).
             // R146 treated this as fatal (recordError → discovery incomplete).
             // But the same ENOENT race is a warning everywhere else. Now we
@@ -972,10 +1014,17 @@ export function discoverSourceFilesStructured(
         if (!lang) {
           continue; // unsupported extension — don't mark visited
         }
-        const identity = fileIdentityKey(fullPath, lang);
+        const identityResult = fileIdentityWithStat(fullPath, lang);
+        const identity = identityResult?.identity ?? null;
+        if (identityResult !== null && identityResult.stat !== undefined) {
+          // R190 (P1.3): carry the stat discovery already paid for so the
+          // indexer's mtime_ns+size fast-skip needs no re-stat.
+          const st = identityResult.stat;
+          fileStats.set(fullPath, { mtimeMs: Math.floor(Number(st.mtimeMs)), mtimeNs: st.mtimeNs.toString(), size: Number(st.size) });
+        }
         if (identity === null) {
           // R147 (DISC-R147-01): TOCTOU race — file disappeared between lstat
-          // and stat/realpath in fileIdentityKey. Warning, not fatal.
+          // and stat/realpath in fileIdentityWithStat. Warning, not fatal.
           // R153 (OBS-R153-02): include the root-relative path for diagnostics.
           const relFilePath = relative(realRoot, fullPath);
           recordWarning('ENOENT_IDENTITY', relFilePath);
@@ -1029,6 +1078,7 @@ export function discoverSourceFilesStructured(
     skippedExternalSymlinks,
     skippedPolicyPaths,
     duplicates,
+    fileStats,
   };
 }
 

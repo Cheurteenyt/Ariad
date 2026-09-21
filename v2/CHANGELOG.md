@@ -1,5 +1,20 @@
 # Changelog — Codebase Memory V2
 
+## 0.78.0-alpha.8 — mtime pruning of the incremental refresh path (2026-09-21)
+
+- P1.3: the incremental refresh path no longer re-stats and re-queries every
+  discovered file. Discovery now carries the per-file stat metadata it
+  already collects for identity keys (`DiscoveryResult.fileStats`), and both
+  the `useParallel` estimate (R86) and the incremental fast-skip (R85) share
+  one bulk metadata load per run — one SELECT instead of one per discovered
+  file. The per-file statement remains only for stat mismatches (rare in
+  steady state), where the hash comparison decides between a metadata-only
+  update and a re-parse.
+- Skip semantics unchanged (R85/R93): `mtime_ns`+size match → skip;
+  mismatch or NULL `mtime_ns` → read+hash → metadata-only backfill or
+  re-index. An all-unchanged refresh now costs the walk plus one query, so
+  nightly refreshes of unchanged trees are dominated by the walk itself.
+
 ## 0.78.0-alpha.7 — incremental cross-file resolver (2026-09-08)
 
 - P1.2: incremental runs no longer rebuild ALL cross-file CALLS edges. The
