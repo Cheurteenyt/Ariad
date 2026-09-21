@@ -444,6 +444,21 @@ export function defaultCodeDbPath(project: string): string {
 
 // ── R193 (R169D): reader cutover to atomic generations ─────────────────
 
+/**
+ * R193 (R169D): platforms whose generation-store RESOLUTION is certified.
+ * Mirrors the publication gate (R192): the R169B primitives are
+ * Linux-certified only (doc §15.1) — their permission walk rejects the
+ * synthesized directory modes other platforms report (e.g. NTFS 0777), so
+ * on those platforms resolution would fail-closed on every call and the
+ * fallbacks would degrade readers to human-only. Non-certified platforms
+ * therefore keep the exact pre-R169D behavior: read the legacy DB.
+ */
+const GENERATION_RESOLVE_CERTIFIED_PLATFORMS = new Set(['linux']);
+
+function generationResolutionCertified(): boolean {
+  return GENERATION_RESOLVE_CERTIFIED_PLATFORMS.has(process.platform);
+}
+
 export interface CodeDbReadTarget {
   dbPath: string;
   /** 'generation' = active published snapshot; 'legacy' = live legacy DB. */
@@ -462,6 +477,9 @@ export interface CodeDbReadTarget {
  * propagate — callers must NOT fall back to a hand-constructed path.
  */
 export function resolveCodeDbForRead(project: string, cacheRoot?: string): CodeDbReadTarget {
+  if (!generationResolutionCertified()) {
+    return { dbPath: defaultCodeDbPath(project), source: 'legacy', generationId: null };
+  }
   const resolved = resolveActiveCodeDb(project, cacheRoot ? { cacheRoot } : undefined);
   if (resolved.source === 'generation') {
     return { dbPath: resolved.dbPath, source: 'generation', generationId: resolved.generationId };
@@ -479,6 +497,7 @@ export function resolveCodeDbForRead(project: string, cacheRoot?: string): CodeD
  * Passing `undefined` as the held path reports a change (nothing held yet).
  */
 export function activeGenerationChanged(project: string, heldDbPath: string | undefined, cacheRoot?: string): boolean {
+  if (!generationResolutionCertified()) return false;
   try {
     const resolved = resolveActiveCodeDb(project, cacheRoot ? { cacheRoot } : undefined);
     if (resolved.source !== 'generation') return false;
