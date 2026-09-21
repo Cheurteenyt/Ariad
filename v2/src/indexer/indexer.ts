@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 import { defaultCodeDbPath } from '../bridge/sqlite-ro.js';
 import { initIndexerSchema, clearProjectData, updateProjectStats, CURRENT_EXTRACTOR_SEMANTICS_VERSION, CURRENT_DISCOVERY_POLICY_VERSION, loadAliasHistory, computeRootFingerprint, commitAliasStateAtomically } from './schema.js';
 import { discoverSourceFilesStructured, detectLanguage, extractFromFilesWasm, preloadGrammars } from './wasm-extractor.js';
-import type { DiscoveryMode, DiscoveryResult } from './wasm-extractor.js';
+import type { DiscoveryMode, DiscoveryResult, FileStatMeta } from './wasm-extractor.js';
 import { replaceCallSitesForFiles, replaceImportsForFiles, replaceExportsForFiles, rebuildCrossFileCallsEdges, clearCrossFileCallEdges, isCallSitesInitialized } from './cross-file-resolver.js';
 import { assertDiscoveryRoot, DiscoveryRootError } from '../utils/safe-path.js';
 import { Worker } from 'node:worker_threads';
@@ -1939,35 +1939,27 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
   // R86: Bug 28 fix — useParallel should be based on filesToIndex (after fast-skip),
   // not files.length (total). In incremental mode with 1 file changed out of 10000,
   // spawning workers is wasteful. We do a quick stat+lookup pass to estimate.
+  // R190 (P1.3): the estimate reuses the SAME bulk-loaded metadata and the
+  // SAME discovery-carried stats as indexParallel's fast-skip — one SELECT
+  // per run and zero per-file stats on the unchanged path (was: one statSync
+  // + one prepared SELECT per file HERE, repeated again inside
+  // indexParallel). Both sites share fastSkippable() so they cannot drift.
   let estimatedFilesToIndex = files.length;
   if (opts.incremental) {
+    // R190 (P1.3): one bulk metadata load for the estimate — indexParallel
+    // performs its own load for the skip pass.
+    const bulkHashMeta = loadBulkHashMeta(db, opts.project);
     estimatedFilesToIndex = 0;
-    // R90: prepare statement once outside the loop (was re-preparing per file)
-    const getHashMeta = db.prepare(
-      'SELECT mtime_ns, mtime, size FROM file_hashes WHERE project = ? AND file_path = ?'
-    );
     for (const f of files) {
       // R142 (PATH-R142-01): use canonicalRoot for relative path.
       const relPath = nodeRelative(effectiveRoot, f);
-      const stat = statSync(f, { bigint: true });
-      const fileMtimeNs = stat.mtimeNs.toString();
-      const fileSize = Number(stat.size);
-      const existing = getHashMeta.get(opts.project, relPath) as { mtime_ns: string | null; mtime: number; size: number } | undefined;
-      if (!existing) {
+      const statMeta = resolveFileStat(f, discovery.fileStats.get(f));
+      // R91: Bug 32 fix — fastSkippable() returns false when mtime_ns is
+      // NULL (legacy pre-R85 DB), forcing a re-hash to backfill mtime_ns.
+      // Without this, mtime_ns stays NULL forever for unchanged files,
+      // keeping them exposed to the old Math.floor(mtimeMs) false-skip risk.
+      if (!fastSkippable(bulkHashMeta.get(relPath), statMeta.mtimeNs, statMeta.size)) {
         estimatedFilesToIndex++;
-      } else {
-        // R91: Bug 32 fix — if mtime_ns is NULL (legacy pre-R85 DB), don't
-        // fast-skip on mtime+size alone. Force a re-hash to backfill mtime_ns.
-        // Without this, mtime_ns stays NULL forever for unchanged files,
-        // keeping them exposed to the old Math.floor(mtimeMs) false-skip risk.
-        if (!existing.mtime_ns) {
-          estimatedFilesToIndex++;
-        } else {
-          const mtimeMatches = existing.mtime_ns === fileMtimeNs;
-          if (!mtimeMatches || existing.size !== fileSize) {
-            estimatedFilesToIndex++;
-          }
-        }
       }
     }
   }
@@ -2471,7 +2463,7 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
     currentPhase = 'extraction';
     let result;
     if (useParallel) {
-      result = await indexParallel(db, opts.project, effectiveRoot, langGroups, numWorkers, opts.incremental ?? false);
+      result = await indexParallel(db, opts.project, effectiveRoot, langGroups, numWorkers, opts.incremental ?? false, discovery.fileStats);
     } else {
       result = await extractFromFilesWasm(
         db, opts.project, effectiveRoot, files, opts.incremental ?? false,
@@ -2817,6 +2809,62 @@ export async function indexProjectWasm(opts: IndexOptions): Promise<IndexResult>
  * resolved in BOTH full and incremental modes using the shared
  * rebuildCrossFileCallsEdges() helper from cross-file-resolver.ts.
  */
+// ── R190 (P1.3): mtime pruning of the incremental refresh path ─────────
+
+/**
+ * Stat metadata for one file, from discovery's carried stats or a fresh
+ * bigint stat.
+ */
+interface FileMeta { mtimeMs: number; mtimeNs: string; size: number }
+
+/**
+ * Resolve one file's stat metadata, preferring the stat discovery already
+ * collected (DiscoveryResult.fileStats, keyed by absolute path) over a fresh
+ * syscall. The fallback covers exotic files discovery could not stat and
+ * direct callers that pass no map.
+ */
+function resolveFileStat(absPath: string, carried: FileStatMeta | undefined): FileMeta {
+  if (carried !== undefined) {
+    return { mtimeMs: carried.mtimeMs, mtimeNs: carried.mtimeNs, size: carried.size };
+  }
+  const stat = statSync(absPath, { bigint: true });
+  return { mtimeMs: Math.floor(Number(stat.mtimeMs)), mtimeNs: stat.mtimeNs.toString(), size: Number(stat.size) };
+}
+
+/**
+ * One streaming SELECT replaces the per-file prepared lookups in the
+ * useParallel estimate (R86) and the incremental fast-skip (R85): both now
+ * cost ONE query per run instead of one per discovered file. content_hash is
+ * deliberately NOT loaded — only stat-mismatched files need it, and they
+ * fetch it with the per-file statement right before read+hash. This bounds
+ * the map to (path, nullable mtime_ns, size) instead of pulling every hash.
+ */
+function loadBulkHashMeta(
+  db: Database.Database,
+  project: string,
+): Map<string, { mtimeNs: string | null; size: number }> {
+  const map = new Map<string, { mtimeNs: string | null; size: number }>();
+  const stmt = db.prepare('SELECT file_path, mtime_ns, size FROM file_hashes WHERE project = ?');
+  const rows = stmt.iterate(project) as unknown as IterableIterator<{ file_path: string; mtime_ns: string | null; size: number }>;
+  for (const row of rows) {
+    map.set(row.file_path, { mtimeNs: row.mtime_ns, size: row.size });
+  }
+  return map;
+}
+
+/**
+ * The R85/R93 fast-skip predicate, shared by the useParallel estimate and
+ * indexParallel so their skip decisions cannot drift. False for missing rows
+ * (new files) and for legacy NULL mtime_ns rows (R93 backfill).
+ */
+function fastSkippable(
+  meta: { mtimeNs: string | null; size: number } | undefined,
+  fileMtimeNs: string,
+  fileSize: number,
+): boolean {
+  return meta !== undefined && meta.mtimeNs !== null && meta.mtimeNs === fileMtimeNs && meta.size === fileSize;
+}
+
 async function indexParallel(
   db: Database.Database,
   project: string,
@@ -2824,6 +2872,7 @@ async function indexParallel(
   langGroups: Map<string, string[]>,
   numWorkers: number,
   incremental: boolean,
+  fileStats?: ReadonlyMap<string, FileStatMeta>,
 ): Promise<{ nodes: number; edges: number; files: number; skipped: number; errors: Array<{ file: string; error: string }>; languages: Set<string>; crossFileCallsResolved: boolean }> {
   // Build batches: group files by language, then split into worker-sized chunks
   const batches: WorkerBatch[] = [];
@@ -2835,6 +2884,12 @@ async function indexParallel(
   // R84: Bug 25 — metadata-only hash updates for parallel path (same as single-thread Bug 24)
   const allMetadataOnlyHashUpdates: Array<{ relPath: string; hash: string; mtime: number; mtimeNs: string; size: number; indexedAt: string }> = [];
   let totalSkipped = 0;
+
+  // R190 (P1.3): one bulk metadata load replaces the per-file SELECT in the
+  // fast-skip below; the carried discovery stats replace the per-file
+  // statSync. The per-file statement stays for the rare stat-mismatch path
+  // (it fetches content_hash for the hash comparison and R93 backfill).
+  const bulkMeta = incremental ? loadBulkHashMeta(db, project) : undefined;
 
   for (const [lang, langFiles] of langGroups) {
     languages.add(lang);
@@ -2848,23 +2903,28 @@ async function indexParallel(
     for (const f of langFiles) {
       if (incremental) {
         const relPath = nodeRelative(rootPath, f);
-        // R85: use bigint stat for nanosecond mtime precision
-        const stat = statSync(f, { bigint: true });
-        const fileMtime = Math.floor(Number(stat.mtimeMs));
-        const fileMtimeNs = stat.mtimeNs.toString();
-        const fileSize = Number(stat.size);
+        // R190: stat metadata carried from discovery (no re-stat); bigint
+        // stat fallback keeps nanosecond mtime precision (R85) for files
+        // discovery could not carry.
+        const statMeta = resolveFileStat(f, fileStats?.get(f));
+        const fileMtime = statMeta.mtimeMs;
+        const fileMtimeNs = statMeta.mtimeNs;
+        const fileSize = statMeta.size;
 
-        // R85: mtimeNs+size fast skip — nanosecond precision
-        // R90: prepare statement once outside the loop
+        // R85: mtimeNs+size fast skip — nanosecond precision. R93: never
+        // skip when the stored mtime_ns is NULL (legacy row) — the hash
+        // comparison below read+hashes and backfills mtime_ns.
+        const existingMeta = bulkMeta?.get(relPath);
+        if (fastSkippable(existingMeta, fileMtimeNs, fileSize)) {
+          totalSkipped++;
+          continue;
+        }
+
+        // Stat mismatch, new file, or legacy NULL mtime_ns — fetch the hash
+        // row to decide between metadata-only and re-index.
         const existing = getHashMetaParallel.get(project, relPath) as { content_hash: string; mtime: number; mtime_ns: string | null; size: number } | undefined;
 
         if (existing) {
-          // R93: Bug 33 fix — never fast-skip on mtime integer alone when
-          // mtime_ns is NULL. Force read+hash to backfill mtime_ns.
-          if (existing.mtime_ns && existing.mtime_ns === fileMtimeNs && existing.size === fileSize) {
-            totalSkipped++;
-            continue;
-          }
           // mtime_ns is NULL or mismatch — must read+hash to confirm
           const content = readFileSync(f, 'utf-8');
           const hash = createHash('sha256').update(content).digest('hex');
